@@ -1,0 +1,32 @@
+[project]
+name = "comfyui-webui-prompt-bridge"
+description = "A WebUI-style prompt editor, translator, autocomplete and LoRA bridge for ComfyUI."
+version = "0.1.0"
+license = { file = "LICENSE" }
+dependencies = [
+    "pyyaml",
+    "safetensors"
+]
+requires-python = ">=3.10"
+readme = "README.md"
+authors = [
+    { name = "dianfangsihuo" }
+]
+keywords = [
+    "comfyui",
+    "prompt",
+    "webui",
+    "autocomplete",
+    "translation",
+    "lora",
+    "anima"
+]
+
+[project.urls]
+Repository = "https://github.com/dianfangsihuo/ComfyUI-WebUI-Prompt-Bridge"
+Issues = "https://github.com/dianfangsihuo/ComfyUI-WebUI-Prompt-Bridge/issues"
+
+[tool.comfy]
+PublisherId = "dianfangsihuo"
+DisplayName = "ComfyUI WebUI Prompt Bridge"
+Icon = ""

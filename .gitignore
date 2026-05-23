@@ -1,0 +1,12 @@
+__pycache__/
+.learnings/
+*.py[cod]
+data/storage/
+data/styles.csv
+config.local.json
+.env
+.venv/
+venv/
+dist/
+build/
+*.egg-info/

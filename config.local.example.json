@@ -1,0 +1,7 @@
+{
+  "webui_root": "X:/path/to/stable-diffusion-webui",
+  "prompt_all_in_one_dir": "X:/path/to/stable-diffusion-webui/extensions/sd-webui-prompt-all-in-one",
+  "tagcomplete_dir": "X:/path/to/stable-diffusion-webui/extensions/a1111-sd-webui-tagcomplete",
+  "webui_python_site_packages": "X:/path/to/stable-diffusion-webui/python/Lib/site-packages",
+  "styles_file": "X:/path/to/stable-diffusion-webui/styles.csv"
+}

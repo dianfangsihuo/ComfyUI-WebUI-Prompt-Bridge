@@ -1,0 +1,10 @@
+__pycache__/
+.learnings/
+*.py[cod]
+config.local.json
+.env
+.git/
+docs/
+*.zip
+dist/
+build/
