@@ -29,4 +29,5 @@ Issues = "https://github.com/dianfangsihuo/ComfyUI-WebUI-Prompt-Bridge/issues"
 [tool.comfy]
 PublisherId = "dianfangsihuo"
 DisplayName = "ComfyUI WebUI Prompt Bridge"
-Icon = ""
+Icon = "https://raw.githubusercontent.com/dianfangsihuo/ComfyUI-WebUI-Prompt-Bridge/main/docs/images/webui-prompt-bridge-workflow.png"
+Banner = "https://raw.githubusercontent.com/dianfangsihuo/ComfyUI-WebUI-Prompt-Bridge/main/docs/images/webui-prompt-bridge-workflow.png"
