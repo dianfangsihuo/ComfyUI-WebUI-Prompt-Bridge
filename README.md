@@ -4,7 +4,7 @@
 
 ## 中文介绍
 
-**ComfyUI WebUI Prompt Bridge** 是一个给 ComfyUI 使用的 WebUI 式提示词编辑节点。它的目标很简单：让你在 ComfyUI 里也能像 WebUI 那样顺手地写提示词、点标签、翻译中文、收藏常用词、管理负面词，并且确认 LoRA 真的被加载到了模型里。
+**ComfyUI WebUI Prompt Bridge** 是一个给 ComfyUI 使用的 WebUI 式提示词编辑节点。它把 WebUI 里顺手的提示词输入、Tag 编辑、中文翻译、自动补全、收藏、负面词管理和 LoRA 检测搬进 ComfyUI，让复杂工作流也能拥有接近 WebUI 的提示词操作体验。
 
 很多人用 ComfyUI 时会遇到两个问题：
 
@@ -76,12 +76,12 @@ workflows/anima-webui-prompt-bridge.json
 - **开关 ON**：使用 Anima/Qwen 分体模型，也就是 `UNET + CLIP + VAE`。这是推荐默认模式，适合当前 Anima 工作流。
 - **开关 OFF**：使用普通整合 checkpoint，也就是 `CheckpointLoaderSimple`。适合 SD1.5、SDXL、Pony、Illustrious、Qwen-Rapid-AIO 这类整合模型。
 
-我已经实际测试过：
+已验证：
 
 - 分体 Anima/Qwen 模式可以正常生成。
 - 整合 Checkpoint 模式可以用 `Qwen-Rapid-AIO-NSFW-v16.safetensors` 正常生成。
 
-注意：如果你切到普通 SDXL / Pony / Illustrious checkpoint，建议先关闭参考图、Qwen Union 姿势控制等 Qwen 专用分支，避免编码器或模型结构不兼容。
+注意：切到普通 SDXL / Pony / Illustrious checkpoint 时，需要关闭参考图、Qwen Union 姿势控制等 Qwen 专用分支，避免编码器或模型结构不兼容。
 
 ## 需要准备的模型
 
@@ -98,6 +98,38 @@ workflows/anima-webui-prompt-bridge.json
 仓库**不包含任何模型、LoRA、VAE、放大模型或检测器文件**。你需要自己下载并放到 ComfyUI 对应模型目录里。发布或分享工作流时也要注意每个模型自己的授权协议。
 
 ## 安装方法
+
+### 方法一：ComfyUI-Manager 安装
+
+本节点已经注册到 Comfy Registry，节点 ID 为：
+
+```text
+comfyui-webui-prompt-bridge
+```
+
+在 ComfyUI-Manager 中搜索下面任意关键词：
+
+```text
+ComfyUI WebUI Prompt Bridge
+```
+
+```text
+comfyui-webui-prompt-bridge
+```
+
+点击安装并重启 ComfyUI。
+
+### 方法二：通过 Git URL 安装
+
+如果 ComfyUI-Manager 的本地索引还没有刷新，可以在 Manager 里使用 `Install via Git URL`，填入：
+
+```text
+https://github.com/dianfangsihuo/ComfyUI-WebUI-Prompt-Bridge.git
+```
+
+安装完成后重启 ComfyUI。
+
+### 方法三：手动安装
 
 把仓库克隆到 `ComfyUI/custom_nodes`：
 
@@ -117,10 +149,16 @@ pip install -r ComfyUI-WebUI-Prompt-Bridge/requirements.txt
 conditioning/webui -> WebUI Prompt Bridge
 ```
 
+Registry 页面：
+
+```text
+https://registry.comfy.org/nodes/comfyui-webui-prompt-bridge
+```
+
 ## 推荐使用步骤
 
 1. 安装这个自定义节点。
-2. 在 ComfyUI 里导入 `workflows/anima-webui-prompt-bridge.json`。
+2. 在 ComfyUI 里导入 `workflows/anima-webui-prompt-bridge.json`。可以直接把 JSON 拖进 ComfyUI 页面，也可以用菜单里的 `Load` 打开。
 3. 按上面的模型列表放好模型文件。
 4. 先保持模型模式开关为 ON，跑默认 Anima/Qwen 分体模式。
 5. 在 WebUI Prompt Bridge 节点里输入中文或英文提示词。
@@ -173,7 +211,7 @@ conditioning/webui -> WebUI Prompt Bridge
 
 **为什么我写了 LoRA 但没有效果？**
 
-先确认 LoRA 文件真的在 ComfyUI 的 `models/loras` 目录里，并且名字能被节点匹配到。建议开启 `Missing LoRA stops`，这样找不到 LoRA 会直接报错。
+先确认 LoRA 文件真的在 ComfyUI 的 `models/loras` 目录里，并且名字能被节点匹配到。开启 `Missing LoRA stops` 后，找不到 LoRA 会直接报错，方便定位问题。
 
 **为什么切到普通 checkpoint 后姿势或参考图报错？**
 
