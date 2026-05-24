@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-webui-prompt-bridge"
 description = "WebUI-style prompt editing for ComfyUI with Chinese translation, tag autocomplete, favorites, negative prompts, styles and real LoRA loading."
-version = "0.1.1"
+version = "0.1.2"
 license = { file = "LICENSE" }
 dependencies = [
     "pyyaml",
