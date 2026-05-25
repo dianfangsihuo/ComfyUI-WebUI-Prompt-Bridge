@@ -7,6 +7,16 @@ const EXTRA_SEPARATOR = ", ";
 const ATTENTION_STEP = 0.1;
 const EXTRA_STEP = 0.05;
 const WORD_DELIMITERS = ",;，；、\n\r\t";
+const DEFAULT_PANEL_WIDTH = 1180;
+const DEFAULT_PANEL_HEIGHT = 1040;
+const LEGACY_PANEL_WIDTH = 1280;
+const LEGACY_PANEL_HEIGHT = 1120;
+const PANEL_MIN_WIDTH = 760;
+const PANEL_MAX_WIDTH = 1600;
+const PANEL_MIN_HEIGHT = 620;
+const DOM_WIDGET_LAYOUT_PAD = 58;
+const SPLIT_ANIMA_MODEL_VALUE = "__webui_bridge_split_anima_qwen__";
+const SPLIT_ANIMA_MODEL_LABEL = "分体 Anima/Qwen（Anima UNET + Text Encoder + VAE）";
 const DEFAULT_QUALITY_TAGS = [
     "masterpiece",
     "best quality",
@@ -14,11 +24,73 @@ const DEFAULT_QUALITY_TAGS = [
     "anime style",
 ];
 const DEFAULT_NEGATIVE_PROMPT = "worst quality, low quality, lowres, blurry, bad anatomy, bad hands, extra fingers, extra legs, bad feet, malformed feet, text, watermark, artist name, jpeg artifacts, deformed, ugly face";
+const POSITIVE_PROMPT_HINTS = [
+    "1girl",
+    "1boy",
+    "2girls",
+    "2boys",
+    "solo",
+    "girl",
+    "boy",
+    "woman",
+    "man",
+    "portrait",
+    "full body",
+    "upper body",
+    "standing",
+    "sitting",
+    "looking at viewer",
+    "long hair",
+    "short hair",
+    "bangs",
+    "hair",
+    "eyes",
+    "dress",
+    "school uniform",
+    "kamisato",
+    "ayaka",
+    "masterpiece",
+    "best quality",
+    "score_9",
+    "score_8",
+];
+const NEGATIVE_PROMPT_HINTS = [
+    "worst quality",
+    "low quality",
+    "lowres",
+    "bad",
+    "blurry",
+    "deformed",
+    "malformed",
+    "extra",
+    "missing",
+    "mutated",
+    "watermark",
+    "text",
+    "jpeg artifacts",
+    "censored",
+    "nsfw",
+];
 const ANIMA_FAST_LORAS = [
     { name: "anima_p3_rdbt_v0.29.b.122", weight: 0.8 },
     { name: "anima-highres-aesthetic-boost", weight: 0.55 },
 ];
 const ANIMA_FAST_LORA_PATTERN = /<\s*(?:lora|lyco)\s*:\s*(?:[^>]*\/)?(?:anima_p3_rdbt_v0\.29\.b\.122|anima-highres-aesthetic-boost)(?:\.[a-z0-9]+)?(?:\s*:[^>]*)?>\s*,?\s*/gi;
+const LORA_CATEGORY_PRESETS = [
+    "角色/人物",
+    "画风/风格",
+    "服装/装扮",
+    "姿势/动作",
+    "场景/环境",
+    "物品/道具",
+    "质量/增强",
+    "构图/镜头",
+    "表情/情绪",
+    "材质/质感",
+    "光照/色彩",
+    "工具/控制",
+    "未分类",
+];
 
 function chainCallback(object, property, callback) {
     const original = object[property];
@@ -45,16 +117,89 @@ function el(tag, attrs = {}, children = []) {
 }
 
 function getWidget(node, name) {
-    return node.widgets?.find((widget) => widget.name === name);
+    return node?.widgets?.find((widget) => widget.name === name);
+}
+
+function clampPanelSize(width, height) {
+    const nextHeight = Math.max(PANEL_MIN_HEIGHT, Math.round(height || DEFAULT_PANEL_HEIGHT));
+    const ratioWidth = Math.ceil(nextHeight * 0.78);
+    const nextWidth = Math.min(PANEL_MAX_WIDTH, Math.max(PANEL_MIN_WIDTH, Math.round(width || DEFAULT_PANEL_WIDTH), ratioWidth));
+    return [nextWidth, nextHeight];
+}
+
+function looksLikeLegacyDefaultSize(size) {
+    return Array.isArray(size) &&
+        Math.abs(Number(size[0] || 0) - LEGACY_PANEL_WIDTH) <= 8 &&
+        Math.abs(Number(size[1] || 0) - LEGACY_PANEL_HEIGHT) <= 8;
 }
 
 function hideWidget(widget) {
     if (!widget || widget.__webuiBridgeHidden) return;
     widget.__webuiBridgeHidden = true;
     widget.origComputeSize = widget.computeSize;
-    widget.computeSize = () => [0, -4];
+    widget.computeSize = () => [0, 0];
+    widget.computedHeight = 0;
+    widget.y = 0;
+    widget.last_y = 0;
+    widget.width = 0;
+    widget.draw = () => {};
     widget.hidden = true;
-    widget.type = `WEBUI_BRIDGE_HIDDEN_${widget.name}`;
+    widget.options = widget.options || {};
+    widget.options.getMinHeight = () => 0;
+    widget.options.getMaxHeight = () => 0;
+    if (widget.element?.style) {
+        widget.element.style.display = "none";
+        widget.element.style.height = "0";
+        widget.element.style.minHeight = "0";
+        widget.element.style.maxHeight = "0";
+    }
+    widget.type = `WEBUI_BRIDGE_HIDDEN_${widget.name || "widget"}`;
+}
+
+function removeBridgeDomWidgets(node) {
+    if (!Array.isArray(node.widgets)) return false;
+    let removed = false;
+    for (const widget of node.widgets) {
+        if (widget?.name !== "webui_prompt_frontend") continue;
+        removed = true;
+        try {
+            widget.element?.remove?.();
+        } catch {
+            // Ignore stale DOM cleanup errors; the widget list is the source of truth.
+        }
+    }
+    if (removed) {
+        node.widgets = node.widgets.filter((widget) => widget?.name !== "webui_prompt_frontend");
+    }
+    return removed;
+}
+
+function shouldHideNativeWidget(widget) {
+    const widgetName = String(widget?.name || "");
+    return PROMPT_WIDGETS.has(widgetName) ||
+        widgetName.endsWith("_status") ||
+        widgetName === "open_webui_prompt_editor";
+}
+
+function hideNativeWidgets(node) {
+    for (const widget of node.widgets || []) {
+        if (shouldHideNativeWidget(widget)) hideWidget(widget);
+    }
+}
+
+function isBridgePanelUsable(node) {
+    const panel = node.__webuiBridgePanel;
+    if (!panel?.querySelector?.(".webui-bridge-toprow, .webui-bridge-panel-error")) return false;
+    return Boolean((node.widgets || []).some((widget) => widget?.name === "webui_prompt_frontend" && widget.element === panel));
+}
+
+function scheduleBridgePanelInstall(node) {
+    if (node.__webuiBridgeInstallScheduled) return;
+    node.__webuiBridgeInstallScheduled = true;
+    requestAnimationFrame(() => {
+        node.__webuiBridgeInstallScheduled = false;
+        installWebUIPanel(node);
+    });
 }
 
 function setWidgetValue(node, name, value) {
@@ -318,6 +463,185 @@ function resolveLora(state, requested) {
     ));
 }
 
+function loraFolderLabel(folder) {
+    return folder ? String(folder).replace(/\\/g, "/") : "Root";
+}
+
+function loraDisplayName(item) {
+    return item?.base_name || item?.alias?.split(/[\\/]/).pop() || item?.name || "";
+}
+
+function loraMatchesQuery(item, query) {
+    if (!query) return true;
+    const haystack = [
+        item.name,
+        item.alias,
+        item.folder,
+        item.file_name,
+        item.base_name,
+        item.description,
+        item.category,
+        item.manual_category,
+        item.kind_label,
+        item.category_label,
+        item.auto_category,
+        item.sd_version,
+        item.search_terms,
+    ].map((value) => String(value || "").toLowerCase()).join("\n");
+    return haystack.includes(query);
+}
+
+function loraSortValue(item, key) {
+    if (key === "name") return String(loraDisplayName(item)).toLowerCase();
+    if (key === "created") return Number(item.created || 0);
+    if (key === "modified") return Number(item.modified || 0);
+    return String(item.alias || item.name || "").toLowerCase();
+}
+
+function sortLoras(loras, key, descending) {
+    const sorted = [...loras].sort((a, b) => {
+        const av = loraSortValue(a, key);
+        const bv = loraSortValue(b, key);
+        if (typeof av === "number" && typeof bv === "number") return av - bv;
+        return av < bv ? -1 : av > bv ? 1 : 0;
+    });
+    return descending ? sorted.reverse() : sorted;
+}
+
+function loraManualCategory(item) {
+    return String(item?.manual_category || item?.category || item?.user_metadata?.category || item?.user_metadata?.["manual category"] || "").trim();
+}
+
+function loraAutoCategoryForItem(item) {
+    const text = [
+        item.name,
+        item.alias,
+        item.folder,
+        item.base_name,
+        item.description,
+        item.activation_text,
+        item.notes,
+    ].map((value) => String(value || "").toLowerCase()).join(" ");
+    const rules = [
+        ["角色/人物", ["character", "chara", "char_", "girl", "boy", "person", "people", "face", "vtuber", "oc", "cosplay", "idol", "人物", "角色", "女孩", "男孩", "少女", "正太", "萝莉"]],
+        ["画风/风格", ["style", "artist", "artstyle", "toon", "anime", "manga", "illustration", "painting", "render", "realistic", "风格", "画风", "画师", "写实", "水彩", "像素"]],
+        ["服装/装扮", ["cloth", "clothes", "dress", "outfit", "uniform", "shirt", "skirt", "jacket", "armor", "kimono", "maid", "服装", "衣服", "制服", "裙", "甲", "女仆", "和服"]],
+        ["姿势/动作", ["pose", "action", "gesture", "dance", "standing", "sitting", "running", "walk", "hand", "动作", "姿势", "手势", "站立", "坐姿", "舞"]],
+        ["场景/环境", ["background", "scene", "environment", "room", "city", "landscape", "building", "interior", "forest", "street", "背景", "场景", "环境", "房间", "城市", "森林", "街道"]],
+        ["物品/道具", ["prop", "object", "weapon", "sword", "gun", "vehicle", "car", "mecha", "item", "道具", "物品", "武器", "车", "机甲", "剑", "枪"]],
+        ["质量/增强", ["quality", "detail", "aesthetic", "highres", "upscale", "enhance", "boost", "detailer", "质量", "细节", "增强", "高清", "修复"]],
+        ["构图/镜头", ["composition", "camera", "lens", "closeup", "close-up", "wide shot", "portrait", "shot", "view", "angle", "构图", "镜头", "视角", "特写", "全景"]],
+        ["表情/情绪", ["expression", "smile", "sad", "angry", "happy", "cry", "emotion", "mood", "表情", "情绪", "微笑", "哭", "生气"]],
+        ["光照/色彩", ["light", "lighting", "shadow", "color", "colour", "tone", "palette", "neon", "光照", "灯光", "阴影", "色彩", "配色"]],
+        ["工具/控制", ["controlnet", "control", "depth", "canny", "ipadapter", "adapter", "slider", "工具", "控制"]],
+    ];
+    for (const [label, keywords] of rules) {
+        if (keywords.some((keyword) => text.includes(keyword))) return label;
+    }
+    return "未分类";
+}
+
+function loraCategoryForItem(item) {
+    return loraManualCategory(item) || loraAutoCategoryForItem(item);
+}
+
+function collectLoraCategoryOptions(loras) {
+    const seen = new Set();
+    const options = [];
+    const add = (value) => {
+        const text = String(value || "").trim();
+        if (!text || seen.has(text)) return;
+        seen.add(text);
+        options.push(text);
+    };
+    for (const preset of LORA_CATEGORY_PRESETS) add(preset);
+    for (const item of loras || []) {
+        add(loraManualCategory(item));
+        add(item.category_label);
+        add(item.auto_category);
+        add(loraAutoCategoryForItem(item));
+    }
+    return options;
+}
+
+function loraSdVersionLabel(item) {
+    const value = String(item?.sd_version || "").trim();
+    return value && value !== "Unknown" ? value : "Unknown";
+}
+
+function loraMetadataStatusLabel(item) {
+    if (loraManualCategory(item)) return "已手动分类";
+    if (item.thumbnail) return "有预览图";
+    if (item.activation_text) return "有触发词";
+    if (item.description || item.notes) return "有说明";
+    return "待整理";
+}
+
+function makeTreeNode(name, path, icon = "Dir") {
+    return { name, path, icon, count: 0, children: new Map() };
+}
+
+function addTreeChild(parent, name, path, icon) {
+    if (!parent.children.has(path)) parent.children.set(path, makeTreeNode(name, path, icon));
+    return parent.children.get(path);
+}
+
+function incrementTreePath(root, parts) {
+    let node = root;
+    node.count += 1;
+    for (const part of parts) {
+        node = addTreeChild(node, part.name, part.path, part.icon);
+        node.count += 1;
+    }
+}
+
+function buildLoraFolderTree(loras) {
+    const root = makeTreeNode("All", "__all", "All");
+    const foldersRoot = addTreeChild(root, "文件夹", "group:folders", "Dir");
+    const smartRoot = addTreeChild(root, "分类", "group:smart", "Tag");
+    const sdRoot = addTreeChild(root, "模型版本", "group:sd", "SD");
+    const statusRoot = addTreeChild(root, "整理状态", "group:status", "Meta");
+    for (const item of loras || []) {
+        item.auto_category = loraAutoCategoryForItem(item);
+        item.category_label = loraCategoryForItem(item);
+        item.kind_label = item.category_label;
+        incrementTreePath(root, [
+            { name: "分类", path: "group:smart", icon: "Tag" },
+            { name: item.category_label, path: `smart:${item.category_label}`, icon: "Tag" },
+        ]);
+        incrementTreePath(root, [
+            { name: "模型版本", path: "group:sd", icon: "SD" },
+            { name: loraSdVersionLabel(item), path: `sd:${loraSdVersionLabel(item)}`, icon: "SD" },
+        ]);
+        const statusLabel = loraMetadataStatusLabel(item);
+        incrementTreePath(root, [
+            { name: "整理状态", path: "group:status", icon: "Meta" },
+            { name: statusLabel, path: `status:${statusLabel}`, icon: "Meta" },
+        ]);
+        const parts = String(item.folder || "").split("/").filter(Boolean);
+        const folderPath = [];
+        incrementTreePath(root, [
+            { name: "文件夹", path: "group:folders", icon: "Dir" },
+            ...(parts.length ? parts : ["Root"]).map((part) => {
+                folderPath.push(part);
+                return { name: part, path: `folder:${folderPath.join("/")}`, icon: "Dir" };
+            }),
+        ]);
+    }
+    root.count = (loras || []).length;
+    return root;
+}
+
+function loraMatchesFilter(item, filter) {
+    if (!filter || filter === "__all") return true;
+    if (filter.startsWith("group:")) return true;
+    if (filter.startsWith("folder:")) return (item.folder || "Root") === filter.slice("folder:".length);
+    if (filter.startsWith("smart:")) return (item.category_label || loraCategoryForItem(item)) === filter.slice("smart:".length);
+    if (filter.startsWith("sd:")) return loraSdVersionLabel(item) === filter.slice("sd:".length);
+    if (filter.startsWith("status:")) return loraMetadataStatusLabel(item) === filter.slice("status:".length);
+    return item.folder === filter;
+}
+
 function setPromptTags(textarea, tags) {
     setTextareaValue(textarea, tags.map((item) => item.value || item).filter(Boolean).join(EXTRA_SEPARATOR));
 }
@@ -400,6 +724,7 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
         ...tags.map((tag, index) => ({ ...tag, index, disabled: false })),
         ...row.__webuiBridgeDisabledTags.map((tag, index) => ({ ...tag, index, disabled: true })),
     ];
+    row.classList.toggle("has-chips", visibleTags.length > 0);
     chips.classList.toggle("empty", visibleTags.length === 0);
     for (const tag of visibleTags) {
         const lora = parseLoraTag(tag.value);
@@ -603,13 +928,17 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             fetchLoraInfo(lora.name).then((info) => {
                 if (!info || !chip.isConnected) return;
                 const localNode = chip.querySelector(".webui-bridge-chip-local");
-                if (info.warning) {
+                const compatible = loraFamilyCompatibleWithCurrentModel(info.family);
+                if (info.warning && !compatible) {
                     chip.classList.add("warning");
-                    localNode.textContent = `可能不兼容: ${info.family || "unknown"}`;
-                    chip.title = `${tag.value}\n${info.warning}\nbase=${info.base_model || "unknown"}\nmodule=${info.network_module || "unknown"}`;
+                    localNode.textContent = `可能不兼容: ${info.family || "unknown"} -> ${currentModelFamily()}`;
+                    chip.title = `${tag.value}\n当前模型: ${currentCheckpointName() || currentModelFamily()}\n${info.warning}\nbase=${info.base_model || "unknown"}\nmodule=${info.network_module || "unknown"}`;
                 } else if (info.family && info.family !== "unknown") {
-                    localNode.textContent = `${info.family} LoRA${info.trigger_words?.length ? `: ${info.trigger_words.slice(0, 3).join(", ")}` : ""}`;
-                    chip.title = `${tag.value}\nbase=${info.base_model || info.family}\ntrigger=${(info.trigger_words || []).join(", ")}`;
+                    chip.classList.toggle("warning", false);
+                    localNode.textContent = compatible
+                        ? `匹配 ${currentModelFamily()}`
+                        : `${info.family} LoRA${info.trigger_words?.length ? `: ${info.trigger_words.slice(0, 3).join(", ")}` : ""}`;
+                    chip.title = `${tag.value}\n当前模型: ${currentCheckpointName() || currentModelFamily()}\nbase=${info.base_model || info.family}\ntrigger=${(info.trigger_words || []).join(", ")}`;
                 }
             });
         }
@@ -649,6 +978,38 @@ function addPromptArea(textarea, text) {
     const sep = textarea.value.trim() ? EXTRA_SEPARATOR : "";
     setTextareaValue(textarea, textarea.value + sep + text);
     return true;
+}
+
+function promptHasLora(text, name) {
+    const target = normalizeLoraName(name);
+    if (!target) return false;
+    return splitPromptTags(text).some((tag) => {
+        const lora = parseLoraTag(tag.value);
+        return lora && normalizeLoraName(lora.name) === target;
+    });
+}
+
+function formatLoraStrength(value, fallback = 1) {
+    const number = Number(value);
+    const safe = Number.isFinite(number) ? number : fallback;
+    return safe.toFixed(3).replace(/\.?0+$/, "");
+}
+
+function loraPromptFromLoader(loader, state) {
+    const rawName = getNodeWidgetValue(loader, "lora_name");
+    if (!rawName) return null;
+    const resolved = resolveLora(state, rawName);
+    const name = resolved?.alias || resolved?.base_name || rawName;
+    const model = formatLoraStrength(getNodeWidgetValue(loader, "strength_model"), 1);
+    const clipValue = getNodeWidgetValue(loader, "strength_clip");
+    const clip = Number(clipValue);
+    const suffix = Number.isFinite(clip) && formatLoraStrength(clip, 1) !== model
+        ? `:${formatLoraStrength(clip, 1)}`
+        : "";
+    return {
+        key: normalizeLoraName(rawName),
+        prompt: `<lora:${name}:${model}${suffix}>`,
+    };
 }
 
 function cleanPromptSeparators(text) {
@@ -748,20 +1109,257 @@ function applyStyleText(base, styleText) {
 }
 
 async function loadBridgeData() {
-    const [lorasRes, stylesRes, promptAllInOneRes] = await Promise.allSettled([
+    const [lorasRes, stylesRes, promptAllInOneRes, modelsRes] = await Promise.allSettled([
         api.fetchApi("/webui_prompt_bridge/loras", { cache: "no-store" }).then((r) => r.json()),
         api.fetchApi("/webui_prompt_bridge/styles", { cache: "no-store" }).then((r) => r.json()),
         api.fetchApi("/webui_prompt_bridge/prompt_all_in_one?lang=zh_CN", { cache: "no-store" }).then((r) => r.json()),
+        api.fetchApi("/webui_prompt_bridge/models", { cache: "no-store" }).then((r) => r.json()),
     ]);
     return {
         loras: lorasRes.status === "fulfilled" ? lorasRes.value.loras || [] : [],
         styles: stylesRes.status === "fulfilled" ? stylesRes.value.styles || [] : [],
         promptAllInOne: promptAllInOneRes.status === "fulfilled" ? promptAllInOneRes.value : { group_tags: [], favorites: {} },
+        models: modelsRes.status === "fulfilled" ? modelsRes.value : { checkpoints: [], unets: [], clips: [], vaes: [] },
     };
 }
 
 function getGraphNodes() {
     return app.graph?._nodes || [];
+}
+
+function getGraphNodeById(id) {
+    return app.graph?.getNodeById?.(id) || getGraphNodes().find((graphNode) => String(graphNode.id) === String(id));
+}
+
+function getGraphLink(linkId) {
+    const links = app.graph?.links || app.graph?._links;
+    if (!links || linkId === undefined || linkId === null) return null;
+    if (Array.isArray(links)) return links.find((link) => String(link?.id ?? link?.[0]) === String(linkId));
+    return links[linkId] || links[String(linkId)] || null;
+}
+
+function linkOriginId(link) {
+    return link?.origin_id ?? link?.originId ?? link?.[1];
+}
+
+function linkOriginSlot(link) {
+    return link?.origin_slot ?? link?.originSlot ?? link?.[2] ?? 0;
+}
+
+function graphLinkId(link) {
+    return link?.id ?? link?.[0];
+}
+
+function findInputSlot(node, name) {
+    return node?.findInputSlot?.(name) ?? (node?.inputs || []).findIndex((input) => input.name === name);
+}
+
+function findOutputSlot(node, name, fallback = 0) {
+    const slot = node?.findOutputSlot?.(name) ?? (node?.outputs || []).findIndex((output) => output.name === name || output.type === name);
+    return slot >= 0 ? slot : fallback;
+}
+
+function disconnectInput(node, inputSlot) {
+    if (!node || inputSlot < 0) return;
+    if (typeof node.disconnectInput === "function") {
+        node.disconnectInput(inputSlot);
+        return;
+    }
+    const linkId = node.inputs?.[inputSlot]?.link;
+    if (linkId !== undefined && linkId !== null) app.graph?.removeLink?.(linkId);
+}
+
+function removeInputLinkReference(node, inputSlot) {
+    const input = node?.inputs?.[inputSlot];
+    if (!input) return false;
+    const linkId = input.link;
+    if (linkId === undefined || linkId === null) return false;
+    const link = getGraphLink(linkId);
+    if (link) {
+        const source = getGraphNodeById(linkOriginId(link));
+        const outputSlot = linkOriginSlot(link);
+        const output = source?.outputs?.[outputSlot];
+        if (Array.isArray(output?.links)) {
+            output.links = output.links.filter((id) => String(id) !== String(linkId));
+        }
+        app.graph?.removeLink?.(linkId);
+    }
+    input.link = null;
+    app.graph?.setDirtyCanvas(true, true);
+    return true;
+}
+
+function findOutputReferenceToLink(linkId) {
+    if (linkId === undefined || linkId === null) return null;
+    for (const source of getGraphNodes()) {
+        for (let outputSlot = 0; outputSlot < (source.outputs || []).length; outputSlot += 1) {
+            const output = source.outputs[outputSlot];
+            if (!Array.isArray(output?.links)) continue;
+            if (output.links.some((id) => String(id) === String(linkId))) {
+                return { source, outputSlot, output };
+            }
+        }
+    }
+    return null;
+}
+
+function writeGraphLink(linkId, source, outputSlot, target, inputSlot, type) {
+    if (!app.graph || linkId === undefined || linkId === null || !source || !target) return false;
+    const id = Number.isFinite(Number(linkId)) ? Number(linkId) : linkId;
+    const link = {
+        id,
+        type: type || target.inputs?.[inputSlot]?.type || source.outputs?.[outputSlot]?.type || "*",
+        origin_id: source.id,
+        origin_slot: outputSlot,
+        target_id: target.id,
+        target_slot: inputSlot,
+    };
+    app.graph.links = app.graph.links || {};
+    app.graph.links[id] = link;
+    if (app.graph._links) app.graph._links[id] = link;
+    target.inputs[inputSlot].link = id;
+    const output = source.outputs?.[outputSlot];
+    if (output) {
+        output.links = Array.isArray(output.links) ? output.links : [];
+        if (!output.links.some((existing) => String(existing) === String(id))) output.links.push(id);
+    }
+    app.graph.setDirtyCanvas(true, true);
+    return true;
+}
+
+function restoreMissingInputLink(node, inputSlot) {
+    const input = node?.inputs?.[inputSlot];
+    const linkId = input?.link;
+    if (linkId === undefined || linkId === null || getGraphLink(linkId)) return false;
+    const reference = findOutputReferenceToLink(linkId);
+    if (!reference) return false;
+    return writeGraphLink(linkId, reference.source, reference.outputSlot, node, inputSlot, input.type || reference.output?.type);
+}
+
+function isWidgetBackedInput(input) {
+    return Boolean(input?.widget?.name || input?.widget || input?.type === "INT" || input?.type === "FLOAT" || input?.type === "BOOLEAN" || input?.type === "STRING");
+}
+
+function repairStaleInputLinks() {
+    let repaired = 0;
+    for (const graphNode of getGraphNodes()) {
+        for (let slot = 0; slot < (graphNode.inputs || []).length; slot += 1) {
+            const input = graphNode.inputs[slot];
+            if (input.link === undefined || input.link === null) continue;
+            const link = getGraphLink(input.link);
+            if (link && String(link?.target_id ?? link?.targetId ?? link?.[3]) === String(graphNode.id)) continue;
+            if (restoreMissingInputLink(graphNode, slot)) {
+                repaired += 1;
+            } else if (isWidgetBackedInput(input) && removeInputLinkReference(graphNode, slot)) {
+                repaired += 1;
+            }
+        }
+    }
+    return repaired;
+}
+
+function repairQueueParentLinkError(error) {
+    const message = String(error?.message || error || "");
+    const match = message.match(/No link found in parent graph for id \[(\d+)] slot \[(\d+)]/i);
+    if (!match) return 0;
+    const graphNode = getGraphNodeById(match[1]);
+    const slot = Number(match[2]);
+    const input = graphNode?.inputs?.[slot];
+    if (!graphNode || !input) return 0;
+    if (restoreMissingInputLink(graphNode, slot)) return 1;
+    if (isWidgetBackedInput(input) && removeInputLinkReference(graphNode, slot)) return 1;
+    return 0;
+}
+
+async function submitComfyQueue() {
+    if (typeof app.queuePrompt === "function") {
+        await app.queuePrompt(0, 1);
+        return "已提交生成任务";
+    }
+    const queueButton = document.querySelector("#queue-button, button.comfy-queue-button");
+    if (!queueButton) throw new Error("找不到 ComfyUI 的生成按钮，无法提交队列。");
+    queueButton.click();
+    return "已点击 ComfyUI 生成按钮";
+}
+
+function connectNodes(sourceNode, outputSlot, targetNode, inputSlot) {
+    if (!sourceNode || !targetNode || outputSlot < 0 || inputSlot < 0) return false;
+    disconnectInput(targetNode, inputSlot);
+    sourceNode.connect?.(outputSlot, targetNode, inputSlot);
+    app.graph?.setDirtyCanvas(true, true);
+    return true;
+}
+
+function captureInputLink(targetNode, inputSlot) {
+    const linkId = targetNode?.inputs?.[inputSlot]?.link;
+    const link = getGraphLink(linkId);
+    const sourceId = linkOriginId(link);
+    if (sourceId === undefined || sourceId === null) return null;
+    return {
+        sourceId,
+        sourceSlot: linkOriginSlot(link),
+        targetId: targetNode.id,
+        targetSlot: inputSlot,
+    };
+}
+
+function restoreCapturedLink(captured) {
+    if (!captured) return false;
+    const source = getGraphNodeById(captured.sourceId);
+    const target = getGraphNodeById(captured.targetId);
+    if (!source || !target) return false;
+    return connectNodes(source, captured.sourceSlot, target, captured.targetSlot);
+}
+
+function inputSourceNode(targetNode, inputName) {
+    const inputSlot = findInputSlot(targetNode, inputName);
+    const link = getGraphLink(targetNode?.inputs?.[inputSlot]?.link);
+    return getGraphNodeById(linkOriginId(link));
+}
+
+function collectUpstreamLoraLoaders(targetNode) {
+    const found = [];
+    const seen = new Set();
+    function visit(node) {
+        if (!node || seen.has(node.id)) return;
+        seen.add(node.id);
+        const text = `${node.type || ""} ${node.title || ""}`.toLowerCase();
+        if (getWidget(node, "lora_name") && text.includes("lora")) found.push(node);
+        for (const input of node.inputs || []) {
+            const link = getGraphLink(input.link);
+            const source = getGraphNodeById(linkOriginId(link));
+            visit(source);
+        }
+    }
+    for (const inputName of ["model", "clip"]) {
+        visit(inputSourceNode(targetNode, inputName));
+    }
+    return found.reverse();
+}
+
+function findUpstreamNode(targetNode, inputNames, predicate) {
+    const seen = new Set();
+    function visit(node) {
+        if (!node || seen.has(node.id)) return null;
+        seen.add(node.id);
+        if (predicate(node)) return node;
+        for (const input of node.inputs || []) {
+            const link = getGraphLink(input.link);
+            const source = getGraphNodeById(linkOriginId(link));
+            const found = visit(source);
+            if (found) return found;
+        }
+        return null;
+    }
+    for (const inputName of inputNames) {
+        const found = visit(inputSourceNode(targetNode, inputName));
+        if (found) return found;
+    }
+    return null;
+}
+
+function nodeSearchText(graphNode) {
+    return `${graphNode?.type || ""} ${graphNode?.title || ""} ${(graphNode?.widgets || []).map((widget) => widget.value || "").join(" ")}`.toLowerCase();
 }
 
 function setNodeWidgetValue(targetNode, widgetName, value) {
@@ -786,8 +1384,239 @@ function setNodeWidgetValue(targetNode, widgetName, value) {
     return true;
 }
 
+function getNodeWidgetValue(targetNode, widgetName) {
+    return getWidget(targetNode, widgetName)?.value;
+}
+
 function findFirstNode(types) {
     return getGraphNodes().find((graphNode) => types.includes(graphNode.type));
+}
+
+function findCheckpointLoaderNodes() {
+    return getGraphNodes().filter((graphNode) => graphNode.type === "CheckpointLoaderSimple");
+}
+
+function findBridgeNodes() {
+    return getGraphNodes().filter((graphNode) => graphNode.type === TARGET_NODE);
+}
+
+function findModelModeSwitchNode() {
+    return getGraphNodes().find((graphNode) => (
+        graphNode.type === "ImpactBoolean" &&
+        /模型模式|模型来源|分体|anima|model mode|model source|checkpoint/i.test(`${graphNode.title || ""} ${graphNode.properties?.["Node name for S&R"] || ""}`)
+    ));
+}
+
+function hasSplitAnimaModelSource() {
+    const text = getGraphNodes()
+        .map((graphNode) => `${graphNode.type || ""} ${graphNode.title || ""} ${(graphNode.widgets || []).map((widget) => widget.value || "").join(" ")}`)
+        .join("\n")
+        .toLowerCase();
+    return /anima.*(unet|basev10)|anima_basev10|anima.*text encoder|qwen_image_vae/.test(text);
+}
+
+function sourceIsCheckpointLoader(node, inputName) {
+    return Boolean(findUpstreamNode(node, [inputName], (source) => source.type === "CheckpointLoaderSimple"));
+}
+
+function sourceLooksLikeSplitAnima(node, inputName) {
+    const source = inputSourceNode(node, inputName);
+    if (!source) return false;
+    return /anima|qwen_image_vae|unetloader|cliploader|vaeloader/.test(nodeSearchText(source));
+}
+
+function isDirectCheckpointMode() {
+    return findBridgeNodes().some((bridgeNode) => sourceIsCheckpointLoader(bridgeNode, "model") || sourceIsCheckpointLoader(bridgeNode, "clip"));
+}
+
+function directSwitchState() {
+    const graph = app.graph;
+    graph.__webuiBridgeDirectSwitch = graph.__webuiBridgeDirectSwitch || {
+        bridgeInputs: [],
+        vaeInputs: [],
+        checkpointNodeId: null,
+    };
+    return graph.__webuiBridgeDirectSwitch;
+}
+
+function captureDirectInput(collection, node, inputSlot) {
+    if (!node || inputSlot < 0) return;
+    const key = `${node.id}:${inputSlot}`;
+    if (collection.some((item) => item.key === key)) return;
+    const captured = captureInputLink(node, inputSlot);
+    if (captured) collection.push({ ...captured, key });
+}
+
+function findDirectCheckpointLoader() {
+    const state = directSwitchState();
+    const stored = state.checkpointNodeId ? getGraphNodeById(state.checkpointNodeId) : null;
+    if (stored?.type === "CheckpointLoaderSimple") return stored;
+    const titled = findCheckpointLoaderNodes().find((graphNode) => /Prompt Bridge Direct Checkpoint/i.test(graphNode.title || ""));
+    if (titled) {
+        state.checkpointNodeId = titled.id;
+        return titled;
+    }
+    const existing = findCheckpointLoaderNodes()[0];
+    if (existing) {
+        state.checkpointNodeId = existing.id;
+        return existing;
+    }
+    if (!window.LiteGraph?.createNode || !app.graph?.add) return null;
+    const bridgeNode = findBridgeNodes()[0];
+    const loader = LiteGraph.createNode("CheckpointLoaderSimple");
+    if (!loader) return null;
+    loader.title = "Prompt Bridge Direct Checkpoint";
+    loader.pos = [
+        (bridgeNode?.pos?.[0] || 60) + (bridgeNode?.size?.[0] || DEFAULT_PANEL_WIDTH) + 60,
+        bridgeNode?.pos?.[1] || 60,
+    ];
+    app.graph.add(loader);
+    state.checkpointNodeId = loader.id;
+    app.graph.setDirtyCanvas(true, true);
+    return loader;
+}
+
+function findVaeTargetsForDirectSwitch() {
+    const targets = [];
+    for (const graphNode of getGraphNodes()) {
+        for (const [slot, input] of (graphNode.inputs || []).entries()) {
+            if (input.type !== "VAE") continue;
+            const source = inputSourceNode(graphNode, input.name);
+            if (source?.type === "CheckpointLoaderSimple") {
+                targets.push({ node: graphNode, slot });
+                continue;
+            }
+            const text = nodeSearchText(source);
+            if (source?.type === "VAELoader" && /anima|qwen_image_vae|vae/.test(text)) {
+                targets.push({ node: graphNode, slot });
+            }
+        }
+    }
+    return targets;
+}
+
+function applyDirectCheckpointModel(modelName) {
+    const loader = findDirectCheckpointLoader();
+    if (!loader) return { changed: false, message: "未找到也无法创建 CheckpointLoaderSimple" };
+    const modelChanged = setNodeWidgetValue(loader, "ckpt_name", modelName);
+    const state = directSwitchState();
+    state.checkpointNodeId = loader.id;
+    let changed = modelChanged ? 1 : 0;
+    for (const bridgeNode of findBridgeNodes()) {
+        for (const [inputName, outputName] of [["model", "MODEL"], ["clip", "CLIP"]]) {
+            const inputSlot = findInputSlot(bridgeNode, inputName);
+            if (inputSlot < 0) continue;
+            captureDirectInput(state.bridgeInputs, bridgeNode, inputSlot);
+            if (connectNodes(loader, findOutputSlot(loader, outputName), bridgeNode, inputSlot)) changed += 1;
+        }
+    }
+    for (const target of findVaeTargetsForDirectSwitch()) {
+        captureDirectInput(state.vaeInputs, target.node, target.slot);
+        if (connectNodes(loader, findOutputSlot(loader, "VAE", 2), target.node, target.slot)) changed += 1;
+    }
+    return {
+        changed: changed > 0,
+        message: `已直接切换到整合模型: ${modelName}`,
+    };
+}
+
+function restoreDirectSplitModelMode() {
+    const state = directSwitchState();
+    let changed = 0;
+    for (const captured of [...state.bridgeInputs, ...state.vaeInputs]) {
+        if (restoreCapturedLink(captured)) changed += 1;
+    }
+    return {
+        changed: changed > 0,
+        message: changed ? "已切回分体 Anima/Qwen 模式" : "当前工作流没有可恢复的分体模型接线",
+    };
+}
+
+function currentModelMode() {
+    if (isDirectCheckpointMode()) return false;
+    const switchNode = findModelModeSwitchNode();
+    const switchValue = getNodeWidgetValue(switchNode, "value");
+    if (switchValue !== undefined) return Boolean(switchValue);
+    if (findBridgeNodes().some((bridgeNode) => sourceLooksLikeSplitAnima(bridgeNode, "model") || sourceLooksLikeSplitAnima(bridgeNode, "clip"))) return true;
+    if (hasSplitAnimaModelSource()) return true;
+    return null;
+}
+
+function collectCheckpointOptions(models = {}) {
+    const seen = new Set();
+    const options = [];
+    const add = (value) => {
+        const text = String(value || "").trim();
+        if (!text || seen.has(text)) return;
+        seen.add(text);
+        options.push(text);
+    };
+    for (const checkpoint of models.checkpoints || []) add(checkpoint);
+    for (const loader of findCheckpointLoaderNodes()) {
+        const widget = getWidget(loader, "ckpt_name");
+        for (const value of widget?.options?.values || []) add(value);
+        add(widget?.value);
+    }
+    return options;
+}
+
+function currentCheckpointName() {
+    const loader = findBridgeNodes()
+        .map((bridgeNode) => findUpstreamNode(bridgeNode, ["model", "clip"], (source) => source.type === "CheckpointLoaderSimple"))
+        .find(Boolean) || findCheckpointLoaderNodes()[0];
+    return String(getNodeWidgetValue(loader, "ckpt_name") || "");
+}
+
+function currentModelFamily() {
+    if (currentModelMode() === true) return "anima";
+    const name = currentCheckpointName().toLowerCase();
+    if (/\b(sd1|1\.5)\b|anything|counterfeit|realisticvision/.test(name)) return "sd1";
+    if (/xl|sdxl|noob|illustrious|pony|wai|animagine|kohaku|prefectpony/.test(name)) return "sdxl/noob";
+    return "unknown";
+}
+
+function loraFamilyCompatibleWithCurrentModel(family) {
+    const loraFamily = String(family || "unknown").toLowerCase();
+    const modelFamily = currentModelFamily();
+    if (!loraFamily || loraFamily === "unknown" || modelFamily === "unknown") return true;
+    if (modelFamily === "anima") return loraFamily === "anima";
+    if (modelFamily === "sdxl/noob") return loraFamily.includes("sdxl") || loraFamily.includes("noob") || loraFamily.includes("pony");
+    if (modelFamily === "sd1") return loraFamily === "sd1";
+    return true;
+}
+
+function isSplitModelMode() {
+    return currentModelMode();
+}
+
+function applyCheckpointModel(name) {
+    const modelName = String(name || "").trim();
+    if (!modelName) return { changed: false, message: "请选择模型" };
+    const switchNode = findModelModeSwitchNode();
+    if (!switchNode) return applyDirectCheckpointModel(modelName);
+    const loaders = findCheckpointLoaderNodes();
+    if (!loaders.length) return { changed: false, message: "未找到 CheckpointLoaderSimple" };
+    let changed = 0;
+    for (const loader of loaders) {
+        if (setNodeWidgetValue(loader, "ckpt_name", modelName)) changed += 1;
+    }
+    if (switchNode) setNodeWidgetValue(switchNode, "value", false);
+    return {
+        changed: changed > 0,
+        message: switchNode
+            ? `已切换到整合模型: ${modelName}`
+            : `已设置 Checkpoint: ${modelName}`,
+    };
+}
+
+function applySplitModelMode() {
+    const switchNode = findModelModeSwitchNode();
+    if (!switchNode) return restoreDirectSplitModelMode();
+    const changed = setNodeWidgetValue(switchNode, "value", true);
+    return {
+        changed,
+        message: "已切换到分体 Anima/Qwen 模式",
+    };
 }
 
 function parseInfotextClient(text) {
@@ -887,6 +1716,263 @@ async function fetchLoraInfo(name) {
         }).then((response) => (response.ok ? response.json() : null)).catch(() => null));
     }
     return loraInfoCache.get(name);
+}
+
+async function fetchLoraUserMetadata(name) {
+    const response = await api.fetchApi(`/webui_prompt_bridge/lora_user_metadata?name=${encodeURIComponent(name)}`, {
+        cache: "no-store",
+    });
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+}
+
+async function saveLoraUserMetadata(name, values) {
+    const response = await api.fetchApi("/webui_prompt_bridge/lora_user_metadata", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, ...values }),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+}
+
+async function replaceLoraPreview(name, file) {
+    const form = new FormData();
+    form.append("name", name);
+    form.append("preview", file);
+    const response = await api.fetchApi("/webui_prompt_bridge/lora_preview", {
+        method: "POST",
+        body: form,
+    });
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+}
+
+function loraPromptText(item) {
+    const weight = Number(item?.preferred_weight || item?.user_metadata?.["preferred weight"] || 0);
+    const strength = weight > 0 ? weight : 1;
+    const base = `<lora:${item.alias || item.base_name || item.name}:${Number(strength).toFixed(2).replace(/\.?0+$/, "")}>`;
+    const activation = String(item?.activation_text || item?.user_metadata?.["activation text"] || "").trim();
+    return activation ? `${base}, ${activation}` : base;
+}
+
+function applyLoraDetailToItem(item, detail) {
+    const user = detail?.user_metadata || {};
+    item.description = user.description || detail?.description || "";
+    item.user_metadata = user;
+    item.manual_category = user.category || "";
+    item.category = item.manual_category;
+    item.activation_text = user["activation text"] || "";
+    item.negative_text = user["negative text"] || "";
+    item.preferred_weight = Number(user["preferred weight"] || 0);
+    item.sd_version = user["sd version"] || detail?.sd_version || "";
+    item.notes = user.notes || "";
+    item.auto_category = loraAutoCategoryForItem(item);
+    item.category_label = loraCategoryForItem(item);
+    item.kind_label = item.category_label;
+    if (detail?.thumbnail) item.thumbnail = `${detail.thumbnail}${detail.thumbnail.includes("?") ? "&" : "?"}t=${Date.now()}`;
+    item.prompt = loraPromptText(item);
+    return item;
+}
+
+function randomPromptFromTrainingTags(tags) {
+    const list = Array.isArray(tags) ? tags : [];
+    if (!list.length) return "";
+    const maxCount = Number(list[0]?.count || 1) || 1;
+    const selected = [];
+    for (const item of list) {
+        const tag = String(item.tag || "").trim();
+        const count = Number(item.count || 0);
+        if (tag && count > Math.random() * maxCount) selected.push(tag.replace(/[()[\]{}]/g, "\\$&"));
+    }
+    return selected.sort().join(", ");
+}
+
+function showLoraMetadataDialog(item, { categoryOptions = [], onSaved, onStatus } = {}) {
+    const mask = el("div", { class: "webui-bridge-lora-mask" });
+    const preview = el("div", { class: "webui-bridge-lora-edit-preview" }, "NO PREVIEW");
+    const title = el("div", { class: "webui-bridge-lora-edit-title" }, loraDisplayName(item));
+    const description = el("textarea", { class: "webui-bridge-lora-edit-textarea", rows: "4" });
+    const tableBody = el("div", { class: "webui-bridge-lora-edit-table" });
+    const categoryListId = `webui-bridge-lora-category-${Math.random().toString(36).slice(2)}`;
+    const categoryList = el("datalist", { id: categoryListId }, collectLoraCategoryOptions([{ ...item }, ...categoryOptions.map((value) => ({ manual_category: value }))]).map((value) => el("option", { value })));
+    const category = el("input", {
+        class: "webui-bridge-lora-edit-input",
+        list: categoryListId,
+        title: "留空使用自动分类",
+    });
+    const autoCategory = el("span", { class: "webui-bridge-lora-auto-category" });
+    const sdVersion = el("select", { class: "webui-bridge-lora-edit-input" }, [
+        el("option", { value: "SD1" }, "SD1"),
+        el("option", { value: "SD2" }, "SD2"),
+        el("option", { value: "SDXL" }, "SDXL"),
+        el("option", { value: "Unknown" }, "Unknown"),
+    ]);
+    const tagBox = el("div", { class: "webui-bridge-lora-tags" });
+    const activation = el("textarea", { class: "webui-bridge-lora-edit-input", rows: "2" });
+    const preferredWeight = el("input", { class: "webui-bridge-lora-edit-weight", type: "number", min: "0", max: "2", step: "0.01" });
+    const negative = el("textarea", { class: "webui-bridge-lora-edit-input", rows: "2" });
+    const randomPrompt = el("textarea", { class: "webui-bridge-lora-edit-input", rows: "3", readonly: "readonly" });
+    const notes = el("textarea", { class: "webui-bridge-lora-edit-textarea", rows: "4" });
+    const status = el("div", { class: "webui-bridge-lora-edit-status" });
+    const fileInput = el("input", { type: "file", accept: "image/png,image/jpeg,image/webp", style: { display: "none" } });
+    let detail = null;
+
+    const close = () => mask.remove();
+    const setDialogStatus = (text) => {
+        status.textContent = text || "";
+        status.classList.toggle("visible", Boolean(text));
+    };
+    const fill = (nextDetail) => {
+        detail = nextDetail;
+        applyLoraDetailToItem(item, detail);
+        title.textContent = loraDisplayName(item);
+        description.value = item.description || "";
+        category.value = loraManualCategory(item);
+        category.placeholder = `自动: ${item.auto_category || loraAutoCategoryForItem(item)}`;
+        autoCategory.textContent = `自动: ${item.auto_category || loraAutoCategoryForItem(item)}`;
+        sdVersion.value = item.sd_version || "Unknown";
+        activation.value = item.activation_text || "";
+        preferredWeight.value = String(item.preferred_weight || 0);
+        negative.value = item.negative_text || "";
+        notes.value = item.notes || "";
+        if (detail.thumbnail) {
+            preview.innerHTML = "";
+            preview.append(el("img", { src: item.thumbnail || detail.thumbnail, alt: "" }));
+        } else {
+            preview.textContent = "NO PREVIEW";
+        }
+        tableBody.innerHTML = "";
+        for (const row of detail.metadata_table || []) {
+            if (!row.value) continue;
+            tableBody.append(el("div", { class: "webui-bridge-lora-edit-table-row" }, [
+                el("strong", {}, row.label),
+                el("span", {}, row.value),
+            ]));
+        }
+        tagBox.innerHTML = "";
+        const tags = detail.training_tags || [];
+        for (const tag of tags.slice(0, 32)) {
+            tagBox.append(el("button", {
+                type: "button",
+                title: "Add/remove this tag in activation text",
+                onclick: () => {
+                    const parts = activation.value.split(/\s*,\s*/).filter(Boolean);
+                    const index = parts.indexOf(tag.tag);
+                    if (index >= 0) parts.splice(index, 1);
+                    else parts.push(tag.tag);
+                    activation.value = parts.join(", ");
+                },
+            }, [
+                el("span", {}, tag.tag),
+                el("b", {}, tag.count),
+            ]));
+        }
+        randomPrompt.value = randomPromptFromTrainingTags(tags);
+    };
+
+    const panel = el("div", { class: "webui-bridge-lora-edit" }, [
+        el("div", { class: "webui-bridge-lora-edit-head" }, [
+            title,
+            el("button", { type: "button", title: "Close", onclick: close }, "x"),
+        ]),
+        el("div", { class: "webui-bridge-lora-edit-body" }, [
+            el("div", { class: "webui-bridge-lora-edit-main" }, [
+                el("label", {}, ["描述", description]),
+                tableBody,
+                el("label", {}, [
+                    "分类",
+                    el("div", { class: "webui-bridge-lora-category-row" }, [
+                        category,
+                        autoCategory,
+                    ]),
+                ]),
+                el("label", {}, ["Stable Diffusion 版本", sdVersion]),
+                el("label", {}, ["数据集的训练标签", tagBox]),
+                el("label", {}, ["触发词", activation]),
+                el("label", { class: "webui-bridge-lora-weight-row" }, [
+                    el("span", {}, "推荐权重"),
+                    preferredWeight,
+                ]),
+                el("label", {}, ["反向提示词", negative]),
+                el("label", {}, [
+                    el("span", { class: "webui-bridge-lora-random-head" }, [
+                        el("span", {}, "随机提示词"),
+                        el("button", {
+                            type: "button",
+                            onclick: () => {
+                                randomPrompt.value = randomPromptFromTrainingTags(detail?.training_tags || []);
+                            },
+                        }, "生成"),
+                    ]),
+                    randomPrompt,
+                ]),
+                el("label", {}, ["注意事项", notes]),
+            ]),
+            preview,
+        ]),
+        el("div", { class: "webui-bridge-lora-edit-actions" }, [
+            el("button", { type: "button", onclick: close }, "取消"),
+            el("button", { type: "button", class: "primary", onclick: () => fileInput.click() }, "替换预览图"),
+            el("button", {
+                type: "button",
+                class: "primary",
+                onclick: async () => {
+                    try {
+                        setDialogStatus("保存中...");
+                        const saved = await saveLoraUserMetadata(item.name, {
+                            description: description.value,
+                            category: category.value.trim(),
+                            sd_version: sdVersion.value,
+                            activation_text: activation.value,
+                            preferred_weight: Number(preferredWeight.value || 0),
+                            negative_text: negative.value,
+                            notes: notes.value,
+                        });
+                        fill(saved);
+                        onSaved?.(saved, item);
+                        onStatus?.("LoRA metadata saved");
+                        close();
+                    } catch (error) {
+                        setDialogStatus(error.message || "Save failed");
+                    }
+                },
+            }, "保存"),
+        ]),
+        status,
+        fileInput,
+        categoryList,
+    ]);
+
+    fileInput.addEventListener("change", async () => {
+        const file = fileInput.files?.[0];
+        if (!file) return;
+        try {
+            setDialogStatus("替换预览图...");
+            const updated = await replaceLoraPreview(item.name, file);
+            fill(updated);
+            onSaved?.(updated, item);
+            onStatus?.("LoRA preview replaced");
+            setDialogStatus("");
+        } catch (error) {
+            setDialogStatus(error.message || "Preview upload failed");
+        } finally {
+            fileInput.value = "";
+        }
+    });
+
+    mask.addEventListener("click", (event) => {
+        if (event.target === mask) close();
+    });
+    mask.append(panel);
+    document.body.append(mask);
+    setDialogStatus("读取 LoRA 信息...");
+    fetchLoraUserMetadata(item.name).then((nextDetail) => {
+        fill(nextDetail);
+        setDialogStatus("");
+    }).catch((error) => {
+        setDialogStatus(error.message || "Load failed");
+    });
 }
 
 function compactCount(value) {
@@ -1149,6 +2235,14 @@ function createToolButton(text, title, onclick) {
     return el("button", { class: "webui-bridge-tool", title, onclick }, text);
 }
 
+function createPanelErrorView(error) {
+    const message = error?.stack || error?.message || String(error || "Unknown error");
+    return el("div", { class: "webui-bridge-panel webui-bridge-panel-error" }, [
+        el("div", { class: "webui-bridge-error-title" }, "WebUI Prompt Bridge failed to render"),
+        el("pre", {}, message),
+    ]);
+}
+
 function promptContains(text, prompt) {
     if (!prompt) return false;
     return (text || "").toLowerCase().includes(prompt.toLowerCase());
@@ -1158,6 +2252,59 @@ function promptHasExactTag(text, prompt) {
     const target = String(prompt || "").trim().toLowerCase();
     if (!target) return false;
     return splitPromptTags(text).some((tag) => tag.value.trim().toLowerCase() === target);
+}
+
+function promptHintScore(tags, hints) {
+    let score = 0;
+    for (const tag of tags) {
+        const normalized = tag.replace(/[_-]+/g, " ").toLowerCase();
+        if (hints.some((hint) => normalized === hint || normalized.includes(hint))) score += 1;
+    }
+    return score;
+}
+
+function looksLikeMisplacedPositivePrompt(text) {
+    const value = String(text || "").trim();
+    if (!value) return false;
+    const tags = splitPromptTags(value).map((tag) => tag.value.trim().toLowerCase()).filter(Boolean);
+    const hasLora = /<\s*(?:lora|lyco)\s*:/i.test(value);
+    const positiveScore = promptHintScore(tags, POSITIVE_PROMPT_HINTS);
+    const negativeScore = promptHintScore(tags, NEGATIVE_PROMPT_HINTS);
+    if (hasLora && negativeScore <= Math.max(1, positiveScore + 1)) return true;
+    return positiveScore >= 2 && positiveScore >= negativeScore;
+}
+
+function queueErrorMessage(error) {
+    const messages = [];
+    const visit = (value) => {
+        if (!value || messages.length >= 5) return;
+        if (typeof value === "string") {
+            messages.push(value);
+            return;
+        }
+        if (Array.isArray(value)) {
+            for (const item of value) visit(item);
+            return;
+        }
+        if (typeof value !== "object") return;
+        if (value.message) messages.push(value.message);
+        if (value.details) messages.push(value.details);
+        if (value.exception_message) messages.push(value.exception_message);
+        if (value.received_value !== undefined && value.input_name) {
+            messages.push(`${value.input_name}: ${value.received_value}`);
+        }
+        visit(value.error);
+        visit(value.errors);
+        visit(value.node_errors);
+        visit(value.extra_info);
+    };
+    visit(error);
+    const raw = messages.find(Boolean) || error?.message || error || "未知错误";
+    let message = String(raw).replace(/\s+/g, " ").trim();
+    if (/Failed to convert an input value to a FLOAT value/i.test(message)) {
+        message = `数字参数为空或格式不对: ${message}`;
+    }
+    return message.length > 260 ? `${message.slice(0, 257)}...` : message;
 }
 
 function createTagButton(tag, textarea, sync, rerender, isNegative = false, state = null) {
@@ -1511,14 +2658,37 @@ function buildPanel(node) {
         activeTextarea: null,
         loras: [],
         styles: [],
+        models: { checkpoints: [], unets: [], clips: [], vaes: [] },
         promptAllInOne: { group_tags: [], favorites: {} },
         selectedStyles: new Set(),
+        loraFolder: "__all",
+        loraSort: "path",
+        loraSortDescending: false,
+        loraTreeOpen: new Set(["__all", "group:smart", "group:sd", "group:status", "group:folders"]),
     };
+    let clearPromptPlacementWarning = () => {};
+    let statusTimer = null;
 
     const sync = () => {
         setWidgetValue(node, "positive_prompt", positive.textarea.value);
         setWidgetValue(node, "negative_prompt", negative.textarea.value);
         updateCounters();
+    };
+
+    const importUpstreamLoras = () => {
+        let added = 0;
+        const seen = new Set();
+        for (const loader of collectUpstreamLoraLoaders(node)) {
+            const item = loraPromptFromLoader(loader, state);
+            if (!item || seen.has(item.key) || promptHasLora(positive.textarea.value, item.key)) continue;
+            seen.add(item.key);
+            if (addPromptArea(positive.textarea, item.prompt)) added += 1;
+        }
+        if (added) {
+            setWidgetValue(node, "positive_prompt", positive.textarea.value);
+            setStatus(`已自动导入前置 LoRA: ${added} 个`, { kind: "success" });
+        }
+        return added;
     };
 
     const onFocus = (textarea) => {
@@ -1554,6 +2724,7 @@ function buildPanel(node) {
     };
 
     const onInput = (textarea) => {
+        clearPromptPlacementWarning();
         if (textarea.__webuiBridgeAutoTranslating) {
             sync();
             return;
@@ -1600,7 +2771,13 @@ function buildPanel(node) {
     const styleSelect = el("select", { class: "webui-bridge-styles", multiple: "multiple" });
     const styleName = el("input", { class: "webui-bridge-style-name", placeholder: "Style name" });
     const networkSearch = el("input", { class: "webui-bridge-search", placeholder: "Search LoRA / LyCORIS" });
+    const networkCount = el("span", { class: "webui-bridge-network-count" }, "0");
+    const networkTree = el("div", { class: "webui-bridge-network-tree" });
+    const networkPane = el("div", { class: "webui-bridge-network-pane" });
     const cards = el("div", { class: "webui-bridge-card-grid" });
+    const modelSelect = el("select", { class: "webui-bridge-model-select", title: "选择任意整合 checkpoint 模型" });
+    const modelModeBadge = el("span", { class: "webui-bridge-model-mode" }, "模型");
+    const modelCount = el("span", { class: "webui-bridge-model-count" }, "0");
     const status = el("div", { class: "webui-bridge-status" }, "");
     const clipStrengthInput = el("input", {
         type: "number",
@@ -1609,7 +2786,11 @@ function buildPanel(node) {
         step: "0.05",
         value: clipStrengthWidget?.value ?? 1,
         title: "Default LoRA CLIP strength when tag has no third value",
-        oninput: (event) => setWidgetValue(node, "default_clip_strength", Number(event.currentTarget.value)),
+        oninput: (event) => {
+            event.currentTarget.classList.remove("error");
+            const value = event.currentTarget.value;
+            setWidgetValue(node, "default_clip_strength", value.trim() === "" ? "" : Number(value));
+        },
     });
     const failOnMissingInput = el("input", {
         type: "checkbox",
@@ -1618,10 +2799,132 @@ function buildPanel(node) {
     });
     failOnMissingInput.checked = Boolean(failOnMissingWidget?.value ?? true);
 
-    const setStatus = (message) => {
+    const setStatus = (message, options = {}) => {
+        window.clearTimeout(statusTimer);
         status.textContent = message || "";
         status.classList.toggle("visible", Boolean(message));
-        if (message) window.setTimeout(() => status.classList.remove("visible"), 5000);
+        status.classList.toggle("error", options.kind === "error");
+        status.classList.toggle("success", options.kind === "success");
+        status.classList.remove("has-actions");
+        if (message && !options.sticky) {
+            statusTimer = window.setTimeout(() => status.classList.remove("visible"), options.duration || 5000);
+        }
+    };
+
+    const widgetDisplayName = (graphNode, widgetName) => {
+        const title = graphNode?.title || graphNode?.type || `Node ${graphNode?.id ?? ""}`;
+        const labels = {
+            default_clip_strength: "CLIP",
+            cfg: "CFG",
+            denoise: "Denoise",
+            steps: "Steps",
+        };
+        return `${title} / ${labels[widgetName] || widgetName}`;
+    };
+
+    const numericWidgetIsInvalid = (value) => {
+        if (value === undefined || value === null) return true;
+        if (typeof value === "string" && value.trim() === "") return true;
+        return !Number.isFinite(Number(value));
+    };
+
+    const validateNumericParameters = () => {
+        const invalid = [];
+        clipStrengthInput.classList.remove("error");
+        if (numericWidgetIsInvalid(clipStrengthInput.value)) {
+            invalid.push("Bridge / CLIP");
+            clipStrengthInput.classList.add("error");
+        }
+        const samplerNodes = getGraphNodes().filter((graphNode) => ["KSampler", "KSamplerAdvanced"].includes(graphNode.type));
+        for (const samplerNode of samplerNodes) {
+            for (const widgetName of ["steps", "cfg", "denoise"]) {
+                const widget = getWidget(samplerNode, widgetName);
+                if (widget && numericWidgetIsInvalid(widget.value)) invalid.push(widgetDisplayName(samplerNode, widgetName));
+            }
+        }
+        if (!invalid.length) return true;
+        setStatus(`这些数字参数为空或格式不对，请先填数字: ${invalid.join("，")}`, { kind: "error", sticky: true });
+        return false;
+    };
+
+    clearPromptPlacementWarning = () => {
+        positive.row.classList.remove("prompt-placement-error");
+        negative.row.classList.remove("prompt-placement-error");
+        positive.textarea.classList.remove("error");
+        negative.textarea.classList.remove("error");
+    };
+
+    const repairMisplacedPrompt = () => {
+        const misplaced = negative.textarea.value.trim();
+        if (!misplaced) return;
+        setTextareaValue(positive.textarea, misplaced);
+        setTextareaValue(negative.textarea, DEFAULT_NEGATIVE_PROMPT);
+        clearPromptPlacementWarning();
+        sync();
+        renderPromptPanels();
+    };
+
+    const showPromptPlacementWarning = () => {
+        positive.row.classList.add("prompt-placement-error");
+        negative.row.classList.add("prompt-placement-error");
+        positive.textarea.classList.add("error");
+        negative.textarea.classList.add("error");
+        setStatus("正向 Prompt 是空的；人物、角色和 LoRA 被放进了 Negative prompt，所以这次不会提交。", { kind: "error", sticky: true });
+        status.classList.add("has-actions");
+        status.append(
+            el("button", {
+                class: "webui-bridge-status-action primary",
+                type: "button",
+                onclick: async (event) => {
+                    event.stopPropagation();
+                    repairMisplacedPrompt();
+                    await queuePrompt();
+                },
+            }, "修正并生成"),
+            el("button", {
+                class: "webui-bridge-status-action",
+                type: "button",
+                onclick: (event) => {
+                    event.stopPropagation();
+                    repairMisplacedPrompt();
+                    setStatus("已把内容移到 Prompt，并填入默认反向词。", { kind: "success" });
+                },
+            }, "只修正"),
+        );
+        positive.textarea.focus();
+    };
+
+    const renderModelSwitch = () => {
+        const checkpoints = collectCheckpointOptions(state.models);
+        const current = currentCheckpointName();
+        const split = isSplitModelMode();
+        const canUseSplit = split !== null || hasSplitAnimaModelSource();
+        modelSelect.innerHTML = "";
+        if (canUseSplit) {
+            modelSelect.append(el("option", { value: SPLIT_ANIMA_MODEL_VALUE }, SPLIT_ANIMA_MODEL_LABEL));
+        }
+        if (!checkpoints.length && !canUseSplit) {
+            modelSelect.append(el("option", { value: "" }, "No model source connected"));
+            modelSelect.disabled = true;
+        } else {
+            for (const checkpoint of checkpoints) {
+                modelSelect.append(el("option", { value: checkpoint }, checkpoint));
+            }
+            modelSelect.disabled = false;
+            if (split === true && canUseSplit) modelSelect.value = SPLIT_ANIMA_MODEL_VALUE;
+            else if (current && checkpoints.includes(current)) modelSelect.value = current;
+        }
+        modelModeBadge.textContent = split === null ? "未连接模式开关" : split ? "分体 Anima/Qwen" : "整合 Checkpoint";
+        modelModeBadge.classList.toggle("checkpoint", split === false);
+        modelCount.textContent = `${checkpoints.length + (canUseSplit ? 1 : 0)} models`;
+    };
+
+    const applySelectedModel = () => {
+        const result = modelSelect.value === SPLIT_ANIMA_MODEL_VALUE
+            ? applySplitModelMode()
+            : applyCheckpointModel(modelSelect.value);
+        renderModelSwitch();
+        setStatus(result.message);
     };
 
     const updateCounters = () => {
@@ -1647,21 +2950,130 @@ function buildPanel(node) {
         }
     };
 
-    const renderCards = () => {
-        const q = networkSearch.value.trim().toLowerCase();
-        cards.innerHTML = "";
-        for (const item of state.loras.filter((x) => !q || x.name.toLowerCase().includes(q) || x.alias.toLowerCase().includes(q)).slice(0, 80)) {
-            const card = el("button", {
-                class: "webui-bridge-card",
-                title: item.name,
-                onclick: async () => {
-                    const target = state.activeTextarea || positive.textarea;
-                    await updatePromptAreaWithLoraKeywords(target, item.prompt, target === negative.textarea, sync, setStatus);
+    const renderTree = () => {
+        const tree = buildLoraFolderTree(state.loras);
+        networkTree.innerHTML = "";
+        const renderNode = (node, depth = 0) => {
+            const isRoot = node.path === "__all";
+            const open = isRoot || state.loraTreeOpen.has(node.path);
+            const selected = state.loraFolder === node.path;
+            const children = [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+            const row = el("button", {
+                class: `webui-bridge-tree-row${selected ? " selected" : ""}`,
+                title: isRoot ? "All LoRA" : node.name,
+                style: { "--depth": String(depth) },
+                onclick: (event) => {
+                    const hitChevron = event.target?.classList?.contains("webui-bridge-tree-chevron");
+                    if (hitChevron && children.length) {
+                        if (state.loraTreeOpen.has(node.path)) state.loraTreeOpen.delete(node.path);
+                        else state.loraTreeOpen.add(node.path);
+                    } else {
+                        state.loraFolder = node.path;
+                    }
+                    renderTree();
                     renderCards();
                 },
             }, [
-                el("span", { class: "webui-bridge-card-kind" }, "LoRA"),
-                el("span", { class: "webui-bridge-card-name" }, item.alias),
+                el("span", { class: `webui-bridge-tree-chevron${open ? " open" : ""}` }, children.length ? "›" : ""),
+                el("span", { class: "webui-bridge-tree-icon" }, node.icon || (isRoot ? "All" : "Dir")),
+                el("span", { class: "webui-bridge-tree-name" }, isRoot ? "全部 LoRA" : node.name),
+                el("span", { class: "webui-bridge-tree-count" }, String(node.count)),
+            ]);
+            networkTree.append(row);
+            if (open) {
+                for (const child of children) renderNode(child, depth + 1);
+            }
+        };
+        renderNode(tree);
+    };
+
+    const renderCards = () => {
+        const q = networkSearch.value.trim().toLowerCase();
+        const filter = state.loraFolder || "__all";
+        const filtered = sortLoras(state.loras.filter((item) => (
+            loraMatchesFilter(item, filter) &&
+            loraMatchesQuery(item, q)
+        )), state.loraSort, state.loraSortDescending);
+        const visible = filtered.slice(0, 160);
+        cards.innerHTML = "";
+        networkCount.textContent = `${filtered.length}${filtered.length > visible.length ? ` / showing ${visible.length}` : ""}`;
+        if (!visible.length) {
+            cards.append(el("div", { class: "webui-bridge-empty" }, "No LoRA matched"));
+            return;
+        }
+        for (const item of visible) {
+            item.prompt = loraPromptText(item);
+            const displayName = loraDisplayName(item);
+            const folderLabel = loraFolderLabel(item.folder);
+            const categoryLabel = loraCategoryForItem(item);
+            const categorySource = loraManualCategory(item) ? "手动分类" : "自动分类";
+            const openEditor = (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                showLoraMetadataDialog(item, {
+                    categoryOptions: collectLoraCategoryOptions(state.loras),
+                    onSaved: () => {
+                        renderCards();
+                        renderTree();
+                    },
+                    onStatus: setStatus,
+                });
+            };
+            const card = el("div", {
+                class: "webui-bridge-card",
+                title: item.name,
+                role: "button",
+                tabindex: "0",
+                onclick: async () => {
+                    const target = state.activeTextarea || positive.textarea;
+                    await updatePromptAreaWithLoraKeywords(target, loraPromptText(item), target === negative.textarea, sync, setStatus);
+                    if (item.negative_text) {
+                        updatePromptArea(negative.textarea, `(${item.negative_text}:1)`, true);
+                        sync();
+                    }
+                    renderCards();
+                },
+                onkeydown: (event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        event.currentTarget.click();
+                    }
+                },
+            }, [
+                item.thumbnail
+                    ? el("img", { class: "webui-bridge-card-preview", src: item.thumbnail, alt: "", loading: "lazy" })
+                    : el("span", { class: "webui-bridge-card-preview webui-bridge-card-preview-empty" }, [
+                        el("span", {}, "NO"),
+                        el("span", {}, "PREVIEW"),
+                    ]),
+                el("span", { class: "webui-bridge-card-buttons" }, [
+                    el("button", {
+                        type: "button",
+                        title: "Copy LoRA path",
+                        onclick: async (event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            await navigator.clipboard?.writeText(item.name);
+                            setStatus("LoRA path copied");
+                        },
+                    }, "⧉"),
+                    el("button", {
+                        type: "button",
+                        title: "Show LoRA metadata",
+                        onclick: openEditor,
+                    }, "i"),
+                    el("button", {
+                        type: "button",
+                        title: "Edit LoRA metadata",
+                        onclick: openEditor,
+                    }, "✎"),
+                ]),
+                el("span", { class: "webui-bridge-card-actions" }, [
+                    el("span", { class: "webui-bridge-card-name" }, displayName),
+                    el("span", { class: "webui-bridge-card-category", title: categorySource }, categoryLabel),
+                    el("span", { class: "webui-bridge-card-folder" }, folderLabel),
+                    item.description ? el("span", { class: "webui-bridge-card-desc" }, item.description) : null,
+                ]),
             ]);
             cards.append(card);
         }
@@ -1775,23 +3187,45 @@ function buildPanel(node) {
 
     const queuePrompt = async () => {
         sync();
-        if (typeof app.queuePrompt === "function") {
-            await app.queuePrompt(0, 1);
+        if (!validateNumericParameters()) return;
+        const positiveText = positive.textarea.value.trim();
+        const negativeText = negative.textarea.value.trim();
+        if (!positiveText && looksLikeMisplacedPositivePrompt(negativeText)) {
+            showPromptPlacementWarning();
             return;
         }
-        document.querySelector("#queue-button, button.comfy-queue-button")?.click();
+        try {
+            setStatus("正在提交生成任务...");
+            const preflightRepairs = repairStaleInputLinks();
+            if (preflightRepairs) setStatus(`已修复 ${preflightRepairs} 个悬空参数连接，正在提交...`);
+            setStatus(await submitComfyQueue(), { kind: "success" });
+        } catch (error) {
+            const repaired = repairQueueParentLinkError(error);
+            if (repaired) {
+                try {
+                    setStatus("已修复尺寸/参数的悬空连接，正在重试提交...");
+                    setStatus(await submitComfyQueue(), { kind: "success" });
+                    return;
+                } catch (retryError) {
+                    console.error("[WebUIPromptBridge] Queue retry failed", retryError);
+                    setStatus(`重试后仍提交失败: ${queueErrorMessage(retryError)}`, { kind: "error", sticky: true });
+                    return;
+                }
+            }
+            console.error("[WebUIPromptBridge] Queue failed", error);
+            setStatus(`生成提交失败: ${queueErrorMessage(error)}`, { kind: "error", sticky: true });
+        }
     };
 
     const setNodeSize = (width, height) => {
-        const nextWidth = Math.max(760, Math.min(1500, Math.round(width)));
-        const nextHeight = Math.max(500, Math.min(1100, Math.round(height)));
+        const [nextWidth, nextHeight] = clampPanelSize(width, height);
         node.__webuiBridgeDesiredSize = [nextWidth, nextHeight];
         node.setSize([nextWidth, nextHeight]);
         app.graph?.setDirtyCanvas(true, true);
     };
 
     const resizeNode = (deltaWidth, deltaHeight) => {
-        setNodeSize((node.size?.[0] || 980) + deltaWidth, (node.size?.[1] || 720) + deltaHeight);
+        setNodeSize((node.size?.[0] || DEFAULT_PANEL_WIDTH) + deltaWidth, (node.size?.[1] || DEFAULT_PANEL_HEIGHT) + deltaHeight);
     };
 
     const installResizeDrag = (handle) => {
@@ -1801,8 +3235,8 @@ function buildPanel(node) {
             handle.setPointerCapture?.(event.pointerId);
             const startX = event.clientX;
             const startY = event.clientY;
-            const startWidth = node.size?.[0] || 980;
-            const startHeight = node.size?.[1] || 720;
+            const startWidth = node.size?.[0] || DEFAULT_PANEL_WIDTH;
+            const startHeight = node.size?.[1] || DEFAULT_PANEL_HEIGHT;
             const onMove = (moveEvent) => {
                 setNodeSize(startWidth + (moveEvent.clientX - startX), startHeight + (moveEvent.clientY - startY));
             };
@@ -1865,11 +3299,65 @@ function buildPanel(node) {
         }, "纯模型质量"),
     ]);
 
+    const modelSwitchControls = el("div", { class: "webui-bridge-model-switch" }, [
+        el("div", { class: "webui-bridge-model-head" }, [
+            el("span", { class: "webui-bridge-model-title" }, "模型切换"),
+            modelModeBadge,
+        ]),
+        modelSelect,
+        el("div", { class: "webui-bridge-model-actions" }, [
+            el("button", {
+                type: "button",
+                title: "应用当前下拉选择；选择 Anima 分体项会切回分体模型，选择 checkpoint 会切到整合模型",
+                onclick: applySelectedModel,
+            }, "应用选择"),
+            el("button", {
+                type: "button",
+                title: "切回默认 Anima/Qwen 分体模型",
+                onclick: () => {
+                    const result = applySplitModelMode();
+                    renderModelSwitch();
+                    setStatus(result.message);
+                },
+            }, "分体模型"),
+            modelCount,
+        ]),
+    ]);
+
     const sizeControls = el("div", { class: "webui-bridge-size-controls" }, [
         el("button", { title: "Compact size", onclick: () => setNodeSize(840, 620) }, "S"),
         el("button", { title: "Smaller node", onclick: () => resizeNode(-120, -90) }, "-"),
         el("button", { title: "Larger node", onclick: () => resizeNode(120, 90) }, "+"),
-        el("button", { title: "Fit default size", onclick: () => setNodeSize(1040, 980) }, "Fit"),
+        el("button", { title: "Fit default size", onclick: () => setNodeSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT) }, "Fit"),
+    ]);
+    const makeNetworkSortButton = (key, label, title) => el("button", {
+        class: `webui-bridge-network-tool${state.loraSort === key ? " active" : ""}`,
+        title,
+        onclick: (event) => {
+            state.loraSort = key;
+            for (const button of event.currentTarget.parentElement.querySelectorAll(".webui-bridge-network-tool[data-sort]")) {
+                button.classList.toggle("active", button.dataset.sort === key);
+            }
+            renderCards();
+        },
+        "data-sort": key,
+    }, label);
+    const networkControls = el("div", { class: "webui-bridge-network-controls" }, [
+        networkSearch,
+        el("span", { class: "webui-bridge-network-sort-label" }, "Sort"),
+        makeNetworkSortButton("path", "Path", "Sort by folder path"),
+        makeNetworkSortButton("name", "Name", "Sort by LoRA name"),
+        makeNetworkSortButton("modified", "Date", "Sort by modified time"),
+        el("button", {
+            class: "webui-bridge-network-tool",
+            title: "Reverse sort direction",
+            onclick: (event) => {
+                state.loraSortDescending = !state.loraSortDescending;
+                event.currentTarget.classList.toggle("active", state.loraSortDescending);
+                renderCards();
+            },
+        }, "↓"),
+        networkCount,
     ]);
     const resizeGrip = el("div", { class: "webui-bridge-resize-grip", title: "Drag to resize this node" }, "↘");
     installResizeDrag(resizeGrip);
@@ -1884,6 +3372,8 @@ function buildPanel(node) {
             ]),
             el("div", { class: "webui-bridge-action-column" }, [
                 el("button", { class: "webui-bridge-generate", title: "Queue Prompt", onclick: queuePrompt }, "Generate"),
+                status,
+                modelSwitchControls,
                 animaModeControls,
                 sizeControls,
                 toolbar,
@@ -1905,18 +3395,21 @@ function buildPanel(node) {
                         createToolButton("-", "Delete selected style", deleteStyle),
                     ]),
                 ]),
-                status,
             ]),
         ]),
         el("div", { class: "webui-bridge-extra webui-bridge-extra-compact" }, [
             el("div", { class: "webui-bridge-extra-head" }, [
                 el("span", {}, "Extra Networks"),
-                networkSearch,
+                networkControls,
             ]),
-            cards,
+            el("div", { class: "webui-bridge-extra-body" }, [
+                networkTree,
+                networkPane,
+            ]),
         ]),
         resizeGrip,
     ]);
+    networkPane.append(cards);
 
     function installPromptKeys(textarea, after) {
         textarea.addEventListener("keydown", (event) => {
@@ -1950,6 +3443,7 @@ function buildPanel(node) {
         });
     }
     networkSearch.addEventListener("input", renderCards);
+    modelSelect.addEventListener("change", applySelectedModel);
     styleSelect.addEventListener("change", () => {
         styleName.value = styleSelect.selectedOptions[0]?.value || "";
     });
@@ -1957,56 +3451,130 @@ function buildPanel(node) {
     loadBridgeData().then((data) => {
         state.loras = data.loras;
         state.styles = data.styles;
+        state.models = data.models;
         state.promptAllInOne = data.promptAllInOne;
         renderStyles();
+        renderModelSwitch();
+        renderTree();
         renderCards();
+        importUpstreamLoras();
         updateCounters();
         positiveTagPanel.__webuiBridgeRender?.();
         negativeTagPanel.__webuiBridgeRender?.();
     });
 
+    renderModelSwitch();
+    importUpstreamLoras();
     updateCounters();
+    panel.__webuiBridgeImportUpstreamLoras = () => {
+        const added = importUpstreamLoras();
+        if (added) updateCounters();
+    };
     return panel;
 }
 
 function installWebUIPanel(node) {
-    if (node.__webuiBridgePanel) return;
-    for (const widget of node.widgets || []) {
-        if (PROMPT_WIDGETS.has(widget.name) || widget.name.endsWith("_status") || widget.name === "open_webui_prompt_editor") {
-            hideWidget(widget);
+    if (node.__webuiBridgePanel) {
+        const existingWidget = node.widgets?.find((widget) => widget.name === "webui_prompt_frontend");
+        const usablePanel = existingWidget?.element === node.__webuiBridgePanel &&
+            node.__webuiBridgePanel.querySelector?.(".webui-bridge-toprow, .webui-bridge-panel-error");
+        if (usablePanel) {
+            node.__webuiBridgePanel.style.display = "";
+            return;
         }
+        node.__webuiBridgePanel.remove?.();
+        node.__webuiBridgePanel = null;
     }
-    const panel = buildPanel(node);
+    removeBridgeDomWidgets(node);
+    if (!node.__webuiBridgeSetSizeWrapped && typeof node.setSize === "function") {
+        const originalSetSize = node.setSize.bind(node);
+        node.setSize = function (size) {
+            if (Array.isArray(size) && Number.isFinite(size[0]) && Number.isFinite(size[1])) {
+                const clamped = clampPanelSize(size[0], size[1]);
+                node.__webuiBridgeDesiredSize = clamped;
+                return originalSetSize(clamped);
+            }
+            return originalSetSize(size);
+        };
+        node.__webuiBridgeSetSizeWrapped = true;
+    }
+    hideNativeWidgets(node);
+    let panel = null;
+    try {
+        panel = buildPanel(node);
+    } catch (error) {
+        console.error("[WebUIPromptBridge] Failed to build panel", error);
+        panel = createPanelErrorView(error);
+    }
+    if (!node.__webuiBridgeConnectionsWrapped) {
+        chainCallback(node, "onConnectionsChange", () => {
+            window.setTimeout(() => node.__webuiBridgePanel?.__webuiBridgeImportUpstreamLoras?.(), 0);
+        });
+        node.__webuiBridgeConnectionsWrapped = true;
+    }
     if (!node.__webuiBridgeDesiredSize) {
-        node.__webuiBridgeDesiredSize = [
-            Math.max(node.size?.[0] || 1040, 1040),
-            Math.min(Math.max(node.size?.[1] || 980, 980), 1060),
-        ];
+        node.__webuiBridgeDesiredSize = node.__webuiBridgeFreshNode && !node.__webuiBridgeWasConfigured
+            ? clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT)
+            : looksLikeLegacyDefaultSize(node.size)
+                ? clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT)
+            : clampPanelSize(
+                Math.max(node.size?.[0] || DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_WIDTH),
+                Math.max(node.size?.[1] || DEFAULT_PANEL_HEIGHT, DEFAULT_PANEL_HEIGHT),
+            );
+    }
+    if (!node.__webuiBridgeComputeSizeWrapped && typeof node.computeSize === "function") {
+        const originalComputeSize = node.computeSize.bind(node);
+        node.computeSize = function (...args) {
+            if (node.__webuiBridgeDesiredSize) return [...node.__webuiBridgeDesiredSize];
+            return originalComputeSize(...args);
+        };
+        node.__webuiBridgeComputeSizeWrapped = true;
     }
     const domWidget = node.addDOMWidget("webui_prompt_frontend", "webui_prompt_frontend", panel, {
         serialize: false,
         hideOnZoom: false,
         getMinHeight: () => 420,
-        getMaxHeight: () => 1200,
+        getMaxHeight: () => 100000,
     });
+    if (Array.isArray(node.widgets)) {
+        const index = node.widgets.indexOf(domWidget);
+        if (index > 0) {
+            node.widgets.splice(index, 1);
+            node.widgets.unshift(domWidget);
+        }
+    }
+    domWidget.y = 0;
+    domWidget.last_y = 0;
+    const applyDomWidgetSize = (nodeWidth, nodeHeight) => {
+        const widgetWidth = Math.max(720, nodeWidth - 20);
+        const widgetTop = Number.isFinite(domWidget.y) && domWidget.y > 0 ? domWidget.y : 92;
+        const widgetHeight = Math.max(420, nodeHeight - widgetTop - DOM_WIDGET_LAYOUT_PAD);
+        panel.style.width = `${widgetWidth}px`;
+        panel.style.height = `${widgetHeight}px`;
+        return [widgetWidth, widgetHeight];
+    };
     domWidget.computeSize = (width) => {
         const desired = node.__webuiBridgeDesiredSize || node.size || [width || 1040, 820];
         const nodeWidth = desired[0] || width || 1040;
         const nodeHeight = desired[1] || 820;
-        return [Math.max(720, nodeWidth - 20), Math.min(960, Math.max(620, nodeHeight - 120))];
+        return applyDomWidgetSize(nodeWidth, nodeHeight);
     };
+    applyDomWidgetSize(node.__webuiBridgeDesiredSize[0], node.__webuiBridgeDesiredSize[1]);
     node.__webuiBridgePanel = panel;
     node.resizable = true;
-    if (!node.size || node.size[0] < 840 || node.size[1] < 620 || node.size[1] > 1120) {
-        node.__webuiBridgeDesiredSize = [Math.max(node.size?.[0] || 1040, 1040), Math.min(Math.max(node.size?.[1] || 980, 980), 1060)];
+    if (node.__webuiBridgeFreshNode && !node.__webuiBridgeWasConfigured && !node.__webuiBridgeFreshSizeApplied) {
+        node.__webuiBridgeDesiredSize = clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT);
+        node.__webuiBridgeFreshSizeApplied = true;
         node.setSize(node.__webuiBridgeDesiredSize);
+    } else if (looksLikeLegacyDefaultSize(node.size)) {
+        node.__webuiBridgeDesiredSize = clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT);
+        node.setSize(node.__webuiBridgeDesiredSize);
+    } else if (!node.size || node.size[0] < 840 || node.size[1] < 620) {
+        node.__webuiBridgeDesiredSize = clampPanelSize(Math.max(node.size?.[0] || DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_WIDTH), Math.max(node.size?.[1] || DEFAULT_PANEL_HEIGHT, DEFAULT_PANEL_HEIGHT));
+        node.setSize(node.__webuiBridgeDesiredSize);
+    } else if (node.size[0] > PANEL_MAX_WIDTH) {
+        node.setSize(clampPanelSize(node.size[0], node.size[1]));
     }
-    requestAnimationFrame(() => {
-        if (node.size?.[1] > 1120) {
-            node.__webuiBridgeDesiredSize = [Math.max(node.size[0], 1040), 920];
-            node.setSize(node.__webuiBridgeDesiredSize);
-        }
-    });
 }
 
 function addStyles() {
@@ -2016,11 +3584,10 @@ function addStyles() {
     style.textContent = `
         .webui-bridge-panel {
             position: relative;
-            width: max(100%, 1000px);
-            min-width: 1000px;
-            height: max(100%, 840px);
-            min-height: 840px;
-            min-height: 0;
+            width: 100%;
+            min-width: 0;
+            height: 100%;
+            min-height: 620px;
             padding: 8px;
             box-sizing: border-box;
             display: flex;
@@ -2029,8 +3596,30 @@ function addStyles() {
             background: #20242d;
             color: #f2f4f8;
             font-family: Arial, sans-serif;
-            overflow: auto;
+            overflow: hidden;
             container-type: inline-size;
+        }
+        .webui-bridge-panel-error {
+            justify-content: center;
+            padding: 18px;
+            overflow: auto;
+            background: #241820;
+        }
+        .webui-bridge-error-title {
+            color: #ffd1d1;
+            font-size: 15px;
+            font-weight: 700;
+        }
+        .webui-bridge-panel-error pre {
+            margin: 0;
+            padding: 12px;
+            border: 1px solid #7a3d45;
+            border-radius: 6px;
+            background: #130c10;
+            color: #ffdede;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            font: 12px/1.45 Consolas, Monaco, monospace;
         }
         .webui-bridge-resize-grip {
             position: absolute;
@@ -2103,31 +3692,116 @@ function addStyles() {
             border-color: #8bb9ff;
             filter: brightness(1.12);
         }
+        .webui-bridge-model-switch {
+            display: grid;
+            gap: 6px;
+            padding: 8px;
+            border: 1px solid #4c678f;
+            border-radius: 6px;
+            background: #142033;
+            box-shadow: inset 0 0 0 1px rgba(96, 150, 230, .16);
+        }
+        .webui-bridge-model-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            min-width: 0;
+        }
+        .webui-bridge-model-title {
+            color: #eef5ff;
+            font-size: 13px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .webui-bridge-model-mode {
+            min-width: 0;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: #3a4b64;
+            color: #dce9fb;
+            font-size: 10px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .webui-bridge-model-mode.checkpoint {
+            background: #2d694f;
+            color: #eafff5;
+        }
+        .webui-bridge-model-select {
+            width: 100%;
+            min-width: 0;
+            height: 30px;
+            box-sizing: border-box;
+            padding: 4px 8px;
+            border: 1px solid #5b7092;
+            border-radius: 5px;
+            background: #0d131d;
+            color: #f3f7ff;
+            font-size: 12px;
+        }
+        .webui-bridge-model-actions {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 5px;
+        }
+        .webui-bridge-model-actions button {
+            min-width: 0;
+            min-height: 28px;
+            padding: 4px 6px;
+            border: 1px solid #526785;
+            border-radius: 5px;
+            background: #24334a;
+            color: #edf5ff;
+            cursor: pointer;
+            font-size: 11px;
+        }
+        .webui-bridge-model-actions button:hover {
+            border-color: #8bb9ff;
+            background: #2c4870;
+        }
+        .webui-bridge-model-count {
+            color: #a9bad2;
+            font-size: 10px;
+            white-space: nowrap;
+        }
         .webui-bridge-toprow {
             display: grid;
             grid-template-columns: minmax(0, 1fr) clamp(220px, 24%, 280px);
             gap: 8px;
-            flex: 0 0 auto;
+            flex: 0 1 54%;
             min-height: 0;
-            overflow: visible;
+            max-height: none;
+            overflow: hidden;
         }
         .webui-bridge-prompts {
-            display: flex;
-            flex-direction: column;
+            display: grid;
+            grid-template-rows: auto minmax(150px, 1.15fr) auto minmax(120px, .85fr);
             gap: 8px;
             min-width: 0;
             min-height: 0;
-            overflow: visible;
+            overflow: hidden auto;
         }
         .webui-bridge-prompt-row {
             position: relative;
+            display: flex;
+            flex-direction: column;
             border: 1px solid #3e4654;
             border-radius: 6px;
             background: #171a20;
             overflow: hidden;
         }
+        .webui-bridge-prompt-row.has-chips {
+            min-height: 132px;
+        }
         .webui-bridge-prompt-row.active {
             border-color: #6aa3ff;
+        }
+        .webui-bridge-prompt-row.prompt-placement-error {
+            border-color: #d84a4a;
+            box-shadow: 0 0 0 1px rgba(216, 74, 74, .35);
         }
         .webui-bridge-prompt-label {
             padding: 5px 8px;
@@ -2138,8 +3812,9 @@ function addStyles() {
         }
         .webui-bridge-prompt-row textarea {
             width: 100%;
+            flex: 0 0 auto;
             min-height: 48px;
-            max-height: 82px;
+            max-height: 118px;
             padding: 9px 56px 9px 9px;
             box-sizing: border-box;
             border: 0;
@@ -2154,9 +3829,11 @@ function addStyles() {
         }
         .webui-bridge-prompt-chips {
             display: flex;
+            flex: 0 0 auto;
             gap: 8px;
             padding: 8px 8px 38px;
-            max-height: 136px;
+            min-height: 56px;
+            max-height: 126px;
             overflow: auto;
             flex-wrap: wrap;
             border-top: 1px solid #2d3542;
@@ -2332,18 +4009,18 @@ function addStyles() {
             border-radius: 4px;
             background: #0d121b;
             overflow: hidden;
-            min-height: 210px;
-            flex: 0 0 auto;
+            min-height: 0;
+            flex: 1 1 auto;
             display: flex;
             flex-direction: column;
         }
         .webui-bridge-aio-positive {
-            min-height: 276px;
-            height: 276px;
+            min-height: 150px;
+            height: auto;
         }
         .webui-bridge-aio-negative {
-            min-height: 230px;
-            height: 230px;
+            min-height: 120px;
+            height: auto;
         }
         .webui-bridge-aio-header {
             display: flex;
@@ -2508,15 +4185,15 @@ function addStyles() {
             align-content: start;
             gap: 6px;
             flex: 1 1 auto;
-            min-height: 110px;
+            min-height: 0;
             padding: 8px;
             overflow: auto;
         }
         .webui-bridge-aio-positive .webui-bridge-aio-body {
-            min-height: 150px;
+            min-height: 0;
         }
         .webui-bridge-aio-negative .webui-bridge-aio-body {
-            min-height: 104px;
+            min-height: 0;
         }
         .webui-bridge-aio-tag {
             position: relative;
@@ -2642,7 +4319,10 @@ function addStyles() {
             background: #2f73d9;
             color: white;
             font-weight: 700;
-            cursor: default;
+            cursor: pointer;
+        }
+        .webui-bridge-generate:hover {
+            filter: brightness(1.08);
         }
         .webui-bridge-tools {
             display: grid;
@@ -2685,14 +4365,18 @@ function addStyles() {
             background: #111318;
             color: #f2f4f8;
         }
+        .webui-bridge-backend-settings input[type="number"].error {
+            border-color: #d95c68;
+            background: #28161a;
+            color: #ffd6d6;
+        }
         .webui-bridge-backend-settings input[type="checkbox"] {
             width: 14px;
             height: 14px;
             margin: 0;
             accent-color: #2f73d9;
         }
-        .webui-bridge-tool:hover,
-        .webui-bridge-card:hover {
+        .webui-bridge-tool:hover {
             border-color: #6aa3ff;
             background: #343c49;
         }
@@ -2723,7 +4407,10 @@ function addStyles() {
             font-size: 12px;
         }
         .webui-bridge-status {
-            min-height: 18px;
+            min-height: 0;
+            padding: 0;
+            border: 1px solid transparent;
+            border-radius: 5px;
             color: #9fb1c7;
             font-size: 11px;
             line-height: 1.35;
@@ -2733,11 +4420,54 @@ function addStyles() {
         }
         .webui-bridge-status.visible {
             opacity: 1;
+            padding: 7px 8px;
+            border-color: #3d495c;
+            background: #111824;
+        }
+        .webui-bridge-status.error {
+            color: #ffb3b3;
+        }
+        .webui-bridge-status.error.visible {
+            border-color: #8d4049;
+            background: #29181d;
+        }
+        .webui-bridge-status.success {
+            color: #a8e6b1;
+        }
+        .webui-bridge-status.success.visible {
+            border-color: #3b7250;
+            background: #132319;
+        }
+        .webui-bridge-status.has-actions {
+            min-height: 72px;
+        }
+        .webui-bridge-status-action {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 24px;
+            margin: 6px 6px 0 0;
+            padding: 3px 9px;
+            border: 1px solid #5b6678;
+            border-radius: 4px;
+            background: #252d3a;
+            color: #f2f4f8;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        .webui-bridge-status-action.primary {
+            border-color: #5d9bff;
+            background: #2f73d9;
+            color: #fff;
+        }
+        .webui-bridge-status-action:hover {
+            filter: brightness(1.08);
         }
         .webui-bridge-extra {
-            min-height: 0;
-            flex: 0 0 155px;
-            max-height: 190px;
+            min-height: 220px;
+            flex: 1 1 46%;
+            max-height: none;
             display: flex;
             flex-direction: column;
             border: 1px solid #3e4654;
@@ -2746,10 +4476,11 @@ function addStyles() {
             background: #171a20;
         }
         .webui-bridge-extra-compact {
-            min-height: 120px;
+            min-height: 220px;
         }
         .webui-bridge-extra-head {
-            display: flex;
+            display: grid;
+            grid-template-columns: auto minmax(0, 1fr);
             align-items: center;
             gap: 8px;
             padding: 7px 8px;
@@ -2758,8 +4489,14 @@ function addStyles() {
             font-size: 12px;
             color: #cbd4e1;
         }
+        .webui-bridge-network-controls {
+            display: grid;
+            grid-template-columns: minmax(180px, 1fr) auto repeat(4, minmax(34px, auto)) auto;
+            align-items: center;
+            gap: 5px;
+            min-width: 0;
+        }
         .webui-bridge-search {
-            flex: 1;
             min-width: 0;
             padding: 5px 8px;
             border: 1px solid #4d5666;
@@ -2767,26 +4504,192 @@ function addStyles() {
             background: #111318;
             color: #f2f4f8;
         }
+        .webui-bridge-network-count {
+            color: #8fa0b7;
+            font-size: 11px;
+            white-space: nowrap;
+        }
+        .webui-bridge-network-sort-label {
+            color: #8fa0b7;
+            font-size: 11px;
+        }
+        .webui-bridge-network-tool {
+            min-width: 32px;
+            height: 28px;
+            padding: 0 8px;
+            border: 1px solid #4d5666;
+            border-radius: 5px;
+            background: #202733;
+            color: #e5edf9;
+            cursor: pointer;
+            font-size: 11px;
+        }
+        .webui-bridge-network-tool:hover,
+        .webui-bridge-network-tool.active {
+            border-color: #6aa3ff;
+            background: #24466f;
+        }
+        .webui-bridge-extra-body {
+            display: grid;
+            grid-template-columns: minmax(170px, 230px) minmax(0, 1fr);
+            min-height: 0;
+            flex: 1 1 auto;
+        }
+        .webui-bridge-network-pane {
+            min-width: 0;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .webui-bridge-network-tree {
+            min-width: 0;
+            min-height: 0;
+            padding: 6px 4px;
+            overflow: auto;
+            border-right: 1px solid #3e4654;
+            background: #141922;
+        }
+        .webui-bridge-tree-row {
+            width: 100%;
+            min-height: 26px;
+            display: grid;
+            grid-template-columns: 14px 28px minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 4px;
+            padding: 3px 7px 3px calc(6px + var(--depth) * 13px);
+            box-sizing: border-box;
+            border: 0;
+            border-radius: 4px;
+            background: transparent;
+            color: #d7e0ed;
+            text-align: left;
+            cursor: pointer;
+            font-size: 11px;
+        }
+        .webui-bridge-tree-row:hover {
+            background: #263244;
+        }
+        .webui-bridge-tree-row.selected {
+            background: #2c5d9c;
+            color: #fff;
+        }
+        .webui-bridge-tree-chevron {
+            color: #9fb1c7;
+            font-size: 15px;
+            line-height: 1;
+            transform: rotate(0deg);
+        }
+        .webui-bridge-tree-chevron.open {
+            transform: rotate(90deg);
+        }
+        .webui-bridge-tree-icon {
+            color: #90abd0;
+            font-size: 10px;
+            text-align: center;
+        }
+        .webui-bridge-tree-name {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .webui-bridge-tree-count {
+            color: #9fb1c7;
+            font-size: 10px;
+        }
         .webui-bridge-card-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(clamp(104px, 14%, 150px), 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+            grid-auto-rows: clamp(142px, 16vw, 178px);
             align-content: start;
-            gap: 6px;
+            gap: 8px;
             padding: 8px;
             overflow: auto;
             min-height: 0;
             flex: 1 1 auto;
+            scrollbar-width: thin;
         }
         .webui-bridge-card {
-            min-height: 44px;
-            padding: 6px;
+            position: relative;
+            min-height: 0;
+            padding: 0;
             border: 1px solid #3e4654;
             border-radius: 6px;
-            background: #20242d;
+            background: #101722;
             color: #f2f4f8;
             text-align: left;
             cursor: pointer;
             overflow: hidden;
+            box-shadow: 0 0 5px rgba(0, 0, 0, .2);
+        }
+        .webui-bridge-card:hover {
+            box-shadow: 0 0 0 3px rgba(93, 155, 255, .28);
+        }
+        .webui-bridge-card-preview {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .webui-bridge-card-preview-empty {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: #101722;
+            color: #90abd0;
+            font-size: 18px;
+            font-weight: 700;
+            letter-spacing: 0;
+            opacity: .72;
+        }
+        .webui-bridge-card-buttons {
+            position: absolute;
+            top: 7px;
+            right: 7px;
+            display: flex;
+            gap: 6px;
+            opacity: .92;
+            z-index: 2;
+        }
+        .webui-bridge-card-buttons button {
+            width: 26px;
+            height: 26px;
+            padding: 0;
+            border: 1px solid rgba(255, 255, 255, .42);
+            border-radius: 4px;
+            background: rgba(18, 24, 33, .72);
+            color: #fff;
+            cursor: pointer;
+            font: 700 14px/1 Arial, sans-serif;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, .8);
+            box-shadow: 0 2px 7px rgba(0, 0, 0, .35);
+        }
+        .webui-bridge-card-buttons button:hover {
+            border-color: #8bb9ff;
+            background: rgba(38, 79, 126, .92);
+        }
+        .webui-bridge-card-actions {
+            position: absolute;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            padding: 8px;
+            background: linear-gradient(to top, rgba(0, 0, 0, .78), rgba(0, 0, 0, .44));
+            color: #fff;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, .85);
+        }
+        .webui-bridge-empty {
+            grid-column: 1 / -1;
+            padding: 18px 10px;
+            color: #8fa0b7;
+            text-align: center;
+            font-size: 12px;
         }
         .webui-bridge-autocomplete {
             position: fixed;
@@ -2879,23 +4782,329 @@ function addStyles() {
             .webui-bridge-action-column {
                 grid-template-columns: 1fr;
             }
+            .webui-bridge-toprow {
+                flex-basis: auto;
+                max-height: none;
+            }
+            .webui-bridge-prompts {
+                grid-template-rows: auto minmax(190px, 1fr) auto minmax(160px, .85fr);
+            }
             .webui-bridge-tools {
                 grid-template-columns: repeat(5, minmax(28px, 1fr));
             }
             .webui-bridge-prompt-row textarea {
                 min-height: 52px;
             }
-        }
-        .webui-bridge-card-kind {
-            display: block;
-            color: #8db7ff;
-            font-size: 10px;
+            .webui-bridge-extra-head {
+                grid-template-columns: 1fr;
+                align-items: stretch;
+            }
+            .webui-bridge-network-controls {
+                grid-template-columns: 1fr;
+                align-items: stretch;
+            }
+            .webui-bridge-extra-body {
+                grid-template-columns: 1fr;
+            }
+            .webui-bridge-network-tree {
+                max-height: 140px;
+                border-right: 0;
+                border-bottom: 1px solid #3e4654;
+            }
+            .webui-bridge-card-grid {
+                grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            }
         }
         .webui-bridge-card-name {
-            display: block;
-            margin-top: 2px;
-            font: 11px/1.25 Consolas, monospace;
+            display: -webkit-box;
+            color: #f4f7fb;
+            font: 700 13px/1.22 Consolas, monospace;
+            overflow: hidden;
             overflow-wrap: anywhere;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 2;
+        }
+        .webui-bridge-card-folder {
+            display: block;
+            color: #d4e2f3;
+            opacity: .86;
+            font-size: 11px;
+            line-height: 1.25;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .webui-bridge-card-category {
+            display: inline-flex;
+            align-self: flex-start;
+            max-width: 100%;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(47, 115, 217, .72);
+            color: #f4f8ff;
+            font-size: 11px;
+            line-height: 1.2;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .webui-bridge-card-desc {
+            display: none;
+            max-height: 42px;
+            color: #edf4ff;
+            opacity: .86;
+            font-size: 11px;
+            line-height: 1.2;
+            overflow: hidden;
+            overflow-wrap: anywhere;
+        }
+        .webui-bridge-card:hover .webui-bridge-card-desc {
+            display: block;
+        }
+        .webui-bridge-lora-mask {
+            position: fixed;
+            inset: 0;
+            z-index: 100002;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            box-sizing: border-box;
+            background: rgba(0, 0, 0, .58);
+        }
+        .webui-bridge-lora-edit {
+            width: min(1260px, 96vw);
+            max-height: 92vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            border: 1px solid #3f4c61;
+            border-radius: 8px;
+            background: #0e141e;
+            color: #f3f6fb;
+            box-shadow: 0 18px 60px rgba(0, 0, 0, .55);
+        }
+        .webui-bridge-lora-edit-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 14px 18px;
+            border-bottom: 1px solid #313b4c;
+            background: #151d29;
+        }
+        .webui-bridge-lora-edit-title {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 18px;
+            font-weight: 700;
+        }
+        .webui-bridge-lora-edit-head button {
+            width: 30px;
+            height: 30px;
+            border: 1px solid #58657a;
+            border-radius: 5px;
+            background: #202a38;
+            color: #fff;
+            cursor: pointer;
+        }
+        .webui-bridge-lora-edit-body {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(280px, 370px);
+            gap: 28px;
+            padding: 20px;
+            overflow: auto;
+        }
+        .webui-bridge-lora-edit-main {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            min-width: 0;
+        }
+        .webui-bridge-lora-edit-main label {
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+            color: #dce6f5;
+            font-weight: 700;
+        }
+        .webui-bridge-lora-edit-textarea,
+        .webui-bridge-lora-edit-input,
+        .webui-bridge-lora-edit-weight {
+            width: 100%;
+            box-sizing: border-box;
+            border: 1px solid #40506a;
+            border-radius: 8px;
+            background: #202b3a;
+            color: #f3f6fb;
+            padding: 10px 12px;
+            font: 14px/1.45 Arial, sans-serif;
+        }
+        .webui-bridge-lora-edit-textarea,
+        .webui-bridge-lora-edit-input {
+            resize: vertical;
+        }
+        .webui-bridge-lora-edit-table {
+            width: min(520px, 100%);
+            display: flex;
+            flex-direction: column;
+            border-top: 1px solid rgba(220, 230, 245, .62);
+        }
+        .webui-bridge-lora-edit-table-row {
+            display: grid;
+            grid-template-columns: minmax(120px, 190px) minmax(0, 1fr);
+            gap: 12px;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(220, 230, 245, .62);
+            color: #edf3fb;
+            font-size: 14px;
+        }
+        .webui-bridge-lora-edit-table-row span {
+            min-width: 0;
+            overflow-wrap: anywhere;
+        }
+        .webui-bridge-lora-category-row {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 10px;
+        }
+        .webui-bridge-lora-auto-category {
+            max-width: 210px;
+            padding: 7px 10px;
+            border: 1px solid #40506a;
+            border-radius: 6px;
+            background: #111824;
+            color: #a9bdd8;
+            font-size: 13px;
+            font-weight: 400;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .webui-bridge-lora-edit-preview {
+            position: sticky;
+            top: 0;
+            height: 520px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid #4c5667;
+            border-radius: 6px;
+            background: #aeb3b4;
+            color: #707d94;
+            font-size: 44px;
+            font-weight: 800;
+            text-align: center;
+            overflow: hidden;
+        }
+        .webui-bridge-lora-edit-preview img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #aeb3b4;
+        }
+        .webui-bridge-lora-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            padding: 12px;
+            border: 1px solid #40506a;
+            border-radius: 8px;
+            background: #111824;
+        }
+        .webui-bridge-lora-tags:empty::before {
+            content: "No training tags in metadata";
+            color: #8fa0b7;
+            font-weight: 400;
+        }
+        .webui-bridge-lora-tags button {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            min-height: 30px;
+            border: 0;
+            border-radius: 4px;
+            background: #e9f7ff;
+            color: #0f1722;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .webui-bridge-lora-tags button b {
+            min-width: 22px;
+            padding: 2px 5px;
+            border-radius: 4px;
+            background: #2885d9;
+            color: #fff;
+            font-size: 12px;
+            text-align: center;
+        }
+        .webui-bridge-lora-weight-row {
+            display: grid !important;
+            grid-template-columns: minmax(0, 1fr) 130px;
+            align-items: end;
+        }
+        .webui-bridge-lora-random-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+        .webui-bridge-lora-random-head button,
+        .webui-bridge-lora-edit-actions button {
+            border: 1px solid #58657a;
+            border-radius: 8px;
+            background: #4a5668;
+            color: #fff;
+            cursor: pointer;
+            font-weight: 700;
+        }
+        .webui-bridge-lora-random-head button {
+            padding: 7px 14px;
+        }
+        .webui-bridge-lora-edit-actions {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(160px, 1fr));
+            gap: 18px;
+            padding: 16px 20px 20px;
+            border-top: 1px solid #313b4c;
+        }
+        .webui-bridge-lora-edit-actions button {
+            min-height: 46px;
+            font-size: 16px;
+        }
+        .webui-bridge-lora-random-head button:hover,
+        .webui-bridge-lora-edit-actions button:hover {
+            filter: brightness(1.08);
+        }
+        .webui-bridge-lora-edit-actions button.primary {
+            border-color: #ff6b1a;
+            background: #f36a16;
+        }
+        .webui-bridge-lora-edit-status {
+            min-height: 20px;
+            padding: 0 20px 14px;
+            color: #f4d38c;
+            opacity: 0;
+        }
+        .webui-bridge-lora-edit-status.visible {
+            opacity: 1;
+        }
+        @media (max-width: 900px) {
+            .webui-bridge-lora-edit-body {
+                grid-template-columns: 1fr;
+            }
+            .webui-bridge-lora-edit-preview {
+                position: relative;
+                height: 360px;
+                order: -1;
+            }
+            .webui-bridge-lora-edit-actions {
+                grid-template-columns: 1fr;
+            }
         }
         .webui-bridge-mask {
             position: fixed;
@@ -2955,10 +5164,19 @@ app.registerExtension({
         chainCallback(nodeType.prototype, "onNodeCreated", function () {
             this.color = "#2f3a4a";
             this.bgcolor = "#1b222d";
-            requestAnimationFrame(() => installWebUIPanel(this));
+            this.__webuiBridgeFreshNode = true;
+            scheduleBridgePanelInstall(this);
         });
         chainCallback(nodeType.prototype, "onConfigure", function () {
-            requestAnimationFrame(() => installWebUIPanel(this));
+            this.__webuiBridgeWasConfigured = true;
+            scheduleBridgePanelInstall(this);
+        });
+        chainCallback(nodeType.prototype, "onDrawForeground", function () {
+            if (isBridgePanelUsable(this)) return;
+            const now = performance.now();
+            if (now - (this.__webuiBridgeLastHealthInstall || 0) < 1000) return;
+            this.__webuiBridgeLastHealthInstall = now;
+            scheduleBridgePanelInstall(this);
         });
     },
 });

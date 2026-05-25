@@ -525,8 +525,8 @@
         40
       ],
       "size": [
-        940,
-        940
+        1180,
+        1040
       ],
       "flags": {},
       "order": 4,
@@ -719,8 +719,8 @@
       "id": 11,
       "type": "LatentUpscaleBy",
       "pos": [
-        420,
-        2020
+        1380,
+        40
       ],
       "size": [
         315,
@@ -10962,7 +10962,7 @@
           ]
         }
       ],
-      "title": "备用整合模型 / Full Checkpoint Loader (Qwen-Rapid default)",
+      "title": "明显模型切换 / Select Any Checkpoint Model",
       "properties": {
         "Node name for S&R": "CheckpointLoaderSimple",
         "cnr_id": "comfy-core",
@@ -10971,8 +10971,8 @@
       "widgets_values": [
         "Qwen-Rapid-AIO-NSFW-v16.safetensors"
       ],
-      "color": "#4b3f2f",
-      "bgcolor": "#241d12"
+      "color": "#355173",
+      "bgcolor": "#142033"
     },
     {
       "id": 225,
@@ -11012,15 +11012,15 @@
           ]
         }
       ],
-      "title": "模型模式：分体Anima/Qwen ON，关闭=整合Checkpoint",
+      "title": "模型来源开关 / ON=分体 Anima-Qwen OFF=所选 Checkpoint",
       "properties": {
         "Node name for S&R": "ImpactBoolean"
       },
       "widgets_values": [
         true
       ],
-      "color": "#354a5a",
-      "bgcolor": "#15242d"
+      "color": "#355173",
+      "bgcolor": "#142033"
     },
     {
       "id": 226,
@@ -11203,7 +11203,7 @@
       ],
       "size": [
         360,
-        210
+        170
       ],
       "flags": {},
       "order": 7,
@@ -11228,12 +11228,12 @@
           "links": []
         }
       ],
-      "title": "说明：模型切换",
+      "title": "说明：模型切换 / Model Switch",
       "properties": {
         "Node name for S&R": "TextBox1"
       },
       "widgets_values": [
-        "模型切换说明：\n1. 开关 ON：懒加载左侧 Anima/Qwen 分体模型（UNET + CLIP + VAE），推荐用于当前 Anima 工作流。\n2. 开关 OFF：懒加载上方整合 CheckpointLoaderSimple，默认 Qwen-Rapid-AIO；也可切换到 SD1.5 / SDXL / Pony / Illustrious 等整合 checkpoint。\n3. 使用非 Qwen/Anima checkpoint 时，请关闭参考图/姿势控制等 Qwen 专用分支，避免编码器不兼容。\n4. LoRA 仍然在 WebUI Prompt Bridge 中通过 <lora:name:weight> 自动解析并应用。"
+        "模型切换：\n1. 在 Prompt Bridge 面板右侧的“模型切换”下拉选择“分体 Anima/Qwen”或任意 checkpoint。\n2. 选择“分体 Anima/Qwen”会把模型来源开关切到 ON，使用左侧 Anima UNET + Text Encoder + VAE。\n3. 选择 checkpoint 会自动切到整合 Checkpoint 模式，并更新这里的 CheckpointLoaderSimple。\n4. 上方 CheckpointLoader 原生下拉仍可手动选择 ComfyUI checkpoints 目录里的所有整合模型。"
       ],
       "color": "#2f4550",
       "bgcolor": "#15262d"

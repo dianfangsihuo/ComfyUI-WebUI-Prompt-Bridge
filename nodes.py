@@ -1,4 +1,6 @@
 import csv
+import datetime
+import hashlib
 import json
 import os
 import re
@@ -6,7 +8,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import comfy.sd
 import comfy.utils
@@ -20,8 +22,11 @@ LOCAL_CONFIG_PATH = NODE_DIR / "config.local.json"
 PROMPT_ALL_IN_ONE_HISTORY_MAX = 100
 _TAG_AUTOCOMPLETE_CACHE = None
 _LORA_METADATA_CACHE = {}
+_LORA_RAW_METADATA_CACHE = {}
 _TRANSLATION_MAP_CACHE = {}
 _NETWORK_TRANSLATE_CACHE = {}
+_LORA_PREVIEW_EXTENSIONS = (".preview.png", ".preview.jpg", ".preview.jpeg", ".preview.webp", ".png", ".jpg", ".jpeg", ".webp")
+_LORA_DESCRIPTION_EXTENSIONS = (".txt", ".description.txt", ".desc.txt")
 
 
 def _load_local_config():
@@ -913,6 +918,45 @@ def _parse_lora_tags(prompt):
     return cleaned, loras
 
 
+def _collect_upstream_loras_from_prompt(prompt, unique_id):
+    if not isinstance(prompt, dict) or unique_id is None:
+        return set()
+
+    graph = {str(node_id): node_def for node_id, node_def in prompt.items() if isinstance(node_def, dict)}
+    seen = set()
+    loras = set()
+
+    def normalize(name):
+        return _lora_key(str(name or ""))
+
+    def visit(node_id):
+        key = str(node_id)
+        if key in seen:
+            return
+        seen.add(key)
+        node_def = graph.get(key)
+        if not isinstance(node_def, dict):
+            return
+        inputs = node_def.get("inputs") or {}
+        class_type = str(node_def.get("class_type") or "").casefold()
+        title = str(node_def.get("_meta", {}).get("title") or "").casefold()
+        lora_name = inputs.get("lora_name")
+        if lora_name and ("lora" in class_type or "lora" in title):
+            loras.add(normalize(lora_name))
+        for value in inputs.values():
+            if isinstance(value, (list, tuple)) and value:
+                visit(value[0])
+
+    bridge = graph.get(str(unique_id))
+    if not isinstance(bridge, dict):
+        return set()
+    for input_name in ("model", "clip"):
+        link = (bridge.get("inputs") or {}).get(input_name)
+        if isinstance(link, (list, tuple)) and link:
+            visit(link[0])
+    return loras
+
+
 _RE_PARAM = re.compile(r"\s*([\w \-/]+):\s*(\"(?:\\.|[^\"])*\"|[^,]+)(?:,|$)")
 _RE_IMAGE_SIZE = re.compile(r"^(\d+)[xX](\d+)$")
 
@@ -1000,6 +1044,261 @@ def _resolve_lora_name(requested):
     return candidates.get(_lora_key(with_ext))
 
 
+def _lora_folder_and_base(name):
+    normalized = str(name or "").replace("\\", "/")
+    folder, filename = os.path.split(normalized)
+    stem = _strip_extension(filename)
+    return folder, filename, stem
+
+
+def _find_lora_preview_path(lora_path):
+    if not lora_path:
+        return None
+    path = Path(lora_path)
+    base = path.with_suffix("")
+    for suffix in _LORA_PREVIEW_EXTENSIONS:
+        candidate = Path(str(base) + suffix)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def _find_lora_description(lora_path):
+    if not lora_path:
+        return ""
+    path = Path(lora_path)
+    base = path.with_suffix("")
+    for suffix in _LORA_DESCRIPTION_EXTENSIONS:
+        candidate = Path(str(base) + suffix)
+        if candidate.exists() and candidate.is_file():
+            try:
+                return candidate.read_text(encoding="utf-8", errors="ignore").strip()[:500]
+            except Exception:
+                return ""
+    return ""
+
+
+def _pretty_bytes(size):
+    try:
+        value = float(size or 0)
+    except Exception:
+        value = 0
+    units = ("B", "KB", "MB", "GB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.0f}{unit}" if unit == "B" or value >= 10 else f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{value:.0f}B"
+
+
+def _json_metadata_value(value, fallback=None):
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return json.loads(value)
+        except Exception:
+            return fallback
+    return fallback
+
+
+def _read_lora_raw_metadata(lora_path):
+    if not lora_path:
+        return {}
+    cache_key = str(lora_path)
+    cached = _LORA_RAW_METADATA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    metadata = {}
+    try:
+        from safetensors import safe_open
+
+        with safe_open(lora_path, framework="pt", device="cpu") as f:
+            metadata = f.metadata() or {}
+    except Exception:
+        metadata = {}
+    _LORA_RAW_METADATA_CACHE[cache_key] = metadata
+    return metadata
+
+
+def _lora_user_metadata_path(lora_path):
+    return Path(lora_path).with_suffix(".json") if lora_path else None
+
+
+def _read_lora_user_metadata(lora_path, fallback_description=""):
+    metadata = {}
+    metadata_path = _lora_user_metadata_path(lora_path)
+    if metadata_path and metadata_path.exists():
+        try:
+            loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                metadata.update(loaded)
+        except Exception:
+            pass
+    if fallback_description and not metadata.get("description"):
+        metadata["description"] = fallback_description
+    return metadata
+
+
+def _write_lora_user_metadata(lora_path, updates):
+    metadata_path = _lora_user_metadata_path(lora_path)
+    if not metadata_path:
+        raise ValueError("LoRA metadata path is not available")
+    current = _read_lora_user_metadata(lora_path)
+    for key in ("description", "category", "sd version", "activation text", "negative text", "notes"):
+        current[key] = str(updates.get(key, "") or "")
+    try:
+        current["preferred weight"] = float(updates.get("preferred weight") or 0)
+    except Exception:
+        current["preferred weight"] = 0.0
+    metadata_path.write_text(json.dumps(current, indent=4, ensure_ascii=False), encoding="utf-8")
+    return current
+
+
+def _lora_training_tags(metadata, limit=48):
+    raw_frequency = _json_metadata_value(metadata.get("ss_tag_frequency"), {})
+    counts = {}
+    if isinstance(raw_frequency, dict):
+        for bucket in raw_frequency.values():
+            if isinstance(bucket, dict):
+                for tag, count in bucket.items():
+                    tag = str(tag or "").strip()
+                    if not tag:
+                        continue
+                    try:
+                        counts[tag] = counts.get(tag, 0) + int(count or 0)
+                    except Exception:
+                        pass
+    return [
+        {"tag": tag, "count": count}
+        for tag, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)[:limit]
+    ]
+
+
+def _lora_resolutions(metadata):
+    bucket_info = _json_metadata_value(metadata.get("ss_bucket_info"), {})
+    buckets = bucket_info.get("buckets") if isinstance(bucket_info, dict) else None
+    if not isinstance(buckets, dict):
+        return ""
+    counts = {}
+    for bucket in buckets.values():
+        if not isinstance(bucket, dict):
+            continue
+        resolution = bucket.get("resolution")
+        if not isinstance(resolution, (list, tuple)) or len(resolution) < 2:
+            continue
+        text = f"{resolution[1]}x{resolution[0]}"
+        try:
+            counts[text] = counts.get(text, 0) + int(bucket.get("count") or 0)
+        except Exception:
+            counts[text] = counts.get(text, 0) + 1
+    return ", ".join(sorted(counts, key=counts.get, reverse=True)[:4])
+
+
+def _lora_dataset_size(metadata):
+    dataset_dirs = _json_metadata_value(metadata.get("ss_dataset_dirs"), {})
+    if not isinstance(dataset_dirs, dict):
+        return 0
+    total = 0
+    for params in dataset_dirs.values():
+        if isinstance(params, dict):
+            try:
+                total += int(params.get("img_count") or 0)
+            except Exception:
+                pass
+    return total
+
+
+def _lora_file_hash(lora_path):
+    if not lora_path:
+        return ""
+    try:
+        digest = hashlib.sha256()
+        with open(lora_path, "rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()[:12]
+    except Exception:
+        return ""
+
+
+def _detect_lora_sd_version(metadata, summary=None):
+    for key in ("ss_base_model_version", "ss_sd_model_name", "modelspec.architecture"):
+        value = str(metadata.get(key) or "").casefold()
+        if "sdxl" in value or "xl" in value:
+            return "SDXL"
+        if "sd2" in value or "stable-diffusion-v2" in value:
+            return "SD2"
+        if "sd1" in value or "stable-diffusion-v1" in value:
+            return "SD1"
+    family = str((summary or {}).get("family") or "").casefold()
+    if "sdxl" in family or "noob" in family:
+        return "SDXL"
+    if family == "sd1":
+        return "SD1"
+    return "Unknown"
+
+
+def _lora_training_started_at(metadata):
+    value = metadata.get("ss_training_started_at")
+    if not value:
+        return ""
+    try:
+        return datetime.datetime.utcfromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(value)
+
+
+def _lora_detail(lora_name):
+    resolved = _resolve_lora_name(lora_name)
+    if resolved is None:
+        return {"requested": lora_name, "found": False}
+    lora_path = folder_paths.get_full_path("loras", resolved)
+    preview_path = _find_lora_preview_path(lora_path)
+    description = _find_lora_description(lora_path)
+    user_metadata = _read_lora_user_metadata(lora_path, description)
+    raw_metadata = _read_lora_raw_metadata(lora_path)
+    summary = _lora_metadata_summary(resolved)
+    stat = Path(lora_path).stat()
+    sd_version = user_metadata.get("sd version") or _detect_lora_sd_version(raw_metadata, summary)
+    return {
+        "requested": lora_name,
+        "name": resolved,
+        "found": True,
+        "path": lora_path,
+        "file_name": Path(lora_path).name,
+        "file_size": _pretty_bytes(stat.st_size),
+        "hash": _lora_file_hash(lora_path),
+        "modified": datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+        "thumbnail": f"/webui_prompt_bridge/lora_thumbnail?name={quote(resolved, safe='')}" if preview_path else "",
+        "description": user_metadata.get("description") or description,
+        "user_metadata": {
+            "description": user_metadata.get("description") or description,
+            "category": user_metadata.get("category", "") or user_metadata.get("manual category", ""),
+            "sd version": sd_version,
+            "activation text": user_metadata.get("activation text", ""),
+            "preferred weight": user_metadata.get("preferred weight", 0.0),
+            "negative text": user_metadata.get("negative text", ""),
+            "notes": user_metadata.get("notes", ""),
+        },
+        "metadata_table": [
+            {"label": "文件名:", "value": resolved},
+            {"label": "文件大小:", "value": _pretty_bytes(stat.st_size)},
+            {"label": "哈希值:", "value": _lora_file_hash(lora_path)},
+            {"label": "最后修改日期:", "value": datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")},
+            {"label": "输出名称:", "value": raw_metadata.get("ss_output_name") or ""},
+            {"label": "模型:", "value": raw_metadata.get("ss_sd_model_name") or raw_metadata.get("ss_base_model_version") or ""},
+            {"label": "CLIP 终止层数:", "value": raw_metadata.get("ss_clip_skip") or ""},
+            {"label": "Kohya 模块类型:", "value": raw_metadata.get("ss_network_module") or ""},
+            {"label": "训练日期:", "value": _lora_training_started_at(raw_metadata)},
+            {"label": "分辨率:", "value": _lora_resolutions(raw_metadata)},
+            {"label": "数据集大小:", "value": str(_lora_dataset_size(raw_metadata) or "")},
+        ],
+        "training_tags": _lora_training_tags(raw_metadata),
+        "summary": summary,
+    }
+
+
 class WebUIPromptBridge:
     CATEGORY = "conditioning/webui"
     FUNCTION = "build"
@@ -1031,7 +1330,11 @@ class WebUIPromptBridge:
                 ),
                 "default_clip_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05}),
                 "fail_on_missing_lora": ("BOOLEAN", {"default": True}),
-            }
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     def _load_lora(self, lora_name):
@@ -1042,16 +1345,22 @@ class WebUIPromptBridge:
             self.loaded_loras[lora_path] = cached
         return cached
 
-    def build(self, model, clip, positive_prompt, negative_prompt, default_clip_strength, fail_on_missing_lora):
+    def build(self, model, clip, positive_prompt, negative_prompt, default_clip_strength, fail_on_missing_lora, prompt=None, unique_id=None):
         positive_text, positive_loras = _parse_lora_tags(positive_prompt)
         negative_text, negative_loras = _parse_lora_tags(negative_prompt)
 
         applied = []
+        skipped_upstream = []
         missing = []
+        upstream_loras = _collect_upstream_loras_from_prompt(prompt, unique_id)
         for requested, strength_model, strength_clip in [*positive_loras, *negative_loras]:
             resolved = _resolve_lora_name(requested)
             if resolved is None:
                 missing.append(requested)
+                continue
+
+            if _lora_key(resolved) in upstream_loras or _lora_key(requested) in upstream_loras:
+                skipped_upstream.append(resolved)
                 continue
 
             if strength_clip is None:
@@ -1070,6 +1379,8 @@ class WebUIPromptBridge:
         positive = clip.encode_from_tokens_scheduled(clip.tokenize(positive_text))
         negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_text))
         info = "Applied LoRAs: " + (", ".join(applied) if applied else "None")
+        if skipped_upstream:
+            info += " | Upstream LoRAs already loaded: " + ", ".join(skipped_upstream)
         if missing:
             info += " | Missing LoRAs: " + ", ".join(missing)
 
@@ -1097,6 +1408,21 @@ def _register_routes():
         return
     routes = prompt_server.routes
 
+    @routes.get("/webui_prompt_bridge/models")
+    async def list_models(request):
+        def filenames(kind):
+            try:
+                return folder_paths.get_filename_list(kind)
+            except Exception:
+                return []
+
+        return web.json_response({
+            "checkpoints": filenames("checkpoints"),
+            "unets": filenames("unet") or filenames("diffusion_models"),
+            "clips": filenames("clip"),
+            "vaes": filenames("vae"),
+        })
+
     @routes.get("/webui_prompt_bridge/loras")
     async def list_loras(request):
         try:
@@ -1106,12 +1432,80 @@ def _register_routes():
         items = []
         for name in loras:
             stem = _strip_extension(name).replace("\\", "/")
+            folder, filename, base_name = _lora_folder_and_base(name)
+            thumbnail = None
+            description = ""
+            user_metadata = {}
+            detected_sd_version = ""
+            created = 0
+            modified = 0
+            try:
+                lora_path = folder_paths.get_full_path("loras", name)
+                if _find_lora_preview_path(lora_path):
+                    thumbnail = f"/webui_prompt_bridge/lora_thumbnail?name={quote(name, safe='')}"
+                description = _find_lora_description(lora_path)
+                user_metadata = _read_lora_user_metadata(lora_path, description)
+                raw_metadata = _read_lora_raw_metadata(lora_path)
+                detected_sd_version = _detect_lora_sd_version(raw_metadata, _lora_metadata_summary(name))
+                stat = Path(lora_path).stat() if lora_path else None
+                if stat:
+                    created = int(getattr(stat, "st_ctime", 0))
+                    modified = int(getattr(stat, "st_mtime", 0))
+            except Exception:
+                thumbnail = None
+            display_description = user_metadata.get("description") or description
+            try:
+                preferred_weight = float(user_metadata.get("preferred weight") or 0)
+            except Exception:
+                preferred_weight = 0
             items.append({
                 "name": name,
                 "alias": stem,
+                "folder": folder or "",
+                "file_name": filename,
+                "base_name": base_name,
+                "thumbnail": thumbnail,
+                "description": display_description,
+                "user_metadata": user_metadata,
+                "manual_category": user_metadata.get("category", "") or user_metadata.get("manual category", ""),
+                "category": user_metadata.get("category", "") or user_metadata.get("manual category", ""),
+                "activation_text": user_metadata.get("activation text", ""),
+                "negative_text": user_metadata.get("negative text", ""),
+                "preferred_weight": preferred_weight,
+                "sd_version": user_metadata.get("sd version", "") or detected_sd_version,
+                "notes": user_metadata.get("notes", ""),
+                "search_terms": " ".join([
+                    name,
+                    stem,
+                    folder or "",
+                    base_name,
+                    display_description,
+                    user_metadata.get("category", "") or user_metadata.get("manual category", ""),
+                    user_metadata.get("activation text", ""),
+                    user_metadata.get("sd version", "") or detected_sd_version,
+                ]).strip(),
+                "created": created,
+                "modified": modified,
                 "prompt": f"<lora:{stem}:1>",
             })
         return web.json_response({"loras": items})
+
+    @routes.get("/webui_prompt_bridge/lora_thumbnail")
+    async def lora_thumbnail(request):
+        name = request.query.get("name", "")
+        if not name:
+            return web.Response(status=404)
+        resolved = _resolve_lora_name(name)
+        if not resolved:
+            return web.Response(status=404)
+        try:
+            lora_path = folder_paths.get_full_path("loras", resolved)
+            preview_path = _find_lora_preview_path(lora_path)
+        except Exception:
+            preview_path = None
+        if not preview_path:
+            return web.Response(status=404)
+        return web.FileResponse(preview_path)
 
     @routes.get("/webui_prompt_bridge/lora_info")
     async def lora_info(request):
@@ -1119,6 +1513,66 @@ def _register_routes():
         if not name:
             return web.json_response({"error": "LoRA name is required"}, status=400)
         return web.json_response(_lora_metadata_summary(name))
+
+    @routes.get("/webui_prompt_bridge/lora_user_metadata")
+    async def lora_user_metadata_get(request):
+        name = request.query.get("name", "")
+        if not name:
+            return web.json_response({"error": "LoRA name is required"}, status=400)
+        detail = _lora_detail(name)
+        if not detail.get("found"):
+            return web.json_response(detail, status=404)
+        return web.json_response(detail)
+
+    @routes.post("/webui_prompt_bridge/lora_user_metadata")
+    async def lora_user_metadata_post(request):
+        data = await request.json()
+        name = data.get("name", "")
+        resolved = _resolve_lora_name(name)
+        if not resolved:
+            return web.json_response({"error": "LoRA not found"}, status=404)
+        lora_path = folder_paths.get_full_path("loras", resolved)
+        updates = {
+            "description": data.get("description", ""),
+            "category": data.get("category", ""),
+            "sd version": data.get("sd_version", "Unknown"),
+            "activation text": data.get("activation_text", ""),
+            "preferred weight": data.get("preferred_weight", 0),
+            "negative text": data.get("negative_text", ""),
+            "notes": data.get("notes", ""),
+        }
+        _write_lora_user_metadata(lora_path, updates)
+        return web.json_response(_lora_detail(resolved))
+
+    @routes.post("/webui_prompt_bridge/lora_preview")
+    async def lora_preview_post(request):
+        reader = await request.multipart()
+        name = ""
+        image_bytes = b""
+        extension = ".png"
+        field = await reader.next()
+        while field:
+            if field.name == "name":
+                name = (await field.text()).strip()
+            elif field.name == "preview":
+                filename = field.filename or ""
+                suffix = Path(filename).suffix.lower()
+                if suffix in (".png", ".jpg", ".jpeg", ".webp"):
+                    extension = suffix
+                image_bytes = await field.read(decode=False)
+            field = await reader.next()
+        resolved = _resolve_lora_name(name)
+        if not resolved:
+            return web.json_response({"error": "LoRA not found"}, status=404)
+        if not image_bytes:
+            return web.json_response({"error": "Preview image is required"}, status=400)
+        if len(image_bytes) > 20 * 1024 * 1024:
+            return web.json_response({"error": "Preview image is too large"}, status=400)
+        lora_path = folder_paths.get_full_path("loras", resolved)
+        base = Path(lora_path).with_suffix("")
+        preview_path = Path(str(base) + f".preview{extension}")
+        preview_path.write_bytes(image_bytes)
+        return web.json_response(_lora_detail(resolved))
 
     @routes.get("/webui_prompt_bridge/autocomplete")
     async def autocomplete(request):

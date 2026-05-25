@@ -17,7 +17,7 @@
 
 ![WebUI Prompt Bridge node close-up](docs/images/webui-prompt-bridge-node-panel.png)
 
-这个节点不是普通的大文本框，而是一个完整的提示词操作面板：
+这个节点不是普通的大文本框，而是一个完整的提示词操作面板。新版面板把 Prompt、反向词、模型切换、LoRA 卡片库和常用生成按钮集中到一个节点里：
 
 - 可以直接输入中文自然语言，并自动翻译成更适合模型的英文提示词。
 - 可以把提示词拆成一个个标签块，方便编辑、删除、禁用、复制、加权和拖拽排序。
@@ -26,6 +26,9 @@
 - 可以读取 WebUI 的 `styles.csv` 样式。
 - 可以接入 WebUI 的 Prompt All in One 和 TagComplete 数据。
 - 可以识别 `<lora:name:weight>`，检查 LoRA 是否存在，并真正应用到 ComfyUI 的 model / clip 链路里。
+- 可以在节点内直接浏览 LoRA / LyCORIS 卡片库，按文件夹、分类、模型版本和整理状态过滤。
+- 可以读取 LoRA 预览图、训练 metadata、触发词、推荐权重、说明和手动分类，并在卡片里快速插入。
+- 可以在面板右侧切换分体 Anima/Qwen 或整合 checkpoint，并在提交生成前做常见参数检查。
 
 ## 主要功能
 
@@ -36,6 +39,9 @@
 - **负面词管理**：正向提示词和反向提示词都可以分块编辑。
 - **LoRA 真实加载**：不是只把 LoRA 文本塞进 prompt，而是解析 LoRA 标签后调用 ComfyUI 的 LoRA 加载逻辑。
 - **LoRA 缺失提醒**：找不到 LoRA 时可以直接报错，避免你以为 LoRA 生效了但其实没用。
+- **LoRA 卡片管理**：读取本地 LoRA 预览图和 safetensors metadata，支持搜索、分类、整理状态、触发词和推荐权重。
+- **模型快速切换**：在 Bridge 面板里选择分体 Anima/Qwen 或任意整合 checkpoint，减少在复杂工作流里来回找节点。
+- **生成前检查**：提交前检查空数字参数、Prompt/Negative 放反、悬空连接等常见问题，并尽量自动修复。
 - **WebUI 数据桥接**：可以复用本机 WebUI 扩展里的标签、收藏、翻译配置和样式。
 
 ## 推荐工作流
