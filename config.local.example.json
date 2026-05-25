@@ -3,5 +3,14 @@
   "prompt_all_in_one_dir": "X:/path/to/stable-diffusion-webui/extensions/sd-webui-prompt-all-in-one",
   "tagcomplete_dir": "X:/path/to/stable-diffusion-webui/extensions/a1111-sd-webui-tagcomplete",
   "webui_python_site_packages": "X:/path/to/stable-diffusion-webui/python/Lib/site-packages",
-  "styles_file": "X:/path/to/stable-diffusion-webui/styles.csv"
+  "styles_file": "X:/path/to/stable-diffusion-webui/styles.csv",
+  "model_paths": {
+    "loras": "X:/path/to/stable-diffusion-webui/models/Lora",
+    "checkpoints": "X:/path/to/stable-diffusion-webui/models/Stable-diffusion",
+    "vae": "X:/path/to/stable-diffusion-webui/models/VAE",
+    "embeddings": "X:/path/to/stable-diffusion-webui/embeddings",
+    "controlnet": "X:/path/to/stable-diffusion-webui/models/ControlNet",
+    "upscale_models": "X:/path/to/stable-diffusion-webui/models/ESRGAN",
+    "hypernetworks": "X:/path/to/stable-diffusion-webui/models/hypernetworks"
+  }
 }

@@ -42,6 +42,171 @@ def _load_local_config():
 LOCAL_CONFIG = _load_local_config()
 
 
+def _path_text(path):
+    return str(path).replace("\\", "/") if path else ""
+
+
+def _existing_path(path):
+    path = Path(str(path)).expanduser() if path else None
+    return path if path and path.exists() else None
+
+
+def _first_existing(*paths):
+    for path in paths:
+        found = _existing_path(path)
+        if found:
+            return found
+    return None
+
+
+def _build_webui_config(webui_root):
+    root = _existing_path(webui_root)
+    if not root or not root.is_dir():
+        raise ValueError("WebUI 根目录不存在，请选择包含 launch.py、webui.py 或 models 文件夹的 WebUI 根目录")
+    extensions = root / "extensions"
+    detected = _detect_webui_paths(root)
+    model_paths = {
+        key: _path_text(path)
+        for key, path in detected.items()
+        if key in ("loras", "checkpoints", "vae", "embeddings", "controlnet", "upscale_models", "hypernetworks") and path
+    }
+    return {
+        "webui_root": _path_text(root),
+        "prompt_all_in_one_dir": _path_text(extensions / "sd-webui-prompt-all-in-one"),
+        "tagcomplete_dir": _path_text(extensions / "a1111-sd-webui-tagcomplete"),
+        "webui_python_site_packages": _path_text(root / "python" / "Lib" / "site-packages"),
+        "styles_file": _path_text(root / "styles.csv"),
+        "model_paths": model_paths,
+    }
+
+
+def _detect_webui_paths(root):
+    root = Path(str(root)).expanduser()
+    models = root / "models"
+    extensions = root / "extensions"
+    return {
+        "root": root,
+        "styles_file": root / "styles.csv",
+        "prompt_all_in_one_dir": extensions / "sd-webui-prompt-all-in-one",
+        "tagcomplete_dir": extensions / "a1111-sd-webui-tagcomplete",
+        "webui_python_site_packages": root / "python" / "Lib" / "site-packages",
+        "loras": _first_existing(models / "Lora", models / "lora", models / "loras"),
+        "checkpoints": _first_existing(models / "Stable-diffusion", models / "checkpoints"),
+        "vae": _first_existing(models / "VAE", models / "vae"),
+        "embeddings": _first_existing(root / "embeddings", models / "embeddings"),
+        "controlnet": _first_existing(models / "ControlNet", models / "controlnet"),
+        "upscale_models": _first_existing(models / "ESRGAN", models / "RealESRGAN", models / "SwinIR"),
+        "hypernetworks": _first_existing(models / "hypernetworks", models / "Hypernetwork"),
+    }
+
+
+def _apply_webui_model_paths(webui_root):
+    detected = _detect_webui_paths(webui_root)
+    for key, value in (LOCAL_CONFIG.get("model_paths") or {}).items():
+        if key not in detected or not detected.get(key):
+            detected[key] = _existing_path(value)
+    mapping = {
+        "loras": "loras",
+        "checkpoints": "checkpoints",
+        "vae": "vae",
+        "embeddings": "embeddings",
+        "controlnet": "controlnet",
+        "upscale_models": "upscale_models",
+        "hypernetworks": "hypernetworks",
+    }
+    added = []
+    for key, folder_name in mapping.items():
+        path = detected.get(key)
+        if not path:
+            continue
+        try:
+            folder_paths.add_model_folder_path(folder_name, str(path))
+            added.append({"kind": folder_name, "path": _path_text(path)})
+        except Exception:
+            pass
+    try:
+        folder_paths.filename_list_cache.clear()
+    except Exception:
+        pass
+    return added
+
+
+def _apply_local_config(config):
+    global LOCAL_CONFIG, WEBUI_ROOT, PROMPT_ALL_IN_ONE_DIR, TAGCOMPLETE_DIR, WEBUI_PYTHON_SITE_PACKAGES, STORAGE_DIR, STYLES_FILE
+    global _TAG_AUTOCOMPLETE_CACHE, _LORA_METADATA_CACHE, _LORA_RAW_METADATA_CACHE, _TRANSLATION_MAP_CACHE, _NETWORK_TRANSLATE_CACHE
+    LOCAL_CONFIG = config if isinstance(config, dict) else {}
+    WEBUI_ROOT = _discover_webui_root()
+    PROMPT_ALL_IN_ONE_DIR = (
+        _configured_path("prompt_all_in_one_dir", "WEBUI_PROMPT_BRIDGE_PROMPT_ALL_IN_ONE_DIR")
+        or (WEBUI_ROOT / "extensions" / "sd-webui-prompt-all-in-one" if WEBUI_ROOT else DATA_DIR / "sd-webui-prompt-all-in-one")
+    )
+    TAGCOMPLETE_DIR = (
+        _configured_path("tagcomplete_dir", "WEBUI_PROMPT_BRIDGE_TAGCOMPLETE_DIR")
+        or (WEBUI_ROOT / "extensions" / "a1111-sd-webui-tagcomplete" if WEBUI_ROOT else DATA_DIR / "a1111-sd-webui-tagcomplete")
+    )
+    WEBUI_PYTHON_SITE_PACKAGES = (
+        _configured_path("webui_python_site_packages", "WEBUI_PROMPT_BRIDGE_WEBUI_SITE_PACKAGES")
+        or (WEBUI_ROOT / "python" / "Lib" / "site-packages" if WEBUI_ROOT else None)
+    )
+    STORAGE_DIR = (
+        _configured_path("storage_dir", "WEBUI_PROMPT_BRIDGE_STORAGE_DIR")
+        or DATA_DIR / "storage"
+    )
+    STYLES_FILE = (
+        _configured_path("styles_file", "WEBUI_PROMPT_BRIDGE_STYLES_FILE")
+        or (WEBUI_ROOT / "styles.csv" if WEBUI_ROOT else DATA_DIR / "styles.csv")
+    )
+    _TAG_AUTOCOMPLETE_CACHE = None
+    _LORA_METADATA_CACHE.clear()
+    _LORA_RAW_METADATA_CACHE.clear()
+    _TRANSLATION_MAP_CACHE.clear()
+    _NETWORK_TRANSLATE_CACHE.clear()
+
+
+def _webui_integration_status(webui_root=None):
+    root = _existing_path(webui_root) or WEBUI_ROOT
+    config = _build_webui_config(root) if root else {}
+    detected = _detect_webui_paths(root) if root else {}
+    checks = {}
+    for key in ("styles_file", "prompt_all_in_one_dir", "tagcomplete_dir", "webui_python_site_packages", "loras", "checkpoints", "vae", "embeddings", "controlnet"):
+        path = detected.get(key) if detected else config.get(key)
+        checks[key] = {"path": _path_text(path), "exists": bool(_existing_path(path))}
+    return {
+        "configured": bool(WEBUI_ROOT),
+        "webui_root": _path_text(root),
+        "config_path": _path_text(LOCAL_CONFIG_PATH),
+        "checks": checks,
+    }
+
+
+def _guess_webui_roots():
+    candidates = []
+    for value in (
+        LOCAL_CONFIG.get("webui_root"),
+        os.environ.get("WEBUI_PROMPT_BRIDGE_WEBUI_ROOT"),
+        "H:/sd-webui-aki-v4.9",
+        "D:/sd-webui-aki-v4.9",
+        "D:/stable-diffusion-webui",
+        "H:/stable-diffusion-webui",
+    ):
+        if value:
+            candidates.append(value)
+    for drive in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        for name in ("sd-webui-aki-v4.9", "stable-diffusion-webui", "sd-webui"):
+            candidates.append(f"{drive}:/{name}")
+    seen = set()
+    found = []
+    for candidate in candidates:
+        path = _existing_path(candidate)
+        key = _path_text(path).lower() if path else ""
+        if not path or key in seen:
+            continue
+        if (path / "webui.py").exists() or (path / "launch.py").exists() or (path / "models").exists():
+            seen.add(key)
+            found.append(_path_text(path))
+    return found[:12]
+
+
 def _configured_path(config_key, env_key):
     value = os.environ.get(env_key) or LOCAL_CONFIG.get(config_key)
     if not value:
@@ -90,6 +255,9 @@ STYLES_FILE = (
     _configured_path("styles_file", "WEBUI_PROMPT_BRIDGE_STYLES_FILE")
     or (WEBUI_ROOT / "styles.csv" if WEBUI_ROOT else DATA_DIR / "styles.csv")
 )
+
+if WEBUI_ROOT:
+    _apply_webui_model_paths(WEBUI_ROOT)
 
 
 def _find_webui_styles_file():
@@ -1407,6 +1575,46 @@ def _register_routes():
     if prompt_server is None:
         return
     routes = prompt_server.routes
+
+    @routes.get("/webui_prompt_bridge/webui_integration")
+    async def webui_integration_get(request):
+        return web.json_response({
+            **_webui_integration_status(),
+            "guesses": _guess_webui_roots(),
+        })
+
+    @routes.post("/webui_prompt_bridge/webui_integration")
+    async def webui_integration_post(request):
+        data = await request.json()
+        root = data.get("webui_root") or data.get("root") or ""
+        if not root and data.get("auto_detect"):
+            guesses = _guess_webui_roots()
+            root = guesses[0] if guesses else ""
+        if not root:
+            return web.json_response({
+                "ok": False,
+                "error": "没有自动检测到 WebUI 根目录，请手动粘贴 WebUI 根目录，例如 H:/sd-webui-aki-v4.9",
+                "guesses": _guess_webui_roots(),
+            }, status=400)
+        try:
+            config = dict(LOCAL_CONFIG)
+            config.update(_build_webui_config(root))
+            LOCAL_CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+            _apply_local_config(config)
+            added_model_paths = _apply_webui_model_paths(root)
+            return web.json_response({
+                "ok": True,
+                "message": "WebUI data connected",
+                **_webui_integration_status(root),
+                "added_model_paths": added_model_paths,
+                "guesses": _guess_webui_roots(),
+            })
+        except Exception as exc:
+            return web.json_response({
+                "ok": False,
+                "error": str(exc),
+                "guesses": _guess_webui_roots(),
+            }, status=400)
 
     @routes.get("/webui_prompt_bridge/models")
     async def list_models(request):

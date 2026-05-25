@@ -1109,17 +1109,19 @@ function applyStyleText(base, styleText) {
 }
 
 async function loadBridgeData() {
-    const [lorasRes, stylesRes, promptAllInOneRes, modelsRes] = await Promise.allSettled([
+    const [lorasRes, stylesRes, promptAllInOneRes, modelsRes, webuiRes] = await Promise.allSettled([
         api.fetchApi("/webui_prompt_bridge/loras", { cache: "no-store" }).then((r) => r.json()),
         api.fetchApi("/webui_prompt_bridge/styles", { cache: "no-store" }).then((r) => r.json()),
         api.fetchApi("/webui_prompt_bridge/prompt_all_in_one?lang=zh_CN", { cache: "no-store" }).then((r) => r.json()),
         api.fetchApi("/webui_prompt_bridge/models", { cache: "no-store" }).then((r) => r.json()),
+        api.fetchApi("/webui_prompt_bridge/webui_integration", { cache: "no-store" }).then((r) => r.json()),
     ]);
     return {
         loras: lorasRes.status === "fulfilled" ? lorasRes.value.loras || [] : [],
         styles: stylesRes.status === "fulfilled" ? stylesRes.value.styles || [] : [],
         promptAllInOne: promptAllInOneRes.status === "fulfilled" ? promptAllInOneRes.value : { group_tags: [], favorites: {} },
         models: modelsRes.status === "fulfilled" ? modelsRes.value : { checkpoints: [], unets: [], clips: [], vaes: [] },
+        webuiIntegration: webuiRes.status === "fulfilled" ? webuiRes.value : null,
     };
 }
 
@@ -1746,6 +1748,36 @@ async function replaceLoraPreview(name, file) {
     });
     if (!response.ok) throw new Error(await response.text());
     return response.json();
+}
+
+async function fetchWebUIIntegration() {
+    const response = await api.fetchApi("/webui_prompt_bridge/webui_integration", { cache: "no-store" });
+    if (!response.ok) {
+        if (response.status === 404) throw new Error("后端接口未加载，请重启 ComfyUI 后再打开一键接入");
+        const text = await response.text();
+        throw new Error(text || `读取 WebUI 接入状态失败 (${response.status})`);
+    }
+    return response.json();
+}
+
+async function connectWebUIRoot(webuiRoot, autoDetect = false) {
+    const response = await api.fetchApi("/webui_prompt_bridge/webui_integration", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ webui_root: webuiRoot, auto_detect: autoDetect }),
+    });
+    const text = await response.text();
+    let data = {};
+    try {
+        data = text ? JSON.parse(text) : {};
+    } catch {
+        data = {};
+    }
+    if (!response.ok) {
+        if (response.status === 404) throw new Error("后端接口未加载，请重启 ComfyUI 后再点一键接入");
+        throw new Error(data.error || text || `WebUI 接入失败 (${response.status})，请确认选择的是 WebUI 根目录`);
+    }
+    return data;
 }
 
 function loraPromptText(item) {
@@ -2659,6 +2691,7 @@ function buildPanel(node) {
         loras: [],
         styles: [],
         models: { checkpoints: [], unets: [], clips: [], vaes: [] },
+        webuiIntegration: null,
         promptAllInOne: { group_tags: [], favorites: {} },
         selectedStyles: new Set(),
         loraFolder: "__all",
@@ -2892,6 +2925,102 @@ function buildPanel(node) {
             }, "只修正"),
         );
         positive.textarea.focus();
+    };
+
+    const refreshBridgeData = async () => {
+        const data = await loadBridgeData();
+        state.loras = data.loras;
+        state.styles = data.styles;
+        state.models = data.models;
+        state.webuiIntegration = data.webuiIntegration;
+        state.promptAllInOne = data.promptAllInOne;
+        renderStyles();
+        renderModelSwitch();
+        renderTree();
+        renderCards();
+        renderPromptPanels();
+        updateCounters();
+        return data;
+    };
+
+    const webuiStatusText = (info) => {
+        const checks = info?.checks || {};
+        const ok = Object.values(checks).filter((item) => item?.exists).length;
+        const total = Object.keys(checks).length;
+        return info?.webui_root ? `WebUI: ${info.webui_root} (${ok}/${total})` : "WebUI: 未接入";
+    };
+
+    const showWebUIIntegrationDialog = async () => {
+        const mask = el("div", { class: "webui-bridge-config-mask" });
+        const statusLine = el("div", { class: "webui-bridge-config-status" }, "正在读取配置...");
+        const rootInput = el("input", {
+            class: "webui-bridge-config-input",
+            placeholder: "例如 H:/sd-webui-aki-v4.9",
+            spellcheck: "false",
+        });
+        const guessSelect = el("select", { class: "webui-bridge-config-input" }, [
+            el("option", { value: "" }, "自动检测到的 WebUI 目录"),
+        ]);
+        const close = () => mask.remove();
+        const renderInfo = (info) => {
+            state.webuiIntegration = info;
+            rootInput.value = info?.webui_root || rootInput.value || info?.guesses?.[0] || "";
+            guessSelect.innerHTML = "";
+            guessSelect.append(el("option", { value: "" }, "自动检测到的 WebUI 目录"));
+            for (const guess of info?.guesses || []) guessSelect.append(el("option", { value: guess }, guess));
+            statusLine.textContent = webuiStatusText(info);
+        };
+        const connect = async (autoDetect = false) => {
+            let root = rootInput.value.trim();
+            statusLine.textContent = autoDetect ? "正在自动检测并接入..." : "正在接入 WebUI...";
+            try {
+                if (autoDetect && !root) {
+                    const latest = await fetchWebUIIntegration();
+                    renderInfo(latest);
+                    root = rootInput.value.trim() || latest?.guesses?.[0] || "";
+                    if (!root) {
+                        statusLine.textContent = "没有自动检测到 WebUI 目录，请把 WebUI 根目录粘贴到上面的输入框。";
+                        return;
+                    }
+                }
+                const info = await connectWebUIRoot(root, autoDetect);
+                renderInfo(info);
+                await refreshBridgeData();
+                setStatus(`已接入 WebUI：${info.webui_root}`, { kind: "success" });
+                statusLine.textContent = `${webuiStatusText(info)}；已刷新提示词、样式、LoRA 和模型列表`;
+            } catch (error) {
+                statusLine.textContent = `接入失败: ${error?.message || error}`;
+            }
+        };
+        guessSelect.addEventListener("change", () => {
+            if (guessSelect.value) rootInput.value = guessSelect.value;
+        });
+        mask.append(el("div", { class: "webui-bridge-config-panel" }, [
+            el("div", { class: "webui-bridge-config-head" }, [
+                el("span", {}, "一键接入 WebUI"),
+                el("button", { type: "button", onclick: close }, "×"),
+            ]),
+            el("div", { class: "webui-bridge-config-body" }, [
+                el("label", {}, [
+                    el("span", {}, "WebUI 根目录"),
+                    rootInput,
+                ]),
+                guessSelect,
+                statusLine,
+            ]),
+            el("div", { class: "webui-bridge-config-actions" }, [
+                el("button", { type: "button", onclick: () => connect(true) }, "自动检测"),
+                el("button", { type: "button", class: "primary", onclick: () => connect(false) }, "接入并刷新"),
+            ]),
+        ]));
+        document.body.append(mask);
+        try {
+            renderInfo(await fetchWebUIIntegration());
+        } catch (error) {
+            statusLine.textContent = error?.message || "读取配置失败，请粘贴 WebUI 根目录后重试";
+        }
+        rootInput.focus();
+        rootInput.select();
     };
 
     const renderModelSwitch = () => {
@@ -3378,6 +3507,12 @@ function buildPanel(node) {
                 sizeControls,
                 toolbar,
                 el("div", { class: "webui-bridge-backend-settings" }, [
+                    el("button", {
+                        class: "webui-bridge-config-button",
+                        type: "button",
+                        title: "只填写 WebUI 根目录，自动接入 Prompt All in One、TagComplete、styles、LoRA 和模型目录",
+                        onclick: showWebUIIntegrationDialog,
+                    }, "一键接入 WebUI"),
                     el("label", {}, [
                         el("span", {}, "CLIP"),
                         clipStrengthInput,
@@ -4376,6 +4511,19 @@ function addStyles() {
             margin: 0;
             accent-color: #2f73d9;
         }
+        .webui-bridge-config-button {
+            min-height: 30px;
+            border: 1px solid #4f7db8;
+            border-radius: 5px;
+            background: #17355c;
+            color: #eef6ff;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .webui-bridge-config-button:hover {
+            filter: brightness(1.08);
+        }
         .webui-bridge-tool:hover {
             border-color: #6aa3ff;
             background: #343c49;
@@ -5092,6 +5240,96 @@ function addStyles() {
         }
         .webui-bridge-lora-edit-status.visible {
             opacity: 1;
+        }
+        .webui-bridge-config-mask {
+            position: fixed;
+            inset: 0;
+            z-index: 100003;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            box-sizing: border-box;
+            background: rgba(0, 0, 0, .58);
+        }
+        .webui-bridge-config-panel {
+            width: min(560px, calc(100vw - 48px));
+            overflow: hidden;
+            border: 1px solid #40506a;
+            border-radius: 8px;
+            background: #111824;
+            color: #f3f6fb;
+            box-shadow: 0 18px 60px rgba(0, 0, 0, .55);
+        }
+        .webui-bridge-config-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 12px 14px;
+            border-bottom: 1px solid #313b4c;
+            background: #182234;
+            font-weight: 700;
+        }
+        .webui-bridge-config-head button {
+            width: 28px;
+            height: 28px;
+            border: 1px solid #58657a;
+            border-radius: 5px;
+            background: #202a38;
+            color: #fff;
+            cursor: pointer;
+        }
+        .webui-bridge-config-body {
+            display: grid;
+            gap: 10px;
+            padding: 14px;
+        }
+        .webui-bridge-config-body label {
+            display: grid;
+            gap: 7px;
+            color: #dce6f5;
+            font-weight: 700;
+        }
+        .webui-bridge-config-input {
+            width: 100%;
+            min-height: 36px;
+            box-sizing: border-box;
+            padding: 7px 10px;
+            border: 1px solid #40506a;
+            border-radius: 6px;
+            background: #0d121b;
+            color: #f3f6fb;
+            font: 13px/1.4 Consolas, monospace;
+        }
+        .webui-bridge-config-status {
+            min-height: 20px;
+            color: #a9bdd8;
+            font-size: 12px;
+            line-height: 1.45;
+            overflow-wrap: anywhere;
+        }
+        .webui-bridge-config-actions {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            padding: 0 14px 14px;
+        }
+        .webui-bridge-config-actions button {
+            min-height: 38px;
+            border: 1px solid #58657a;
+            border-radius: 6px;
+            background: #263244;
+            color: #fff;
+            cursor: pointer;
+            font-weight: 700;
+        }
+        .webui-bridge-config-actions button.primary {
+            border-color: #5d9bff;
+            background: #2f73d9;
+        }
+        .webui-bridge-config-actions button:hover {
+            filter: brightness(1.08);
         }
         @media (max-width: 900px) {
             .webui-bridge-lora-edit-body {

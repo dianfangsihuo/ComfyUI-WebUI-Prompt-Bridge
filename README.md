@@ -15,6 +15,12 @@
 
 新用户可以先从中文最小工作流教程开始：`docs/tutorial-minimal-workflows.md`。教程分别演示 Anima 分体模型和 XL 整合 checkpoint 的最小接线，并配有截图和可直接拖入 ComfyUI 的 JSON 工作流。
 
+## v0.1.4 新版简介
+
+这一版重点降低 WebUI 数据接入门槛。用户只需要在节点里点 `一键接入 WebUI`，选择 WebUI 根目录，节点就会自动识别提示词词库、样式、LoRA、checkpoint、VAE、embeddings 和 ControlNet 等常用目录。自动检测成功后会直接刷新节点里的提示词、样式、LoRA 和模型列表。
+
+这一版也优化了接入失败时的提示：如果后端接口还没加载，会提示重启 ComfyUI；如果目录不对，会提示选择真正的 WebUI 根目录。
+
 ## 节点特写
 
 ![WebUI Prompt Bridge node close-up](docs/images/webui-prompt-bridge-node-panel.png)
@@ -194,7 +200,13 @@ https://registry.comfy.org/nodes/comfyui-webui-prompt-bridge
 - `sd-webui-prompt-all-in-one`
 - `a1111-sd-webui-tagcomplete`
 
-复制 `config.local.example.json` 为 `config.local.json`，然后改成本机路径：
+最简单的方法：在节点右侧点击 `一键接入 WebUI`，只选择或填写 WebUI 根目录，例如 `H:/sd-webui-aki-v4.9`。节点会自动接入 `styles.csv`、Prompt All in One、TagComplete、LoRA、checkpoint、VAE、embeddings、ControlNet 等常用数据，不需要用户自己找 CSV 或复制多个路径。
+
+![One-click WebUI auto detection](docs/images/webui-one-click-auto-detect-success.png)
+
+看到 `WebUI: ... (9/9)` 就表示接入成功。接入后会立即刷新提示词、样式、LoRA 和模型列表。如果按钮提示“后端接口未加载”，重启一次 ComfyUI 再打开节点即可。
+
+如果要手动配置，也可以复制 `config.local.example.json` 为 `config.local.json`，然后改成本机路径：
 
 ```json
 {
@@ -202,7 +214,16 @@ https://registry.comfy.org/nodes/comfyui-webui-prompt-bridge
   "prompt_all_in_one_dir": "X:/path/to/stable-diffusion-webui/extensions/sd-webui-prompt-all-in-one",
   "tagcomplete_dir": "X:/path/to/stable-diffusion-webui/extensions/a1111-sd-webui-tagcomplete",
   "webui_python_site_packages": "X:/path/to/stable-diffusion-webui/python/Lib/site-packages",
-  "styles_file": "X:/path/to/stable-diffusion-webui/styles.csv"
+  "styles_file": "X:/path/to/stable-diffusion-webui/styles.csv",
+  "model_paths": {
+    "loras": "X:/path/to/stable-diffusion-webui/models/Lora",
+    "checkpoints": "X:/path/to/stable-diffusion-webui/models/Stable-diffusion",
+    "vae": "X:/path/to/stable-diffusion-webui/models/VAE",
+    "embeddings": "X:/path/to/stable-diffusion-webui/embeddings",
+    "controlnet": "X:/path/to/stable-diffusion-webui/models/ControlNet",
+    "upscale_models": "X:/path/to/stable-diffusion-webui/models/ESRGAN",
+    "hypernetworks": "X:/path/to/stable-diffusion-webui/models/hypernetworks"
+  }
 }
 ```
 
