@@ -34,6 +34,7 @@ _TAG_AUTOCOMPLETE_CACHE = None
 _LORA_METADATA_CACHE = {}
 _LORA_RAW_METADATA_CACHE = {}
 _LORA_HASH_CACHE = {}
+_LORA_LINK_ALIAS_CACHE = {}
 _TRANSLATION_MAP_CACHE = {}
 _NETWORK_TRANSLATE_CACHE = {}
 _LORA_PREVIEW_EXTENSIONS = (".preview.png", ".preview.jpg", ".preview.jpeg", ".preview.webp", ".png", ".jpg", ".jpeg", ".webp")
@@ -399,6 +400,8 @@ def _apply_webui_model_paths(webui_root):
         try:
             folder_paths.add_model_folder_path(folder_name, str(path))
             added.append({"kind": folder_name, "path": _path_text(path)})
+            if folder_name == "loras":
+                added.extend(_apply_linked_lora_targets(path))
         except Exception:
             pass
     try:
@@ -408,9 +411,103 @@ def _apply_webui_model_paths(webui_root):
     return added
 
 
+def _resolve_windows_shortcut(shortcut_path):
+    if os.name != "nt" or not shortcut_path:
+        return None
+    path = Path(shortcut_path)
+    if path.suffix.casefold() != ".lnk" or not path.exists():
+        return None
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($args[0]);"
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+        "Write-Output $s.TargetPath"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script, str(path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return None
+    target = (result.stdout or "").strip().splitlines()
+    if result.returncode != 0 or not target:
+        return None
+    resolved = Path(target[-1]).expanduser()
+    return resolved if resolved.exists() else None
+
+
+def _apply_linked_lora_targets(lora_root):
+    root = _existing_path(lora_root)
+    if not root:
+        return []
+    added = []
+    aliases = {}
+    try:
+        shortcuts = list(root.rglob("*.lnk"))[:500]
+    except Exception:
+        shortcuts = []
+    for shortcut in shortcuts:
+        target = _resolve_windows_shortcut(shortcut)
+        if not target or target.suffix.casefold() not in {".safetensors", ".ckpt", ".pt"}:
+            continue
+        try:
+            folder_paths.add_model_folder_path("loras", str(target.parent))
+            added.append({"kind": "loras", "path": _path_text(target.parent), "source": _path_text(shortcut)})
+            aliases[_lora_key(shortcut.stem)] = target.name
+            aliases[_lora_key(shortcut.name)] = target.name
+        except Exception:
+            pass
+    if aliases:
+        _LORA_LINK_ALIAS_CACHE.update(aliases)
+        try:
+            folder_paths.filename_list_cache.clear()
+        except Exception:
+            pass
+    return added
+
+
+def _apply_configured_model_paths():
+    added = []
+    configured_paths = LOCAL_CONFIG.get("model_paths") if isinstance(LOCAL_CONFIG, dict) else {}
+    if WEBUI_ROOT:
+        added.extend(_apply_webui_model_paths(WEBUI_ROOT))
+    elif isinstance(configured_paths, dict):
+        mapping = {
+            "loras": "loras",
+            "checkpoints": "checkpoints",
+            "vae": "vae",
+            "embeddings": "embeddings",
+            "controlnet": "controlnet",
+            "upscale_models": "upscale_models",
+            "hypernetworks": "hypernetworks",
+        }
+        for key, folder_name in mapping.items():
+            path = _existing_path(configured_paths.get(key))
+            if not path:
+                continue
+            try:
+                folder_paths.add_model_folder_path(folder_name, str(path))
+                added.append({"kind": folder_name, "path": _path_text(path)})
+                if folder_name == "loras":
+                    added.extend(_apply_linked_lora_targets(path))
+            except Exception:
+                pass
+        try:
+            folder_paths.filename_list_cache.clear()
+        except Exception:
+            pass
+    return added
+
+
 def _apply_local_config(config):
     global LOCAL_CONFIG, WEBUI_ROOT, PROMPT_ALL_IN_ONE_DIR, TAGCOMPLETE_DIR, WEBUI_PYTHON_SITE_PACKAGES, STORAGE_DIR, STYLES_FILE
-    global _TAG_AUTOCOMPLETE_CACHE, _LORA_METADATA_CACHE, _LORA_RAW_METADATA_CACHE, _LORA_HASH_CACHE, _TRANSLATION_MAP_CACHE, _NETWORK_TRANSLATE_CACHE
+    global _TAG_AUTOCOMPLETE_CACHE, _LORA_METADATA_CACHE, _LORA_RAW_METADATA_CACHE, _LORA_HASH_CACHE, _LORA_LINK_ALIAS_CACHE, _TRANSLATION_MAP_CACHE, _NETWORK_TRANSLATE_CACHE
     LOCAL_CONFIG = config if isinstance(config, dict) else {}
     WEBUI_ROOT = _discover_webui_root()
     PROMPT_ALL_IN_ONE_DIR = (
@@ -437,8 +534,10 @@ def _apply_local_config(config):
     _LORA_METADATA_CACHE.clear()
     _LORA_RAW_METADATA_CACHE.clear()
     _LORA_HASH_CACHE.clear()
+    _LORA_LINK_ALIAS_CACHE.clear()
     _TRANSLATION_MAP_CACHE.clear()
     _NETWORK_TRANSLATE_CACHE.clear()
+    _apply_configured_model_paths()
 
 
 def _webui_integration_status(webui_root=None):
@@ -534,8 +633,7 @@ STYLES_FILE = (
     or (WEBUI_ROOT / "styles.csv" if WEBUI_ROOT else DATA_DIR / "styles.csv")
 )
 
-if WEBUI_ROOT:
-    _apply_webui_model_paths(WEBUI_ROOT)
+_apply_configured_model_paths()
 
 
 def _find_webui_styles_file():
@@ -1604,16 +1702,44 @@ def _resolve_lora_name(requested):
         return requested
 
     candidates = {}
+    for alias, target in list(_LORA_LINK_ALIAS_CACHE.items()):
+        if target in available:
+            candidates.setdefault(alias, target)
+    basename_candidates = {}
     for name in available:
         candidates.setdefault(_lora_key(name), name)
         candidates.setdefault(_lora_key(name.replace("/", "\\")), name)
+        basename_key = _lora_key(Path(str(name).replace("\\", "/")).name)
+        if basename_key:
+            basename_candidates.setdefault(basename_key, set()).add(name)
+        try:
+            lora_path = folder_paths.get_full_path("loras", name)
+            metadata = _read_lora_raw_metadata(lora_path)
+            for alias in (
+                metadata.get("ss_output_name"),
+                metadata.get("modelspec.title"),
+            ):
+                alias_key = _lora_key(str(alias or "").strip())
+                if alias_key:
+                    candidates.setdefault(alias_key, name)
+        except Exception:
+            pass
 
     key = _lora_key(requested)
     if key in candidates:
         return candidates[key]
+    basename_matches = basename_candidates.get(key)
+    if basename_matches and len(basename_matches) == 1:
+        return next(iter(basename_matches))
 
     with_ext = requested if requested.casefold().endswith(".safetensors") else f"{requested}.safetensors"
-    return candidates.get(_lora_key(with_ext))
+    with_ext_key = _lora_key(with_ext)
+    if with_ext_key in candidates:
+        return candidates[with_ext_key]
+    basename_matches = basename_candidates.get(with_ext_key)
+    if basename_matches and len(basename_matches) == 1:
+        return next(iter(basename_matches))
+    return None
 
 
 def _lora_folder_and_base(name):
@@ -1977,6 +2103,54 @@ def _import_custom_tags(items):
     }
 
 
+def _custom_tag_response():
+    custom_tags = LOCAL_CONFIG.get("custom_tags") if isinstance(LOCAL_CONFIG, dict) else []
+    if not isinstance(custom_tags, list):
+        custom_tags = []
+    return {
+        "success": True,
+        "items": custom_tags,
+        "total": len(custom_tags),
+        **_settings_response(),
+    }
+
+
+def _delete_custom_tag(index):
+    config = dict(LOCAL_CONFIG) if isinstance(LOCAL_CONFIG, dict) else {}
+    current = config.get("custom_tags")
+    if not isinstance(current, list):
+        current = []
+    if index < 0 or index >= len(current):
+        raise ValueError("custom tag index out of range")
+    current.pop(index)
+    config["custom_tags"] = current
+    _write_local_config(config)
+    _apply_local_config(config)
+    return _custom_tag_response()
+
+
+def _update_custom_tag(index, item):
+    normalized = _normalize_imported_tag_item(item)
+    if not normalized:
+        raise ValueError("custom tag needs a prompt")
+    config = dict(LOCAL_CONFIG) if isinstance(LOCAL_CONFIG, dict) else {}
+    current = config.get("custom_tags")
+    if not isinstance(current, list):
+        current = []
+    if index < 0 or index >= len(current):
+        current.append(normalized)
+    else:
+        current[index] = normalized
+    config["custom_tags"] = current[-5000:]
+    settings = dict(_bridge_settings())
+    settings["data_source"] = "builtin" if settings.get("data_source") == "webui" else settings.get("data_source", "auto")
+    settings["show_startup_wizard"] = False
+    config["settings"] = settings
+    _write_local_config(config)
+    _apply_local_config(config)
+    return _custom_tag_response()
+
+
 def _asset_target(parent, spec):
     return parent / spec["directory"]
 
@@ -2306,6 +2480,34 @@ def _register_routes():
             return web.json_response({"error": "items must be a list"}, status=400)
         return web.json_response(_import_custom_tags(items))
 
+    @routes.get("/webui_prompt_bridge/custom_tags")
+    async def bridge_custom_tags_get(request):
+        return web.json_response(_custom_tag_response())
+
+    @routes.post("/webui_prompt_bridge/custom_tags")
+    async def bridge_custom_tags_post(request):
+        rejected = reject_cross_origin(request)
+        if rejected is not None:
+            return rejected
+        try:
+            data = await request.json()
+            index = int(data.get("index", -1))
+            item = data.get("item") or data
+            return web.json_response(_update_custom_tag(index, item))
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+    @routes.delete("/webui_prompt_bridge/custom_tags")
+    async def bridge_custom_tags_delete(request):
+        rejected = reject_cross_origin(request)
+        if rejected is not None:
+            return rejected
+        try:
+            index = int(request.query.get("index", "-1"))
+            return web.json_response(_delete_custom_tag(index))
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
     @routes.post("/webui_prompt_bridge/install_assets")
     async def bridge_install_assets(request):
         rejected = reject_cross_origin(request)
@@ -2402,6 +2604,7 @@ def _register_routes():
             thumbnail = None
             description = ""
             user_metadata = {}
+            raw_metadata = {}
             detected_sd_version = ""
             created = 0
             modified = 0
@@ -2420,6 +2623,13 @@ def _register_routes():
             except Exception:
                 thumbnail = None
             display_description = user_metadata.get("description") or description
+            metadata_aliases = [
+                value for value in (
+                    raw_metadata.get("ss_output_name") if isinstance(raw_metadata, dict) else "",
+                    raw_metadata.get("modelspec.title") if isinstance(raw_metadata, dict) else "",
+                )
+                if value
+            ]
             try:
                 preferred_weight = float(user_metadata.get("preferred weight") or 0)
             except Exception:
@@ -2430,6 +2640,7 @@ def _register_routes():
                 "folder": folder or "",
                 "file_name": filename,
                 "base_name": base_name,
+                "aliases": metadata_aliases,
                 "thumbnail": thumbnail,
                 "description": display_description,
                 "user_metadata": user_metadata,
@@ -2445,6 +2656,7 @@ def _register_routes():
                     stem,
                     folder or "",
                     base_name,
+                    " ".join(metadata_aliases),
                     display_description,
                     user_metadata.get("category", "") or user_metadata.get("manual category", ""),
                     user_metadata.get("activation text", ""),

@@ -15,13 +15,19 @@
 
 新用户可以先从中文最小工作流教程开始：`docs/tutorial-minimal-workflows.md`。教程分别演示 Anima 分体模型和 XL 整合 checkpoint 的最小接线，并配有截图和可直接拖入 ComfyUI 的 JSON 工作流。
 
-## v0.1.9 更新说明
+## v0.2.0 更新说明
 
-这一版补上了 WebUI 配套扩展检测的细节：如果你的 WebUI 里已经有 Prompt All in One 和 TagComplete，节点会显示 `扩展已存在`，直接 `一键接入 WebUI` 即可，不会引导你重复下载。
+这一版主要解决大家反馈最多的 LoRA 接入、提示词保存和面板拖动问题。升级后建议重启 ComfyUI，并在浏览器里刷新页面。
 
-如果你的 WebUI 缺少 Prompt All in One 或 TagComplete，才需要点 `补齐缺失扩展`。如果电脑里没有 A1111 / Forge WebUI，可以点 `使用内置数据`，或者在 `设置` 里点 `下载本地数据包`，把更完整的词库下载到本节点自己的 `data` 目录。
+- WebUI 接入后的 LoRA 匹配更稳：会同步 WebUI/配置里的 LoRA 路径，也支持 `.lnk` 快捷方式、文件名、路径名和部分 metadata 别名匹配，减少“预览和触发词都能看到，但生成前提示 LoRA 未找到”的情况。
+- 刷新页面后 Prompt / Negative prompt / CLIP 字段错位的问题已修复，提示词保存更稳定。
+- `快速添加 LoRA` 现在可以勾选多个 LoRA，一次添加到正向提示词，并显示添加成功提示。
+- LoRA 面板折叠和拖动分隔线已优化，不会再被压成一坨，也不会折叠后留出大片空白。
+- 底部输入框更明显，按 Enter 添加提示词时默认会翻译；输入过程中不会刚打一个字就自动翻译。
+- 可以新增、修改、删除自己的提示词标签，也可以按住 Ctrl 多选多个提示词标签一起拖动。
+- LoRA 权重编辑会正确修改 `<lora:name:weight>`，不会再把 LoRA 标签当普通提示词加权。
 
-如果点补齐扩展时看到“后端安装接口未加载”，请重启 ComfyUI 后刷新页面。这通常是前端脚本已经更新、但 Python 后端还没重新加载造成的。
+本版已经在浏览器里实际验证：XL 整合模型 `waiANINSFWPONYXL_v60.safetensors`、分体 `Anima/Qwen` 模型、以及从 Anima 切回 XL 后再次生成都成功出图。
 
 完整更新记录见 `CHANGELOG.md`。
 
@@ -108,7 +114,8 @@ docs/tutorial-minimal-workflows.md
 已验证：
 
 - 分体 Anima/Qwen 模式可以正常生成。
-- 整合 Checkpoint 模式可以用 `Qwen-Rapid-AIO-NSFW-v16.safetensors` 正常生成。
+- 整合 Checkpoint 模式可以用 `waiANINSFWPONYXL_v60.safetensors` 正常生成。
+- 从分体 Anima/Qwen 切回整合 XL 后再次生成也正常。
 
 注意：切到普通 SDXL / Pony / Illustrious checkpoint 时，需要关闭参考图、Qwen Union 姿势控制等 Qwen 专用分支，避免编码器或模型结构不兼容。
 
