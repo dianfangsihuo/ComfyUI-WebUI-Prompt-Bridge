@@ -15,7 +15,7 @@
 
 新用户可以先从中文最小工作流教程开始：`docs/tutorial-minimal-workflows.md`。教程分别演示 Anima 分体模型和 XL 整合 checkpoint 的最小接线，并配有截图和可直接拖入 ComfyUI 的 JSON 工作流。
 
-## v0.2.1 更新说明
+## v0.2.2 更新说明
 
 这一版在 v0.2.0 的基础上补了几个常见问题：如果右侧 `CLIP` 数字框被清空，生成时可能提示 `Failed to convert an input value to a FLOAT value`；设置里的字体大小也可能只有少部分文字变化；批量添加 LoRA 后选中框可能还残留。现在空值会自动回到 `1`，主要按钮、输入框、提示词标签和 LoRA 卡片文字都会跟随字体大小变化，添加选中 LoRA 后也会自动清空绿色选中状态。升级后建议重启 ComfyUI，并在浏览器里刷新页面。
 
