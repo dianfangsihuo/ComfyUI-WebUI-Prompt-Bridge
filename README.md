@@ -15,13 +15,13 @@
 
 新用户可以先从中文最小工作流教程开始：`docs/tutorial-minimal-workflows.md`。教程分别演示 Anima 分体模型和 XL 整合 checkpoint 的最小接线，并配有截图和可直接拖入 ComfyUI 的 JSON 工作流。
 
-## v0.1.8 更新说明
+## v0.1.9 更新说明
 
-这一版重点解决“没有 WebUI 怎么用”的问题。首次打开节点时会出现启动向导，可以选择 `连接 WebUI`、`使用内置数据` 或 `导入词库`；即使电脑里没有 A1111 / Forge WebUI，也能先用内置基础 tag 分类、自动补全、常用反向词和简单中英映射开始写提示词。
+这一版补上了 WebUI 配套扩展检测的细节：如果你的 WebUI 里已经有 Prompt All in One 和 TagComplete，节点会显示 `扩展已存在`，直接 `一键接入 WebUI` 即可，不会引导你重复下载。
 
-如果你已经有 WebUI，并且装过 Prompt All in One / TagComplete，直接 `一键接入 WebUI` 即可，不需要重复下载。只有 WebUI 缺扩展时才需要点 `补齐缺失扩展`；没有 WebUI 的用户可以在 `设置` 里点 `下载本地数据包`，把更完整的词库下载到本节点自己的 `data` 目录。
+如果你的 WebUI 缺少 Prompt All in One 或 TagComplete，才需要点 `补齐缺失扩展`。如果电脑里没有 A1111 / Forge WebUI，可以点 `使用内置数据`，或者在 `设置` 里点 `下载本地数据包`，把更完整的词库下载到本节点自己的 `data` 目录。
 
-新增的 `设置` 面板可以集中管理数据来源、翻译来源、布局尺寸、Tag 显示方式和 LoRA 卡片大小。已有 WebUI 用户、新用户和只用 ComfyUI 的用户都可以在同一个入口里选合适的使用方式。
+如果点补齐扩展时看到“后端安装接口未加载”，请重启 ComfyUI 后刷新页面。这通常是前端脚本已经更新、但 Python 后端还没重新加载造成的。
 
 完整更新记录见 `CHANGELOG.md`。
 
