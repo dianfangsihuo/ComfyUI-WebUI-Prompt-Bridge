@@ -15,19 +15,19 @@
 
 新用户可以先从中文最小工作流教程开始：`docs/tutorial-minimal-workflows.md`。教程分别演示 Anima 分体模型和 XL 整合 checkpoint 的最小接线，并配有截图和可直接拖入 ComfyUI 的 JSON 工作流。
 
-## v0.2.2 更新说明
+## v0.2.3 更新说明
 
-这一版在 v0.2.0 的基础上补了几个常见问题：如果右侧 `CLIP` 数字框被清空，生成时可能提示 `Failed to convert an input value to a FLOAT value`；设置里的字体大小也可能只有少部分文字变化；批量添加 LoRA 后选中框可能还残留。现在空值会自动回到 `1`，主要按钮、输入框、提示词标签和 LoRA 卡片文字都会跟随字体大小变化，添加选中 LoRA 后也会自动清空绿色选中状态。升级后建议重启 ComfyUI，并在浏览器里刷新页面。
+这一版重点增强提示词词库和 AI 翻译。现在可以在设置里打开 `提示词市场`，一键导入公开词库并自动分类；导入过的来源会显示状态，也可以 `重新导入`，方便误删后恢复。`提示词编辑` 改成全屏窗口，可以集中新增、编辑、删除提示词，并按分类和来源筛选。
 
-- WebUI 接入后的 LoRA 匹配更稳：会同步 WebUI/配置里的 LoRA 路径，也支持 `.lnk` 快捷方式、文件名、路径名和部分 metadata 别名匹配，减少“预览和触发词都能看到，但生成前提示 LoRA 未找到”的情况。
-- 刷新页面后 Prompt / Negative prompt / CLIP 字段错位的问题已修复，提示词保存更稳定。
-- `快速添加 LoRA` 现在可以勾选多个 LoRA，一次添加到正向提示词，并显示添加成功提示。
-- LoRA 面板折叠和拖动分隔线已优化，不会再被压成一坨，也不会折叠后留出大片空白。
-- 底部输入框更明显，按 Enter 添加提示词时默认会翻译；输入过程中不会刚打一个字就自动翻译。
-- 可以新增、修改、删除自己的提示词标签，也可以按住 Ctrl 多选多个提示词标签一起拖动：先按住 `Ctrl` 点选多个标签，再拖动其中任意一个被选中的标签，松手后会一起移动到新位置。
-- LoRA 权重编辑会正确修改 `<lora:name:weight>`，不会再把 LoRA 标签当普通提示词加权。
+AI 接口支持 OpenAI 兼容服务，例如 SiliconFlow、DeepSeek 等。填写 Base URL 和 API Key 后，可以点击 `检测模型` 读取上游真实模型 ID，再直接选择模型。开启 `AI 翻译` 后，中文提示词会通过配置的 AI 接口翻译成英文 tag；翻译时输入框会显示 `AI 正在翻译...` 并高亮，用户能看出功能正在工作。
 
-本版已经在浏览器里实际验证：XL 整合模型 `waiANINSFWPONYXL_v60.safetensors`、分体 `Anima/Qwen` 模型、以及从 Anima 切回 XL 后再次生成都成功出图。
+- 提示词市场新增免费词库来源，包括当前 WebUI / 本地词库、Prompt All in One 中文分类词库、TagComplete 热门 tags、质量词等。
+- 自动补全会显示中文解释；本地词库不足时，可以在设置里开启联网补全中文解释。
+- 没有 WebUI 或 WebUI 词库未显示时，可以通过提示词市场补导入本地数据。
+- AI 设置里可以配置 Base URL、模型、API Key、系统提示；API Key 只保存在本机 `config.local.json`。
+- SiliconFlow 推荐模型 ID 为 `deepseek-ai/DeepSeek-V4-Flash`，如果误填 `deepseek-v4-flash`，节点会自动修正。
+
+升级后请重启 ComfyUI，再刷新浏览器页面。
 
 完整更新记录见 `CHANGELOG.md`。
 

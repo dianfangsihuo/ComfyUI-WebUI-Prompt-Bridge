@@ -24,6 +24,7 @@ const EXTRA_NETWORKS_MIN_HEIGHT = 180;
 const DEFAULT_BRIDGE_SETTINGS = {
     data_source: "auto",
     translation_source: "auto",
+    tag_translation_source: "auto",
     show_startup_wizard: true,
     layout_preset: "default",
     tag_display: "local_first",
@@ -31,7 +32,8 @@ const DEFAULT_BRIDGE_SETTINGS = {
 };
 const SETTING_CHOICES = {
     data_source: ["auto", "webui", "builtin"],
-    translation_source: ["auto", "webui", "builtin"],
+    translation_source: ["auto", "webui", "online", "ai", "builtin"],
+    tag_translation_source: ["auto", "local", "online", "off"],
     layout_preset: ["default", "compact", "roomy"],
     tag_display: ["local_first", "prompt_first", "compact"],
     lora_card_size: ["compact", "normal", "large"],
@@ -2666,6 +2668,59 @@ async function saveBridgeSettings(settings) {
     return response.json();
 }
 
+async function fetchAIConfig() {
+    const response = await api.fetchApi("/webui_prompt_bridge/ai_config", { cache: "no-store" });
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+}
+
+async function saveAIConfig(config) {
+    const response = await api.fetchApi("/webui_prompt_bridge/ai_config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(config),
+    });
+    if (!response.ok) {
+        if (response.status === 405) throw new Error("后端接口还是旧版本，请重启 ComfyUI 后再保存 AI 配置");
+        throw new Error(await response.text());
+    }
+    return response.json();
+}
+
+async function testAIConfig(prompt) {
+    const response = await api.fetchApi("/webui_prompt_bridge/ai_config/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "AI 接口测试失败");
+    return data;
+}
+
+async function fetchAIModels(config) {
+    const response = await api.fetchApi("/webui_prompt_bridge/ai_config/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(config || {}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        if (response.status === 405) throw new Error("后端接口还是旧版本，请重启 ComfyUI 后再检测模型");
+        throw new Error(data.error || "模型检测失败");
+    }
+    return data;
+}
+
+function normalizeAIModelInput(model, baseUrl = "") {
+    const raw = String(model || "").trim();
+    const key = raw.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    if (String(baseUrl || "").toLowerCase().includes("siliconflow") && ["deepseekv4flash", "deepseek4flash", "deepseekv4"].includes(key)) {
+        return "deepseek-ai/DeepSeek-V4-Flash";
+    }
+    return raw;
+}
+
 async function importBridgeTags(items) {
     const response = await api.fetchApi("/webui_prompt_bridge/import_tags", {
         method: "POST",
@@ -2695,6 +2750,22 @@ async function saveCustomTag(index, item) {
 async function deleteCustomTag(index) {
     const response = await api.fetchApi(`/webui_prompt_bridge/custom_tags?index=${encodeURIComponent(index)}`, {
         method: "DELETE",
+    });
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+}
+
+async function fetchPromptMarketSources() {
+    const response = await api.fetchApi("/webui_prompt_bridge/prompt_market", { cache: "no-store" });
+    if (!response.ok) throw new Error(await response.text());
+    return response.json();
+}
+
+async function importPromptMarketSource(sourceId) {
+    const response = await api.fetchApi("/webui_prompt_bridge/prompt_market/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_id: sourceId }),
     });
     if (!response.ok) throw new Error(await response.text());
     return response.json();
@@ -3283,6 +3354,7 @@ function createPromptRow(label, value, placeholder, onFocus, onInput, options = 
     });
     textarea.value = value || "";
     const counter = el("div", { class: "webui-bridge-token-counter" }, "0/75");
+    const translateStatus = el("div", { class: "webui-bridge-translate-status" }, "");
     const baseKey = String(label || "prompt").toLowerCase().replace(/\W+/g, "-");
     const textareaHeightKey = options.textareaHeightKey || `webui-bridge-textarea-height-${baseKey}`;
     const chipHeightKey = options.sizeKey || `webui-bridge-chip-height-${baseKey}`;
@@ -3350,6 +3422,7 @@ function createPromptRow(label, value, placeholder, onFocus, onInput, options = 
             el("span", {}, label),
             el("span", { class: "webui-bridge-prompt-label-tools" }, labelTools),
         ]),
+        translateStatus,
         textarea,
         textChipGrip,
         chips,
@@ -3358,9 +3431,20 @@ function createPromptRow(label, value, placeholder, onFocus, onInput, options = 
     ]);
     applyCollapsedState(collapsed);
     row.chips = chips;
+    row.translateStatus = translateStatus;
     row.__webuiBridgeBottomResizeTarget = () => chips.classList.contains("empty") ? textarea : chips;
     row.__webuiBridgeBottomResizeKey = () => chips.classList.contains("empty") ? textareaHeightKey : chipHeightKey;
     return { row, textarea, counter };
+}
+
+function setPromptTranslateStatus(textarea, message = "", active = false) {
+    const row = textarea?.closest?.(".webui-bridge-prompt-row");
+    if (!row) return;
+    row.classList.toggle("translating", Boolean(active));
+    if (row.translateStatus) {
+        row.translateStatus.textContent = message || "";
+        row.translateStatus.classList.toggle("visible", Boolean(message));
+    }
 }
 
 function createToolButton(text, title, onclick) {
@@ -3567,20 +3651,32 @@ function createPromptAllInOnePanel(kind, title, textarea, state, sync) {
     const appendKeyword = async () => {
         const value = query.value.trim();
         if (!value) return;
-        const tags = await resolveKeywordInput(value, autoTranslate.checked);
-        for (const tag of tags) {
-            if (!tag.prompt || tag.prompt === "\n") continue;
-            await updatePromptAreaWithLoraKeywords(textarea, tag.prompt, isNegative, sync, (message) => {
-                hint.textContent = message;
-            }, { toggle: false });
+        const hasCjk = /[\u3400-\u9fff]/.test(value);
+        const aiMode = normalizeBridgeSettings(state.settings).translation_source === "ai";
+        if (autoTranslate.checked && hasCjk) {
+            hint.textContent = aiMode ? "AI 正在翻译关键词..." : "正在翻译关键词...";
+            query.classList.add("webui-bridge-input-busy");
+            addBtn.disabled = true;
         }
-        hint.textContent = tags.length
-            ? `已加入: ${tags.map((tag) => tag.prompt).join(", ")}`
-            : "";
-        query.value = "";
-        closeAppendMenu();
-        sync();
-        render();
+        try {
+            const tags = await resolveKeywordInput(value, autoTranslate.checked);
+            for (const tag of tags) {
+                if (!tag.prompt || tag.prompt === "\n") continue;
+                await updatePromptAreaWithLoraKeywords(textarea, tag.prompt, isNegative, sync, (message) => {
+                    hint.textContent = message;
+                }, { toggle: false });
+            }
+            hint.textContent = tags.length
+                ? `${aiMode && autoTranslate.checked && hasCjk ? "AI " : ""}已加入: ${tags.map((tag) => tag.prompt).join(", ")}`
+                : "";
+            query.value = "";
+            closeAppendMenu();
+            sync();
+            render();
+        } finally {
+            query.classList.remove("webui-bridge-input-busy");
+            addBtn.disabled = false;
+        }
     };
     const addBtn = el("button", {
         class: "webui-bridge-aio-add",
@@ -3633,16 +3729,21 @@ function createPromptAllInOnePanel(kind, title, textarea, state, sync) {
     const translateAll = async () => {
         const value = textarea.value.trim();
         if (!value) return;
+        const aiMode = normalizeBridgeSettings(state.settings).translation_source === "ai";
+        hint.textContent = aiMode ? "AI 正在翻译整段提示词..." : "正在翻译整段提示词...";
+        setPromptTranslateStatus(textarea, hint.textContent, true);
         try {
             const translated = await translatePromptAllInOne(value, "english");
             setTextareaValue(textarea, translated.prompt || value);
             hint.textContent = translated.matched
-                ? `已翻译 ${translated.matched} 个关键词`
+                ? `${aiMode ? "AI " : ""}已翻译 ${translated.matched} 个关键词`
                 : "本地词库未匹配，已保留原文；可在设置里查看说明";
+            setPromptTranslateStatus(textarea, hint.textContent, false);
             sync();
             render();
         } catch (error) {
             hint.textContent = "整段翻译失败";
+            setPromptTranslateStatus(textarea, hint.textContent, false);
         }
     };
     const copyPrompt = async () => {
@@ -3912,21 +4013,31 @@ function buildPanel(node) {
         if (!readLocalBoolean(`webui-bridge-live-auto-translate-${kind}`, false)) return;
         if (!/[\u3400-\u9fff]/.test(textarea.value || "")) return;
         window.clearTimeout(textarea.__webuiBridgeAutoTranslateTimer);
+        setPromptTranslateStatus(textarea, "等待翻译...", false);
         textarea.__webuiBridgeAutoTranslateTimer = window.setTimeout(async () => {
             if (textarea.__webuiBridgeComposing || !/[\u3400-\u9fff]/.test(textarea.value || "")) return;
             const before = textarea.value;
+            const aiMode = normalizeBridgeSettings(state.settings).translation_source === "ai";
             try {
                 textarea.__webuiBridgeAutoTranslating = true;
+                setPromptTranslateStatus(textarea, aiMode ? "AI 正在翻译..." : "正在翻译...", true);
+                setStatus(aiMode ? "AI 正在翻译提示词..." : "正在自动翻译提示词...");
                 const translated = await translatePromptAllInOne(before, "english");
                 const next = translated.prompt || before;
                 if (translated.matched && next && next !== before) {
                     setTextareaValue(textarea, next);
-                    setStatus(`已自动翻译 ${translated.matched} 个关键词`);
+                    const translatedByAI = aiMode || (translated.tags || []).some((tag) => tag.source === "ai");
+                    const message = `${translatedByAI ? "AI " : ""}已自动翻译 ${translated.matched} 个关键词`;
+                    setPromptTranslateStatus(textarea, message, false);
+                    setStatus(message);
                     sync();
                     positiveTagPanel.__webuiBridgeRender?.();
                     negativeTagPanel.__webuiBridgeRender?.();
+                } else {
+                    setPromptTranslateStatus(textarea, aiMode ? "AI 已返回，内容未变化" : "已检查，内容未变化", false);
                 }
             } catch {
+                setPromptTranslateStatus(textarea, "自动翻译失败", false);
                 setStatus("自动翻译失败");
             } finally {
                 textarea.__webuiBridgeAutoTranslating = false;
@@ -3940,6 +4051,7 @@ function buildPanel(node) {
             sync();
             return;
         }
+        setPromptTranslateStatus(textarea, "", false);
         sync();
         scheduleAutoTranslateInput(textarea);
     };
@@ -3967,6 +4079,7 @@ function buildPanel(node) {
     for (const textarea of [positive.textarea, negative.textarea]) {
         textarea.addEventListener("compositionstart", () => {
             textarea.__webuiBridgeComposing = true;
+            setPromptTranslateStatus(textarea, "", false);
         });
         textarea.addEventListener("compositionend", () => {
             textarea.__webuiBridgeComposing = false;
@@ -4264,65 +4377,200 @@ function buildPanel(node) {
         el("option", { value: item.value, selected: item.value === value ? "selected" : undefined }, item.label)
     )));
 
-    const showImportTagsDialog = () => {
-        const mask = el("div", { class: "webui-bridge-config-mask" });
+    const promptLibraryKeys = () => {
+        const keys = new Set();
+        for (const group of state.promptAllInOne?.group_tags || []) {
+            const kind = group.name === "反向提示词" ? "negative" : "positive";
+            for (const subGroup of group.groups || []) {
+                for (const tag of subGroup.tags || []) {
+                    const prompt = String(tag.prompt || "").trim().toLowerCase();
+                    if (prompt) keys.add(`${kind}:${prompt}`);
+                }
+            }
+        }
+        return keys;
+    };
+
+    const promptCategoryOptions = () => {
+        const groups = new Set(["导入词库", "人物", "服饰", "表情动作", "画面", "环境", "场景", "物品", "反向提示词"]);
+        const subgroups = new Set(["提示词", "对象", "头发", "服装", "动作", "质量", "反向词"]);
+        for (const group of state.promptAllInOne?.group_tags || []) {
+            if (group.name) groups.add(group.name);
+            for (const subGroup of group.groups || []) {
+                if (subGroup.name) subgroups.add(subGroup.name);
+            }
+        }
+        return {
+            groups: [...groups].filter(Boolean).sort((a, b) => a.localeCompare(b, "zh-Hans-CN")),
+            subgroups: [...subgroups].filter(Boolean).sort((a, b) => a.localeCompare(b, "zh-Hans-CN")),
+        };
+    };
+
+    const showImportTagsDialog = (options = {}) => {
+        const editorMode = options.mode === "editor";
+        const mask = el("div", { class: `webui-bridge-config-mask${editorMode ? " webui-bridge-prompt-editor-mask" : ""}` });
         const fileInput = el("input", { type: "file", accept: ".csv,.tsv,.txt,.json,application/json,text/csv,text/plain", style: { display: "none" } });
-        const statusLine = el("div", { class: "webui-bridge-config-status" }, `已导入 ${state.customTagCount || 0} 条`);
+        const statusLine = el("div", { class: "webui-bridge-config-status" }, `自定义提示词 ${state.customTagCount || 0} 条`);
+        const searchInput = el("input", { class: "webui-bridge-config-input", placeholder: "搜索 prompt / 中文名 / 分类" });
+        const filterKind = settingSelect("all", [
+            { value: "all", label: "全部" },
+            { value: "positive", label: "正向" },
+            { value: "negative", label: "反向" },
+        ]);
+        const filterSource = settingSelect("all", [
+            { value: "all", label: "全部来源" },
+            { value: "custom", label: "自定义/市场" },
+            { value: "main", label: "主页面/WebUI" },
+        ]);
+        const filterGroup = settingSelect("", [{ value: "", label: "全部分组" }]);
+        const filterSubgroup = settingSelect("", [{ value: "", label: "全部子分组" }]);
         const promptInput = el("input", { class: "webui-bridge-config-input", placeholder: "英文 tag / prompt" });
         const localInput = el("input", { class: "webui-bridge-config-input", placeholder: "中文名 / 备注" });
-        const groupInput = el("input", { class: "webui-bridge-config-input", placeholder: "分组，例如 人物" });
-        const subgroupInput = el("input", { class: "webui-bridge-config-input", placeholder: "子分组，例如 发型" });
+        const categories = promptCategoryOptions();
+        const groupListId = `webui-bridge-groups-${Math.random().toString(36).slice(2)}`;
+        const subgroupListId = `webui-bridge-subgroups-${Math.random().toString(36).slice(2)}`;
+        const groupInput = el("input", { class: "webui-bridge-config-input", list: groupListId, placeholder: "分组，例如 人物" });
+        const subgroupInput = el("input", { class: "webui-bridge-config-input", list: subgroupListId, placeholder: "子分组，例如 发型" });
+        const groupList = el("datalist", { id: groupListId }, categories.groups.map((value) => el("option", { value })));
+        const subgroupList = el("datalist", { id: subgroupListId }, categories.subgroups.map((value) => el("option", { value })));
         const kindInput = settingSelect("positive", [
             { value: "positive", label: "正向" },
             { value: "negative", label: "反向" },
         ]);
         const customList = el("div", { class: "webui-bridge-custom-tags" });
+        const countLine = el("div", { class: "webui-bridge-config-status" }, "");
         let editingIndex = -1;
+        let editingLibraryKey = "";
         let customItems = [];
         const close = () => mask.remove();
         const pickFile = () => fileInput.click();
+        const refillFilterOptions = () => {
+            const groupValue = filterGroup.value;
+            const subgroupValue = filterSubgroup.value;
+            const rows = editorRows();
+            const groups = [...new Set(rows.map((row) => row.item.group || "导入词库"))].sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
+            const subgroups = [...new Set(rows.map((row) => row.item.subgroup || "提示词"))].sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
+            filterGroup.innerHTML = "";
+            filterGroup.append(el("option", { value: "" }, "全部分组"));
+            groups.forEach((value) => filterGroup.append(el("option", { value, selected: value === groupValue ? "selected" : undefined }, value)));
+            filterSubgroup.innerHTML = "";
+            filterSubgroup.append(el("option", { value: "" }, "全部子分组"));
+            subgroups.forEach((value) => filterSubgroup.append(el("option", { value, selected: value === subgroupValue ? "selected" : undefined }, value)));
+        };
+        const duplicateKeyFor = (item) => `${item.kind || "positive"}:${String(item.prompt || "").trim().toLowerCase()}`;
+        const isDuplicatePrompt = (item) => {
+            const key = duplicateKeyFor(item);
+            const previous = editingIndex >= 0 ? duplicateKeyFor(customItems[editingIndex] || {}) : "";
+            if (key && key === previous) return false;
+            if (key && key === editingLibraryKey) return false;
+            if (customItems.some((existing, index) => index !== editingIndex && duplicateKeyFor(existing) === key)) return true;
+            const libraryKeys = promptLibraryKeys();
+            if (previous) libraryKeys.delete(previous);
+            if (editingLibraryKey) libraryKeys.delete(editingLibraryKey);
+            return libraryKeys.has(key);
+        };
         const clearEditor = () => {
             editingIndex = -1;
+            editingLibraryKey = "";
             promptInput.value = "";
             localInput.value = "";
             groupInput.value = "";
             subgroupInput.value = "";
             kindInput.value = "positive";
         };
-        const refreshCustomList = async () => {
-            const result = await fetchCustomTags();
-            customItems = result.items || [];
-            state.customTagCount = result.custom_tag_count || result.total || customItems.length;
-            statusLine.textContent = `已导入 ${state.customTagCount || 0} 条`;
+        const mainLibraryRows = () => {
+            const rows = [];
+            for (const group of state.promptAllInOne?.group_tags || []) {
+                if (String(group.tabKey || "").startsWith("customTags")) continue;
+                const kind = group.name === "反向提示词" ? "negative" : "positive";
+                for (const subGroup of group.groups || []) {
+                    if (subGroup.type === "wrap") continue;
+                    for (const tag of subGroup.tags || []) {
+                        const prompt = String(tag.prompt || "").trim();
+                        if (!prompt) continue;
+                        rows.push({
+                            source: "main",
+                            index: -1,
+                            item: {
+                                prompt,
+                                local: String(tag.local || ""),
+                                group: group.name || "主页面词库",
+                                subgroup: subGroup.name || "提示词",
+                                kind,
+                            },
+                        });
+                    }
+                }
+            }
+            return rows;
+        };
+        const editorRows = () => [
+            ...customItems.map((item, index) => ({ source: "custom", index, item })),
+            ...mainLibraryRows(),
+        ];
+        const renderCustomList = () => {
             customList.innerHTML = "";
-            customItems.slice(-80).reverse().forEach((item, reverseIndex) => {
-                const index = customItems.length - 1 - reverseIndex;
+            const q = searchInput.value.trim().toLowerCase();
+            const group = filterGroup.value;
+            const subgroup = filterSubgroup.value;
+            const kind = filterKind.value;
+            const source = filterSource.value;
+            const allRows = editorRows();
+            const rows = allRows
+                .filter((row) => {
+                    const { item } = row;
+                    if (source !== "all" && row.source !== source) return false;
+                    if (kind !== "all" && (item.kind || "positive") !== kind) return false;
+                    if (group && (item.group || "导入词库") !== group) return false;
+                    if (subgroup && (item.subgroup || "提示词") !== subgroup) return false;
+                    if (!q) return true;
+                    return [item.prompt, item.local, item.group, item.subgroup, item.kind]
+                        .some((value) => String(value || "").toLowerCase().includes(q));
+                });
+            const mainCount = allRows.filter((row) => row.source === "main").length;
+            countLine.textContent = `显示 ${rows.length} / ${allRows.length} 条；自定义 ${customItems.length}，主页面/WebUI ${mainCount}；修改主页面词会保存为自定义覆盖项`;
+            rows.forEach(({ item, index, source: rowSource }) => {
+                const isMainRow = rowSource === "main";
                 customList.append(el("div", { class: "webui-bridge-custom-tag-row" }, [
-                    el("span", {}, `${item.kind === "negative" ? "反向" : "正向"} / ${item.group || "导入词库"} / ${item.subgroup || "提示词"}`),
+                    el("span", {}, `${isMainRow ? "主页面" : "自定义"} / ${item.kind === "negative" ? "反向" : "正向"} / ${item.group || "导入词库"} / ${item.subgroup || "提示词"}`),
                     el("b", {}, item.local || item.prompt),
                     el("code", {}, item.prompt),
                     el("button", {
                         type: "button",
                         onclick: () => {
-                            editingIndex = index;
+                            editingIndex = isMainRow ? -1 : index;
+                            editingLibraryKey = isMainRow ? duplicateKeyFor(item) : "";
                             promptInput.value = item.prompt || "";
                             localInput.value = item.local || "";
                             groupInput.value = item.group || "";
                             subgroupInput.value = item.subgroup || "";
                             kindInput.value = item.kind || "positive";
+                            statusLine.textContent = isMainRow ? `正在编辑主页面词库: ${item.prompt}；保存后会作为自定义覆盖项` : `正在编辑: ${item.prompt}`;
                         },
                     }, "改"),
                     el("button", {
                         type: "button",
+                        disabled: isMainRow ? "disabled" : undefined,
+                        title: isMainRow ? "主页面/WebUI 原始词不能直接删除；可以保存同名自定义项来覆盖显示" : "",
                         onclick: async () => {
+                            if (isMainRow) return;
                             await deleteCustomTag(index);
                             clearEditor();
                             await refreshBridgeData();
                             await refreshCustomList();
+                            setStatus("提示词已删除", { kind: "success" });
                         },
-                    }, "删"),
+                    }, isMainRow ? "源" : "删"),
                 ]));
             });
+        };
+        const refreshCustomList = async () => {
+            const result = await fetchCustomTags();
+            customItems = result.items || [];
+            state.customTagCount = result.custom_tag_count || result.total || customItems.length;
+            statusLine.textContent = `自定义提示词 ${state.customTagCount || 0} 条`;
+            refillFilterOptions();
+            renderCustomList();
         };
         const saveManualTag = async () => {
             const item = {
@@ -4336,12 +4584,16 @@ function buildPanel(node) {
                 statusLine.textContent = "请先填写英文 tag / prompt";
                 return;
             }
+            if (isDuplicatePrompt(item)) {
+                statusLine.textContent = "主页面或自定义词库里已经有这个提示词；请换一个 prompt，避免重复显示";
+                return;
+            }
             const result = await saveCustomTag(editingIndex, item);
             state.customTagCount = result.custom_tag_count || result.total || state.customTagCount;
             await refreshBridgeData();
             await refreshCustomList();
             clearEditor();
-            setStatus("自定义标签已保存", { kind: "success" });
+            setStatus("提示词已保存并同步到主页面", { kind: "success" });
         };
         const handleFile = async () => {
             const file = fileInput.files?.[0];
@@ -4367,26 +4619,43 @@ function buildPanel(node) {
             }
         };
         fileInput.addEventListener("change", handleFile);
+        searchInput.addEventListener("input", renderCustomList);
+        filterKind.addEventListener("change", renderCustomList);
+        filterSource.addEventListener("change", renderCustomList);
+        filterGroup.addEventListener("change", renderCustomList);
+        filterSubgroup.addEventListener("change", renderCustomList);
         mask.addEventListener("mousedown", (event) => {
             if (event.target === mask) close();
         });
-        mask.append(el("div", { class: "webui-bridge-config-panel" }, [
+        mask.append(el("div", { class: "webui-bridge-config-panel webui-bridge-prompt-editor-panel" }, [
             el("div", { class: "webui-bridge-config-head" }, [
-                el("span", {}, "导入词库"),
+                el("span", {}, editorMode ? "提示词编辑" : "导入词库"),
                 el("button", { type: "button", onclick: close }, "×"),
             ]),
             el("div", { class: "webui-bridge-config-body" }, [
-                el("div", { class: "webui-bridge-config-note" }, "支持 JSON、CSV、TSV。字段可用 prompt/local/group/subgroup/kind。"),
+                el("div", { class: "webui-bridge-config-note" }, editorMode
+                    ? "这里可以查看自定义/市场词和主页面/WebUI 词库。修改主页面词会保存为自定义覆盖项，避免和原始词重复显示。"
+                    : "支持 JSON、CSV、TSV。字段可用 prompt/local/group/subgroup/kind；导入后也可以在这里继续编辑分类。"),
                 el("div", { class: "webui-bridge-custom-editor" }, [
                     promptInput,
                     localInput,
                     groupInput,
                     subgroupInput,
                     kindInput,
-                    el("button", { type: "button", class: "primary", onclick: saveManualTag }, "保存标签"),
+                    el("button", { type: "button", class: "primary", onclick: saveManualTag }, "保存提示词"),
                     el("button", { type: "button", onclick: clearEditor }, "新建"),
                 ]),
+                groupList,
+                subgroupList,
+                el("div", { class: "webui-bridge-custom-filters" }, [
+                    searchInput,
+                    filterKind,
+                    filterSource,
+                    filterGroup,
+                    filterSubgroup,
+                ]),
                 statusLine,
+                countLine,
                 customList,
                 fileInput,
             ]),
@@ -4401,6 +4670,230 @@ function buildPanel(node) {
         });
     };
 
+    const showPromptMarketDialog = () => {
+        const mask = el("div", { class: "webui-bridge-config-mask" });
+        const sourceList = el("div", { class: "webui-bridge-prompt-market-list" });
+        const statusLine = el("div", { class: "webui-bridge-config-status" }, "正在读取提示词市场...");
+        const close = () => mask.remove();
+        const renderSources = (sources) => {
+            sourceList.innerHTML = "";
+            for (const source of sources || []) {
+                const importLabel = source.importable ? (source.imported ? "重新导入" : "一键导入") : "仅可打开";
+                const importButton = el("button", {
+                    type: "button",
+                    disabled: source.importable ? undefined : "disabled",
+                    onclick: async () => {
+                        importButton.disabled = true;
+                        importButton.textContent = "导入中...";
+                        statusLine.textContent = source.imported ? `正在重新导入 ${source.label}...` : `正在下载 ${source.label}...`;
+                        try {
+                            const result = await importPromptMarketSource(source.id);
+                            state.settings = normalizeBridgeSettings(result.settings);
+                            state.customTagCount = result.custom_tag_count || result.total || state.customTagCount;
+                            await refreshBridgeData();
+                            source.imported = true;
+                            source.imported_at = result.imported_at || source.imported_at;
+                            source.imported_count = result.downloaded || source.imported_count || 0;
+                            source.last_added = result.imported || 0;
+                            const actionText = source.last_added ? `新增 ${source.last_added} 条` : "没有新增，已补齐可用项";
+                            statusLine.textContent = `${result.source?.label || source.label}: 下载 ${result.downloaded || 0} 条，${actionText}，当前共 ${state.customTagCount || 0} 条`;
+                            setStatus("提示词市场导入完成", { kind: "success" });
+                            importButton.disabled = false;
+                            importButton.textContent = "重新导入";
+                            metaLine.textContent = marketSourceMeta(source);
+                        } catch (error) {
+                            statusLine.textContent = `导入失败: ${error?.message || error}`;
+                            importButton.disabled = false;
+                            importButton.textContent = importLabel;
+                        }
+                    },
+                }, importLabel);
+                const openButton = el("button", {
+                    type: "button",
+                    disabled: source.open_url ? undefined : "disabled",
+                    onclick: () => {
+                        if (source.open_url) window.open(source.open_url, "_blank", "noopener,noreferrer");
+                    },
+                }, source.open_url ? "打开" : "本地");
+                const marketSourceMeta = (item) => [
+                    item.license,
+                    item.limit ? `最多 ${item.limit} 条` : "",
+                    item.imported ? `已导入 ${item.imported_count || 0} 条` : "",
+                    item.imported_at ? `上次 ${String(item.imported_at).replace("T", " ")}` : "",
+                ].filter(Boolean).join(" / ");
+                const metaLine = el("code", {}, marketSourceMeta(source));
+                sourceList.append(el("div", { class: "webui-bridge-prompt-market-source" }, [
+                    el("div", { class: "webui-bridge-prompt-market-main" }, [
+                        el("b", {}, source.label || source.id),
+                        el("span", {}, source.description || ""),
+                        metaLine,
+                    ]),
+                    el("div", { class: "webui-bridge-prompt-market-actions" }, [
+                        openButton,
+                        importButton,
+                    ]),
+                ]));
+            }
+        };
+        mask.addEventListener("mousedown", (event) => {
+            if (event.target === mask) close();
+        });
+        mask.append(el("div", { class: "webui-bridge-config-panel webui-bridge-settings-panel" }, [
+            el("div", { class: "webui-bridge-config-head" }, [
+                el("span", {}, "提示词市场"),
+                el("button", { type: "button", onclick: close }, "×"),
+            ]),
+            el("div", { class: "webui-bridge-config-body" }, [
+                el("div", { class: "webui-bridge-config-note" }, "可一键导入的来源会下载公开词库并自动分类；案例网站会在浏览器中打开，适合手动挑选完整 prompt。"),
+                sourceList,
+                statusLine,
+            ]),
+            el("div", { class: "webui-bridge-config-actions" }, [
+                el("button", { type: "button", onclick: showImportTagsDialog }, "导入本地文件"),
+                el("button", { type: "button", class: "primary", onclick: close }, "关闭"),
+            ]),
+        ]));
+        document.body.append(mask);
+        fetchPromptMarketSources()
+            .then((result) => {
+                renderSources(result.sources || []);
+                statusLine.textContent = `已加载 ${(result.sources || []).length} 个来源`;
+            })
+            .catch((error) => {
+                statusLine.textContent = `读取失败: ${error?.message || error}`;
+            });
+    };
+
+    const showAIConfigDialog = async () => {
+        const mask = el("div", { class: "webui-bridge-config-mask" });
+        const enabledInput = el("input", { type: "checkbox" });
+        const baseUrlInput = el("input", { class: "webui-bridge-config-input", placeholder: "https://api.siliconflow.cn/v1" });
+        const modelListId = `webui-bridge-ai-models-${Date.now()}`;
+        const modelInput = el("input", { class: "webui-bridge-config-input", placeholder: "deepseek-ai/DeepSeek-V4-Flash", list: modelListId });
+        const modelDatalist = el("datalist", { id: modelListId });
+        const modelList = el("div", { class: "webui-bridge-ai-model-list" });
+        const apiKeyInput = el("input", { class: "webui-bridge-config-input", type: "password", placeholder: "留空表示不修改已保存的 API Key" });
+        const clearKeyInput = el("input", { type: "checkbox" });
+        const systemPromptInput = el("textarea", { class: "webui-bridge-config-input", rows: "5", placeholder: "AI 生成提示词的系统提示" });
+        const testPromptInput = el("input", { class: "webui-bridge-config-input", placeholder: "测试输入，例如：花园里的少女" });
+        const statusLine = el("div", { class: "webui-bridge-config-status" }, "正在读取 AI 配置...");
+        const close = () => mask.remove();
+        const fill = (config) => {
+            enabledInput.checked = Boolean(config.enabled);
+            baseUrlInput.value = config.base_url || "https://api.siliconflow.cn/v1";
+            modelInput.value = config.model || "deepseek-ai/DeepSeek-V4-Flash";
+            systemPromptInput.value = config.system_prompt || "";
+            statusLine.textContent = config.api_key_set ? `API Key: ${config.api_key_preview}` : "API Key 未设置";
+        };
+        const save = async () => {
+            statusLine.textContent = "正在保存 AI 配置...";
+            try {
+                const result = await saveAIConfig({
+                    enabled: enabledInput.checked,
+                    base_url: baseUrlInput.value.trim(),
+                    model: normalizeAIModelInput(modelInput.value, baseUrlInput.value),
+                    api_key: apiKeyInput.value.trim(),
+                    clear_api_key: clearKeyInput.checked,
+                    system_prompt: systemPromptInput.value.trim(),
+                });
+                apiKeyInput.value = "";
+                clearKeyInput.checked = false;
+                fill(result.config || {});
+                setStatus("AI 接口配置已保存", { kind: "success" });
+            } catch (error) {
+                statusLine.textContent = `保存失败: ${error?.message || error}`;
+            }
+        };
+        const renderModels = (models) => {
+            modelDatalist.replaceChildren();
+            modelList.replaceChildren();
+            for (const item of models.slice(0, 120)) {
+                const id = item.id || item;
+                if (!id) continue;
+                modelDatalist.append(el("option", { value: id }));
+                const modelButton = el("button", {
+                    type: "button",
+                    onclick: () => {
+                        modelInput.value = id;
+                        statusLine.textContent = `已选择模型: ${id}`;
+                    },
+                    title: item.owned_by ? `owned_by: ${item.owned_by}` : id,
+                }, id);
+                modelList.append(modelButton);
+            }
+        };
+        const detectModels = async () => {
+            statusLine.textContent = "正在检测上游模型...";
+            modelList.replaceChildren();
+            try {
+                const result = await fetchAIModels({
+                    base_url: baseUrlInput.value.trim(),
+                    api_key: apiKeyInput.value.trim(),
+                });
+                const models = result.models || [];
+                renderModels(models);
+                const preferred = models.find((item) => item.id === "deepseek-ai/DeepSeek-V4-Flash")
+                    || models.find((item) => /deepseek.*v4.*flash/i.test(item.id || ""))
+                    || models.find((item) => /deepseek/i.test(item.id || ""))
+                    || models[0];
+                if (preferred?.id && !modelInput.value.trim()) {
+                    modelInput.value = preferred.id;
+                }
+                statusLine.textContent = models.length ? `检测到 ${models.length} 个模型，点击下方模型名即可填入` : "没有检测到模型";
+            } catch (error) {
+                statusLine.textContent = `检测失败: ${error?.message || error}`;
+            }
+        };
+        const test = async () => {
+            statusLine.textContent = "正在测试 AI 接口...";
+            try {
+                await save();
+                const result = await testAIConfig(testPromptInput.value.trim() || "花园里的少女");
+                statusLine.textContent = `测试成功: ${(result.content || "").slice(0, 180)}`;
+            } catch (error) {
+                statusLine.textContent = `测试失败: ${error?.message || error}`;
+            }
+        };
+        mask.addEventListener("mousedown", (event) => {
+            if (event.target === mask) close();
+        });
+        mask.append(el("div", { class: "webui-bridge-config-panel webui-bridge-settings-panel" }, [
+            el("div", { class: "webui-bridge-config-head" }, [
+                el("span", {}, "AI 接口"),
+                el("button", { type: "button", onclick: close }, "×"),
+            ]),
+            el("div", { class: "webui-bridge-config-body" }, [
+                el("div", { class: "webui-bridge-config-note" }, "支持 OpenAI 兼容接口。SiliconFlow 可填 base URL https://api.siliconflow.cn/v1，模型 deepseek-ai/DeepSeek-V4-Flash；DeepSeek 官方也可填 https://api.deepseek.com/v1。API Key 只保存在本机 config.local.json。"),
+                el("label", { class: "webui-bridge-config-check" }, [enabledInput, el("span", {}, "启用 AI 提示词接口")]),
+                el("label", {}, [el("span", {}, "Base URL"), baseUrlInput]),
+                el("label", {}, [el("span", {}, "模型"), modelInput, modelDatalist]),
+                el("div", { class: "webui-bridge-config-row-actions" }, [
+                    el("button", { type: "button", onclick: detectModels }, "检测模型"),
+                    el("span", {}, "从上游 /models 读取真实模型 ID"),
+                ]),
+                modelList,
+                el("label", {}, [el("span", {}, "API Key"), apiKeyInput]),
+                el("label", { class: "webui-bridge-config-check" }, [clearKeyInput, el("span", {}, "清除已保存 API Key")]),
+                el("label", {}, [el("span", {}, "系统提示"), systemPromptInput]),
+                el("label", {}, [el("span", {}, "测试输入"), testPromptInput]),
+                statusLine,
+            ]),
+            el("div", { class: "webui-bridge-config-actions" }, [
+                el("button", { type: "button", onclick: close }, "关闭"),
+                el("button", { type: "button", onclick: detectModels }, "检测模型"),
+                el("button", { type: "button", onclick: test }, "保存并测试"),
+                el("button", { type: "button", class: "primary", onclick: save }, "保存"),
+            ]),
+        ]));
+        document.body.append(mask);
+        try {
+            const result = await fetchAIConfig();
+            fill(result.config || {});
+        } catch (error) {
+            statusLine.textContent = `读取失败: ${error?.message || error}`;
+        }
+    };
+
     const showBridgeSettingsDialog = () => {
         const mask = el("div", { class: "webui-bridge-config-mask" });
         const current = normalizeBridgeSettings(state.settings);
@@ -4413,6 +4906,14 @@ function buildPanel(node) {
             { value: "auto", label: "自动" },
             { value: "builtin", label: "内置映射" },
             { value: "webui", label: "WebUI 翻译" },
+            { value: "online", label: "联网翻译" },
+            { value: "ai", label: "AI 翻译" },
+        ]);
+        const tagTranslationSource = settingSelect(current.tag_translation_source, [
+            { value: "auto", label: "自动" },
+            { value: "local", label: "只用本地中文" },
+            { value: "online", label: "联网补全中文" },
+            { value: "off", label: "关闭中文解释" },
         ]);
         const layoutPreset = settingSelect(current.layout_preset, [
             { value: "default", label: "默认" },
@@ -4494,6 +4995,7 @@ function buildPanel(node) {
                 const result = await saveBridgeSettings({
                     data_source: dataSource.value,
                     translation_source: translationSource.value,
+                    tag_translation_source: tagTranslationSource.value,
                     layout_preset: layoutPreset.value,
                     tag_display: tagDisplay.value,
                     lora_card_size: loraCardSize.value,
@@ -4522,6 +5024,7 @@ function buildPanel(node) {
             el("div", { class: "webui-bridge-config-body" }, [
                 el("label", {}, [el("span", {}, "数据来源"), dataSource]),
                 el("label", {}, [el("span", {}, "翻译来源"), translationSource]),
+                el("label", {}, [el("span", {}, "补全中文解释"), tagTranslationSource]),
                 el("label", {}, [el("span", {}, "布局尺寸"), layoutPreset]),
                 el("label", {}, [el("span", {}, "Tag 显示"), tagDisplay]),
                 el("label", {}, [el("span", {}, "LoRA 卡片"), loraCardSize]),
@@ -4534,6 +5037,9 @@ function buildPanel(node) {
                 statusLine,
             ]),
             el("div", { class: "webui-bridge-config-actions" }, [
+                el("button", { type: "button", onclick: showPromptMarketDialog }, "提示词市场"),
+                el("button", { type: "button", onclick: () => showImportTagsDialog({ mode: "editor" }) }, "提示词编辑"),
+                el("button", { type: "button", onclick: showAIConfigDialog }, "AI 接口"),
                 el("button", { type: "button", onclick: showImportTagsDialog }, "导入词库"),
                 el("button", { type: "button", onclick: showWebUIIntegrationDialog }, "连接 WebUI"),
                 el("button", { type: "button", onclick: downloadLocalAssets }, "下载本地数据包"),
@@ -4591,6 +5097,13 @@ function buildPanel(node) {
                         showImportTagsDialog();
                     },
                 }, [el("b", {}, "导入词库"), el("span", {}, "JSON / CSV / TSV")]),
+                el("button", {
+                    type: "button",
+                    onclick: async () => {
+                        await close(true);
+                        showPromptMarketDialog();
+                    },
+                }, [el("b", {}, "提示词市场"), el("span", {}, "免费来源 / 一键导入")]),
             ]),
             el("div", { class: "webui-bridge-config-actions" }, [
                 el("button", { type: "button", onclick: () => close(true) }, "不再提示"),
@@ -5865,6 +6378,38 @@ function addStyles() {
             color: #f2f4f8;
             font: 12px/1.45 Consolas, Monaco, monospace;
             outline: none;
+        }
+        .webui-bridge-prompt-row.translating textarea,
+        .webui-bridge-input-busy {
+            box-shadow: inset 0 0 0 1px #5d9bff, 0 0 0 2px rgba(93, 155, 255, .16);
+        }
+        .webui-bridge-translate-status {
+            display: none;
+            margin: 0;
+            padding: 5px 9px;
+            border-bottom: 1px solid #2d3542;
+            background: #10223a;
+            color: #d7e8ff;
+            font-size: 12px;
+            line-height: 1.35;
+        }
+        .webui-bridge-translate-status.visible {
+            display: block;
+        }
+        .webui-bridge-prompt-row.translating .webui-bridge-translate-status.visible::before {
+            content: "";
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            margin-right: 7px;
+            border: 2px solid rgba(215, 232, 255, .45);
+            border-top-color: #d7e8ff;
+            border-radius: 50%;
+            vertical-align: -1px;
+            animation: webui-bridge-spin .85s linear infinite;
+        }
+        @keyframes webui-bridge-spin {
+            to { transform: rotate(360deg); }
         }
         .webui-bridge-prompt-row textarea.error {
             box-shadow: inset 0 0 0 1px #d84a4a;
@@ -7351,11 +7896,48 @@ function addStyles() {
         .webui-bridge-settings-panel .webui-bridge-config-actions {
             grid-template-columns: repeat(3, 1fr);
         }
+        .webui-bridge-prompt-editor-mask {
+            align-items: stretch;
+            justify-content: stretch;
+            padding: 0;
+        }
+        .webui-bridge-prompt-editor-panel {
+            display: grid;
+            grid-template-rows: auto minmax(0, 1fr) auto;
+            width: 100vw;
+            height: 100vh;
+            border: 0;
+            border-radius: 0;
+        }
+        .webui-bridge-prompt-editor-panel .webui-bridge-config-head {
+            padding: 18px 24px;
+        }
+        .webui-bridge-prompt-editor-panel .webui-bridge-config-head button {
+            width: 40px;
+            height: 40px;
+        }
+        .webui-bridge-prompt-editor-panel .webui-bridge-config-body {
+            min-height: 0;
+            overflow: hidden;
+            padding: 20px 24px;
+            grid-template-rows: auto auto auto auto auto minmax(0, 1fr);
+        }
+        .webui-bridge-prompt-editor-panel .webui-bridge-config-actions {
+            padding: 14px 24px 20px;
+        }
+        .webui-bridge-prompt-editor-panel .webui-bridge-custom-tags {
+            max-height: none;
+            min-height: 0;
+        }
+        .webui-bridge-prompt-editor-panel .webui-bridge-custom-tag-row {
+            min-height: 44px;
+            padding: 8px 10px;
+        }
         .webui-bridge-startup {
             width: min(640px, calc(100vw - 48px));
         }
         .webui-bridge-startup-actions {
-            grid-template-columns: repeat(3, minmax(0, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
         }
         .webui-bridge-startup-actions button {
             display: grid;
@@ -7392,6 +7974,41 @@ function addStyles() {
             color: #f3f6fb;
             font: 13px/1.4 Consolas, monospace;
         }
+        .webui-bridge-config-row-actions {
+            display: grid;
+            grid-template-columns: 110px minmax(0, 1fr);
+            gap: 10px;
+            align-items: center;
+            color: #a9bdd8;
+            font-size: 12px;
+        }
+        .webui-bridge-config-row-actions button,
+        .webui-bridge-ai-model-list button {
+            min-height: 30px;
+            border: 1px solid #58657a;
+            border-radius: 6px;
+            background: #263244;
+            color: #fff;
+            cursor: pointer;
+            font-weight: 700;
+        }
+        .webui-bridge-ai-model-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            max-height: 150px;
+            overflow: auto;
+            padding-right: 2px;
+        }
+        .webui-bridge-ai-model-list button {
+            max-width: 100%;
+            min-height: 28px;
+            padding: 4px 8px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font: 11px/1.35 Consolas, monospace;
+        }
         .webui-bridge-custom-editor {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -7400,10 +8017,15 @@ function addStyles() {
         .webui-bridge-custom-editor button {
             min-height: 32px;
         }
+        .webui-bridge-custom-filters {
+            display: grid;
+            grid-template-columns: minmax(0, 1.4fr) minmax(100px, .65fr) minmax(130px, .8fr) minmax(120px, 1fr) minmax(120px, 1fr);
+            gap: 8px;
+        }
         .webui-bridge-custom-tags {
             display: grid;
             gap: 6px;
-            max-height: 220px;
+            max-height: 320px;
             overflow: auto;
             padding-right: 2px;
         }
@@ -7429,6 +8051,62 @@ function addStyles() {
         .webui-bridge-custom-tag-row button {
             min-width: 28px;
             min-height: 26px;
+        }
+        .webui-bridge-prompt-market-list {
+            display: grid;
+            gap: 8px;
+            max-height: 390px;
+            overflow: auto;
+            padding-right: 2px;
+        }
+        .webui-bridge-prompt-market-source {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 12px;
+            align-items: center;
+            padding: 10px;
+            border: 1px solid #33435a;
+            border-radius: 6px;
+            background: #0d121b;
+        }
+        .webui-bridge-prompt-market-main {
+            display: grid;
+            gap: 5px;
+            min-width: 0;
+        }
+        .webui-bridge-prompt-market-main b,
+        .webui-bridge-prompt-market-main span,
+        .webui-bridge-prompt-market-main code {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .webui-bridge-prompt-market-main span {
+            color: #b9c9dd;
+            font-size: 12px;
+        }
+        .webui-bridge-prompt-market-main code {
+            color: #91d7a3;
+            font-size: 11px;
+        }
+        .webui-bridge-prompt-market-actions {
+            display: grid;
+            grid-template-columns: 76px 92px;
+            gap: 8px;
+        }
+        .webui-bridge-prompt-market-actions button {
+            min-height: 32px;
+            border: 1px solid #58657a;
+            border-radius: 6px;
+            background: #263244;
+            color: #fff;
+            cursor: pointer;
+            font-weight: 700;
+        }
+        .webui-bridge-prompt-market-actions button:disabled {
+            opacity: .62;
+            cursor: default;
         }
         .webui-bridge-config-status {
             min-height: 20px;
@@ -7496,6 +8174,12 @@ function addStyles() {
         @media (max-width: 900px) {
             .webui-bridge-startup-actions,
             .webui-bridge-settings-panel .webui-bridge-config-actions {
+                grid-template-columns: 1fr;
+            }
+            .webui-bridge-prompt-market-source,
+            .webui-bridge-prompt-market-actions,
+            .webui-bridge-custom-editor,
+            .webui-bridge-custom-filters {
                 grid-template-columns: 1fr;
             }
             .webui-bridge-lora-edit-body {

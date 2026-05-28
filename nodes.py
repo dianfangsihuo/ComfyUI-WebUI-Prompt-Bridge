@@ -37,6 +37,7 @@ _LORA_HASH_CACHE = {}
 _LORA_LINK_ALIAS_CACHE = {}
 _TRANSLATION_MAP_CACHE = {}
 _NETWORK_TRANSLATE_CACHE = {}
+_TAG_TRANSLATION_MAP_CACHE = None
 _LORA_PREVIEW_EXTENSIONS = (".preview.png", ".preview.jpg", ".preview.jpeg", ".preview.webp", ".png", ".jpg", ".jpeg", ".webp")
 _LORA_DESCRIPTION_EXTENSIONS = (".txt", ".description.txt", ".desc.txt")
 _IMAGE_SIGNATURES = {
@@ -48,6 +49,7 @@ _IMAGE_SIGNATURES = {
 DEFAULT_BRIDGE_SETTINGS = {
     "data_source": "auto",
     "translation_source": "auto",
+    "tag_translation_source": "auto",
     "show_startup_wizard": True,
     "layout_preset": "default",
     "tag_display": "local_first",
@@ -55,7 +57,8 @@ DEFAULT_BRIDGE_SETTINGS = {
 }
 _SETTING_CHOICES = {
     "data_source": {"auto", "webui", "builtin"},
-    "translation_source": {"auto", "webui", "builtin"},
+    "translation_source": {"auto", "webui", "online", "ai", "builtin"},
+    "tag_translation_source": {"auto", "local", "online", "off"},
     "layout_preset": {"default", "compact", "roomy"},
     "tag_display": {"local_first", "prompt_first", "compact"},
     "lora_card_size": {"compact", "normal", "large"},
@@ -74,6 +77,73 @@ EXTENSION_ASSETS = {
         "zip_url": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/archive/refs/heads/main.zip",
     },
 }
+PROMPT_MARKET_SOURCES = {
+    "current_webui_library": {
+        "label": "当前 WebUI / 本地词库",
+        "description": "优先读已连接 WebUI / 本地数据包；没有时联网下载 WebUI 生态词库补导入。",
+        "license": "Local / MIT",
+        "open_url": "",
+        "format": "current_bridge_library",
+        "limit": 2000,
+        "importable": True,
+    },
+    "prompt_all_in_one_zh_cn": {
+        "label": "Prompt All in One 中文分类词库",
+        "description": "免费开源分组 tag，适合直接扩充提示词面板。",
+        "license": "MIT",
+        "open_url": "https://github.com/Physton/sd-webui-prompt-all-in-one/tree/main/group_tags",
+        "download_url": "https://raw.githubusercontent.com/Physton/sd-webui-prompt-all-in-one/main/group_tags/zh_CN.yaml",
+        "format": "prompt_all_in_one_yaml",
+        "importable": True,
+    },
+    "tagcomplete_danbooru_top": {
+        "label": "TagComplete Danbooru 热门 Tags",
+        "description": "免费开源补全词库；导入前 1200 个高频 tag，并按类型自动分组。",
+        "license": "MIT",
+        "open_url": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/tree/main/tags",
+        "download_url": "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/danbooru.csv",
+        "format": "tagcomplete_csv",
+        "group": "Danbooru",
+        "limit": 1200,
+        "importable": True,
+    },
+    "tagcomplete_quality": {
+        "label": "TagComplete 质量词",
+        "description": "常用质量相关 tag，体积小，适合作为基础增强/反向词补充。",
+        "license": "MIT",
+        "open_url": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/blob/main/tags/extra-quality-tags.csv",
+        "download_url": "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/extra-quality-tags.csv",
+        "format": "tagcomplete_csv",
+        "group": "质量",
+        "limit": 200,
+        "importable": True,
+    },
+    "public_prompts": {
+        "label": "Public Prompts",
+        "description": "免费提示词案例站，适合打开后挑选完整 prompt；暂不做批量抓取。",
+        "license": "Free website",
+        "open_url": "https://www.publicprompts.art/",
+        "importable": False,
+    },
+    "diffusiondb": {
+        "label": "DiffusionDB",
+        "description": "Hugging Face 上的 CC0 大型 prompt 数据集，适合研究和抽样，不建议整库导入。",
+        "license": "CC0",
+        "open_url": "https://huggingface.co/datasets/poloclub/diffusiondb",
+        "importable": False,
+    },
+}
+TAGCOMPLETE_TYPE_LABELS = {
+    "0": "通用",
+    "1": "画师",
+    "3": "作品",
+    "4": "角色",
+    "5": "元信息/质量",
+}
+ONLINE_TAG_TRANSLATION_URLS = (
+    "https://raw.githubusercontent.com/byzod/a1111-sd-webui-tagcomplete-CN/main/tags/Tags-zh-full-pack.csv",
+)
+TAG_TRANSLATION_CACHE_FILE = DATA_DIR / EXTENSION_ASSETS["tagcomplete"]["directory"] / "tags" / "Tags-zh-full-pack.csv"
 BUILTIN_GROUP_TAGS = [
     {
         "name": "人物",
@@ -292,6 +362,10 @@ def _data_source_mode():
 
 def _translation_source_mode():
     return _bridge_settings().get("translation_source", "auto")
+
+
+def _tag_translation_source_mode():
+    return _bridge_settings().get("tag_translation_source", "auto")
 
 
 def _should_read_webui_data():
@@ -766,6 +840,50 @@ def _custom_prompt_all_in_one_group_tags():
     return _normalize_prompt_group_data(data, "customTags")
 
 
+def _custom_prompt_override_keys():
+    raw_items = LOCAL_CONFIG.get("custom_tags") if isinstance(LOCAL_CONFIG, dict) else []
+    if not isinstance(raw_items, list):
+        return set()
+    keys = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        prompt = str(item.get("prompt") or item.get("text") or "").strip().casefold()
+        if not prompt:
+            continue
+        kind = _validate_kind(item.get("kind") or item.get("type") or "positive")
+        keys.add((kind, prompt))
+    return keys
+
+
+def _filter_prompt_group_overrides(groups, override_keys):
+    if not override_keys:
+        return groups
+    filtered = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        kind = "negative" if group.get("name") == "反向提示词" else "positive"
+        next_groups = []
+        for sub_group in group.get("groups") or []:
+            if not isinstance(sub_group, dict) or sub_group.get("type") == "wrap":
+                next_groups.append(sub_group)
+                continue
+            tags = [
+                tag for tag in sub_group.get("tags") or []
+                if (kind, str(tag.get("prompt") or "").strip().casefold()) not in override_keys
+            ]
+            if tags:
+                next_sub_group = dict(sub_group)
+                next_sub_group["tags"] = tags
+                next_groups.append(next_sub_group)
+        if next_groups:
+            next_group = dict(group)
+            next_group["groups"] = next_groups
+            filtered.append(next_group)
+    return filtered
+
+
 def _load_webui_prompt_all_in_one_group_tags(lang="zh_CN"):
     if not _should_read_webui_data():
         return []
@@ -794,8 +912,72 @@ def _load_prompt_all_in_one_group_tags(lang="zh_CN"):
     groups = list(webui_groups)
     if _should_use_builtin_prompt_data(webui_groups):
         groups.extend(_builtin_prompt_all_in_one_group_tags(lang))
+    groups = _filter_prompt_group_overrides(groups, _custom_prompt_override_keys())
     groups.extend(_custom_prompt_all_in_one_group_tags())
     return groups
+
+
+def _read_tag_translation_csv(text, zh_map):
+    for row in csv.reader(text.splitlines()):
+        if len(row) >= 2 and row[0].strip():
+            zh_map.setdefault(row[0].strip().casefold(), row[1].strip())
+
+
+def _load_tag_translation_map():
+    global _TAG_TRANSLATION_MAP_CACHE
+    if _TAG_TRANSLATION_MAP_CACHE is not None:
+        return _TAG_TRANSLATION_MAP_CACHE
+
+    zh_map = {}
+    mode = _tag_translation_source_mode()
+    if mode == "off":
+        _TAG_TRANSLATION_MAP_CACHE = zh_map
+        return zh_map
+
+    if mode in {"auto", "local"} and _should_read_webui_data():
+        candidates = [
+            TAGCOMPLETE_DIR / "tags" / "danbooru.zh_CN_SFW.csv",
+            TAGCOMPLETE_DIR / "tags" / "danbooru.zh_CN.csv",
+            TAGCOMPLETE_DIR / "tags" / "Tags-zh-full-pack.csv",
+            TAGCOMPLETE_DIR / "tags" / "tags-zh-full-pack.csv",
+        ]
+        for path in candidates:
+            try:
+                if path.exists():
+                    _read_tag_translation_csv(path.read_text(encoding="utf-8-sig"), zh_map)
+            except Exception:
+                pass
+    try:
+        if mode in {"auto", "local"} and TAG_TRANSLATION_CACHE_FILE.exists():
+            _read_tag_translation_csv(TAG_TRANSLATION_CACHE_FILE.read_text(encoding="utf-8-sig"), zh_map)
+    except Exception:
+        pass
+
+    if mode == "online" or (mode == "auto" and not zh_map):
+        for url in ONLINE_TAG_TRANSLATION_URLS:
+            try:
+                request = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "ComfyUI-WebUI-Prompt-Bridge"},
+                )
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    content = response.read(5 * 1024 * 1024 + 1)
+                if len(content) <= 5 * 1024 * 1024:
+                    text = content.decode("utf-8-sig", errors="replace")
+                    _read_tag_translation_csv(text, zh_map)
+                    try:
+                        TAG_TRANSLATION_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                        if not TAG_TRANSLATION_CACHE_FILE.exists():
+                            TAG_TRANSLATION_CACHE_FILE.write_text(text, encoding="utf-8")
+                    except Exception:
+                        pass
+                if zh_map:
+                    break
+            except Exception:
+                pass
+
+    _TAG_TRANSLATION_MAP_CACHE = zh_map
+    return zh_map
 
 
 def _load_tag_autocomplete_items():
@@ -803,18 +985,10 @@ def _load_tag_autocomplete_items():
     if _TAG_AUTOCOMPLETE_CACHE is not None:
         return _TAG_AUTOCOMPLETE_CACHE
 
-    zh_map = {}
-    if _should_read_webui_data():
-        zh_file = TAGCOMPLETE_DIR / "tags" / "danbooru.zh_CN_SFW.csv"
-        try:
-            with zh_file.open("r", encoding="utf-8-sig", newline="") as f:
-                for row in csv.reader(f):
-                    if len(row) >= 2 and row[0].strip():
-                        zh_map[row[0].strip().casefold()] = row[1].strip()
-        except Exception:
-            pass
+    zh_map = _load_tag_translation_map()
 
     items = []
+    item_by_key = {}
     if _should_read_webui_data():
         tag_file = TAGCOMPLETE_DIR / "tags" / "danbooru.csv"
         try:
@@ -830,13 +1004,15 @@ def _load_tag_autocomplete_items():
                     aliases = []
                     if len(row) > 3 and row[3]:
                         aliases = [x.strip() for x in row[3].split(",") if x.strip()]
-                    items.append({
+                    item = {
                         "text": tag,
                         "local": zh_map.get(tag.casefold(), ""),
                         "count": count,
                         "aliases": aliases[:12],
                         "type": "tag",
-                    })
+                    }
+                    items.append(item)
+                    item_by_key[tag.casefold()] = item
         except Exception:
             pass
 
@@ -847,12 +1023,20 @@ def _load_tag_autocomplete_items():
         for sub_group in group.get("groups", []):
             for tag in sub_group.get("tags", []):
                 prompt = str(tag.get("prompt") or "").strip()
-                if not prompt or prompt.casefold() in seen:
+                prompt_key = prompt.casefold()
+                if not prompt:
                     continue
-                seen.add(prompt.casefold())
+                local = str(tag.get("local") or "")
+                if prompt_key in seen:
+                    existing = item_by_key.get(prompt_key)
+                    if existing is not None and local and not existing.get("local"):
+                        existing["local"] = local
+                    continue
+                seen.add(prompt_key)
+                local = local or zh_map.get(prompt_key, "")
                 items.append({
                     "text": prompt,
-                    "local": str(tag.get("local") or ""),
+                    "local": local,
                     "count": 0,
                     "aliases": [],
                     "type": "group",
@@ -1075,6 +1259,12 @@ def _webui_network_translate(text, from_lang="zh_CN", to_lang="en_US"):
         return _NETWORK_TRANSLATE_CACHE[cache_key]
 
     translate_script = PROMPT_ALL_IN_ONE_DIR / "scripts" / "physton_prompt" / "translate.py"
+    if not translate_script.exists() and _translation_source_mode() == "online":
+        try:
+            _install_extension_asset("prompt_all_in_one", DATA_DIR)
+        except Exception:
+            pass
+        translate_script = PROMPT_ALL_IN_ONE_DIR / "scripts" / "physton_prompt" / "translate.py"
     if not translate_script.exists():
         _NETWORK_TRANSLATE_CACHE[cache_key] = ""
         return ""
@@ -1106,6 +1296,58 @@ def _webui_network_translate(text, from_lang="zh_CN", to_lang="en_US"):
         pass
     _NETWORK_TRANSLATE_CACHE[cache_key] = ""
     return ""
+
+
+def _ai_translate_prompt(text, from_lang="zh_CN", to_lang="en_US"):
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    config = _ai_config_raw()
+    if not config.get("enabled"):
+        return ""
+    api_key = str(config.get("api_key") or "").strip()
+    if not api_key:
+        return ""
+    base_url = str(config.get("base_url") or "https://api.siliconflow.cn/v1").strip().rstrip("/")
+    model = str(config.get("model") or "deepseek-ai/DeepSeek-V4-Flash").strip()
+    if not base_url or not model:
+        return ""
+    cache_key = ("ai", base_url, model, from_lang, to_lang, text)
+    if cache_key in _NETWORK_TRANSLATE_CACHE:
+        return _NETWORK_TRANSLATE_CACHE[cache_key]
+    direction = "Chinese to concise English Stable Diffusion tags" if to_lang == "en_US" else "English tags to concise Chinese labels"
+    system_prompt = str(config.get("system_prompt") or "You are a Stable Diffusion prompt assistant. Return concise tags separated by commas.").strip()
+    user_prompt = f"Translate this prompt from {direction}. Return only the translated tags, separated by commas:\n{text}"
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": _truncate_text(user_prompt, MAX_SHORT_TEXT_LENGTH)},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 256,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "ComfyUI-WebUI-Prompt-Bridge",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        content = _normalize_network_prompt(content).strip("`")
+        content = re.sub(r"^(translated tags?|tags?)\s*[:：]\s*", "", content, flags=re.I).strip()
+        _NETWORK_TRANSLATE_CACHE[cache_key] = content
+        return content
+    except Exception:
+        _NETWORK_TRANSLATE_CACHE[cache_key] = ""
+        return ""
 
 
 def _storage_set(key, data):
@@ -1293,15 +1535,8 @@ def _build_prompt_all_in_one_translation_maps(lang="zh_CN"):
     # TagComplete's Chinese CSV is the broad Danbooru translation source used
     # by WebUI autocomplete. Merge it before group tags; group tags may override
     # local labels but should not remove the much larger dictionary.
-    if _should_read_webui_data():
-        zh_file = TAGCOMPLETE_DIR / "tags" / "danbooru.zh_CN_SFW.csv"
-        try:
-            with zh_file.open("r", encoding="utf-8-sig", newline="") as f:
-                for row in csv.reader(f):
-                    if len(row) >= 2:
-                        add_pair(row[0], row[1])
-        except Exception:
-            pass
+    for prompt, local in _load_tag_translation_map().items():
+        add_pair(prompt, local)
 
     # Also use the main autocomplete CSV aliases so shorthand/alternate English
     # spellings normalize to the canonical Danbooru tag.
@@ -1479,8 +1714,13 @@ def _translate_prompt_all_in_one_text(text, to="english", lang="zh_CN"):
             local = _lookup_map(prompt_to_local, item) or ""
             source = "local"
             if not local and re.search(r"[A-Za-z]", item):
-                local = _webui_network_translate(item, "en_US", lang)
-                source = "network" if local else "local"
+                mode = _translation_source_mode()
+                if mode in ("auto", "ai"):
+                    local = _ai_translate_prompt(item, "en_US", lang)
+                    source = "ai" if local else source
+                if not local and mode != "ai":
+                    local = _webui_network_translate(item, "en_US", lang)
+                    source = "network" if local else source
             translated.append({
                 "input": item,
                 "prompt": item,
@@ -1492,11 +1732,18 @@ def _translate_prompt_all_in_one_text(text, to="english", lang="zh_CN"):
             prompt = _lookup_map(local_to_prompt, item)
             exact_or_alias = prompt is not None
             network_used = False
+            ai_used = False
             if not exact_or_alias and re.search(r"[\u3400-\u9fff]", item):
-                network_prompt = _normalize_network_prompt(_webui_network_translate(item, lang, "en_US")) or None
+                mode = _translation_source_mode()
+                network_prompt = None
+                if mode in ("auto", "ai"):
+                    network_prompt = _normalize_network_prompt(_ai_translate_prompt(item, lang, "en_US")) or None
+                    ai_used = bool(network_prompt)
+                if not network_prompt and mode != "ai":
+                    network_prompt = _normalize_network_prompt(_webui_network_translate(item, lang, "en_US")) or None
+                    network_used = bool(network_prompt)
                 if network_prompt:
                     prompt = network_prompt
-                    network_used = True
             if prompt is None:
                 prompt = _translate_local_phrase_to_prompts(item, local_to_prompt)
             if prompt is None:
@@ -1507,7 +1754,7 @@ def _translate_prompt_all_in_one_text(text, to="english", lang="zh_CN"):
                 "prompt": prompt,
                 "local": local,
                 "matched": prompt != item,
-                "source": "network" if network_used else "local",
+                "source": "ai" if ai_used else ("network" if network_used else "local"),
             })
     return translated
 
@@ -2016,6 +2263,137 @@ def _settings_response():
     }
 
 
+def _ai_config_response():
+    config = LOCAL_CONFIG.get("ai_api") if isinstance(LOCAL_CONFIG, dict) else {}
+    if not isinstance(config, dict):
+        config = {}
+    api_key = str(config.get("api_key") or "")
+    return {
+        "success": True,
+        "config": {
+            "enabled": bool(config.get("enabled")),
+            "provider": str(config.get("provider") or "openai_compatible"),
+            "base_url": str(config.get("base_url") or "https://api.siliconflow.cn/v1"),
+            "model": str(config.get("model") or "deepseek-ai/DeepSeek-V4-Flash"),
+            "api_key_set": bool(api_key),
+            "api_key_preview": (api_key[:4] + "..." + api_key[-4:]) if len(api_key) > 8 else ("已设置" if api_key else ""),
+            "system_prompt": str(config.get("system_prompt") or "You are a Stable Diffusion prompt assistant. Return concise English tags separated by commas."),
+        },
+    }
+
+
+def _normalize_ai_model_name(model, base_url=""):
+    raw = _truncate_text(model or "", MAX_STYLE_NAME_LENGTH).strip()
+    if not raw:
+        return "deepseek-ai/DeepSeek-V4-Flash"
+    key = re.sub(r"[^a-z0-9]+", "", raw.casefold())
+    base_key = str(base_url or "").casefold()
+    if "siliconflow" in base_key and key in {"deepseekv4flash", "deepseek4flash", "deepseekv4"}:
+        return "deepseek-ai/DeepSeek-V4-Flash"
+    return raw
+
+
+def _update_ai_config(data):
+    config = dict(LOCAL_CONFIG) if isinstance(LOCAL_CONFIG, dict) else {}
+    current = config.get("ai_api")
+    if not isinstance(current, dict):
+        current = {}
+    current["enabled"] = bool(data.get("enabled"))
+    current["provider"] = "openai_compatible"
+    current["base_url"] = _truncate_text(data.get("base_url") or "", MAX_SHORT_TEXT_LENGTH).strip().rstrip("/") or "https://api.siliconflow.cn/v1"
+    current["model"] = _normalize_ai_model_name(data.get("model"), current["base_url"])
+    system_prompt = _truncate_text(data.get("system_prompt") or "", MAX_PROMPT_TEXT_LENGTH).strip()
+    if system_prompt:
+        current["system_prompt"] = system_prompt
+    if data.get("clear_api_key"):
+        current["api_key"] = ""
+    elif str(data.get("api_key") or "").strip():
+        current["api_key"] = str(data.get("api_key") or "").strip()
+    config["ai_api"] = current
+    _write_local_config(config)
+    _apply_local_config(config)
+    return _ai_config_response()
+
+
+def _ai_config_raw():
+    config = LOCAL_CONFIG.get("ai_api") if isinstance(LOCAL_CONFIG, dict) else {}
+    return config if isinstance(config, dict) else {}
+
+
+def _test_ai_config(prompt="Generate a short Stable Diffusion prompt for a girl in a garden."):
+    config = _ai_config_raw()
+    api_key = str(config.get("api_key") or "").strip()
+    if not api_key:
+        raise ValueError("请先填写 API Key")
+    base_url = str(config.get("base_url") or "https://api.siliconflow.cn/v1").strip().rstrip("/")
+    model = _normalize_ai_model_name(config.get("model"), base_url)
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": str(config.get("system_prompt") or "Return concise English Stable Diffusion tags.")},
+            {"role": "user", "content": _truncate_text(prompt, MAX_SHORT_TEXT_LENGTH)},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 120,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "ComfyUI-WebUI-Prompt-Bridge",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=45) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    return {"success": True, "content": content, "model": model}
+
+
+def _list_ai_models(data=None):
+    data = data if isinstance(data, dict) else {}
+    config = _ai_config_raw()
+    api_key = str(data.get("api_key") or config.get("api_key") or "").strip()
+    if not api_key:
+        raise ValueError("请先填写 API Key")
+    base_url = _truncate_text(data.get("base_url") or config.get("base_url") or "", MAX_SHORT_TEXT_LENGTH).strip().rstrip("/") or "https://api.siliconflow.cn/v1"
+    request = urllib.request.Request(
+        f"{base_url}/models",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "ComfyUI-WebUI-Prompt-Bridge",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=45) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    raw_models = payload.get("data") if isinstance(payload, dict) else payload
+    models = []
+    if isinstance(raw_models, list):
+        for item in raw_models:
+            if isinstance(item, dict):
+                model_id = str(item.get("id") or item.get("name") or "").strip()
+                if model_id:
+                    models.append({
+                        "id": model_id,
+                        "owned_by": str(item.get("owned_by") or item.get("owner") or "").strip(),
+                    })
+            elif isinstance(item, str) and item.strip():
+                models.append({"id": item.strip(), "owned_by": ""})
+    seen = set()
+    unique = []
+    for item in models:
+        key = item["id"]
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    unique.sort(key=lambda item: item["id"].casefold())
+    return {"success": True, "base_url": base_url, "models": unique, "count": len(unique)}
+
+
 def _update_bridge_settings(data):
     config = dict(LOCAL_CONFIG) if isinstance(LOCAL_CONFIG, dict) else {}
     current = dict(_bridge_settings())
@@ -2100,6 +2478,223 @@ def _import_custom_tags(items):
         "imported": len(imported),
         "total": len(config.get("custom_tags") or current),
         **_settings_response(),
+    }
+
+
+def _prompt_market_sources_response():
+    sources = []
+    imported_sources = LOCAL_CONFIG.get("prompt_market_imports") if isinstance(LOCAL_CONFIG, dict) else {}
+    if not isinstance(imported_sources, dict):
+        imported_sources = {}
+    for source_id, source in PROMPT_MARKET_SOURCES.items():
+        imported = imported_sources.get(source_id) if isinstance(imported_sources.get(source_id), dict) else {}
+        sources.append({
+            "id": source_id,
+            "label": source["label"],
+            "description": source.get("description", ""),
+            "license": source.get("license", ""),
+            "open_url": source.get("open_url", ""),
+            "importable": bool(source.get("importable")),
+            "limit": source.get("limit"),
+            "imported": bool(imported),
+            "imported_at": imported.get("imported_at", ""),
+            "imported_count": imported.get("downloaded", 0),
+            "last_added": imported.get("imported", 0),
+        })
+    return {"success": True, "sources": sources}
+
+
+def _download_prompt_market_text(source):
+    request = urllib.request.Request(
+        source["download_url"],
+        headers={"User-Agent": "ComfyUI-WebUI-Prompt-Bridge"},
+    )
+    with urllib.request.urlopen(request, timeout=90) as response:
+        content = response.read(10 * 1024 * 1024 + 1)
+    if len(content) > 10 * 1024 * 1024:
+        raise ValueError("downloaded prompt market file is too large")
+    return content.decode("utf-8-sig", errors="replace")
+
+
+def _infer_prompt_market_kind(*values):
+    text = " ".join(str(value or "").lower().replace("_", " ").replace("-", " ") for value in values)
+    negative_markers = (
+        "negative", "反向", "负面", "低质量", "错误", "bad", "worst", "low quality",
+        "malformed", "mutated", "deformed", "watermark",
+    )
+    return "negative" if any(marker in text for marker in negative_markers) else "positive"
+
+
+def _items_from_prompt_all_in_one_yaml(text, source):
+    data = yaml.safe_load(text) or []
+    groups = _normalize_prompt_group_data(data, "marketTags")
+    items = []
+    for group in groups:
+        group_name = str(group.get("name") or source["label"]).strip()
+        for sub_group in group.get("groups") or []:
+            subgroup_name = str(sub_group.get("name") or "提示词").strip()
+            kind = _infer_prompt_market_kind(group_name, subgroup_name)
+            for tag in sub_group.get("tags") or []:
+                prompt = str(tag.get("prompt") or "").strip()
+                if not prompt:
+                    continue
+                items.append({
+                    "prompt": prompt,
+                    "local": str(tag.get("local") or "").strip(),
+                    "group": group_name,
+                    "subgroup": subgroup_name,
+                    "kind": kind,
+                })
+    return items
+
+
+def _items_from_tagcomplete_csv(text, source):
+    rows = csv.reader(text.splitlines())
+    items = []
+    group = str(source.get("group") or source["label"]).strip()
+    limit = int(source.get("limit") or 1000)
+    zh_map = _load_tag_translation_map()
+    for row in rows:
+        if len(row) < 2:
+            continue
+        prompt = str(row[0] or "").strip()
+        tag_type = str(row[1] or "").strip()
+        if not prompt or prompt.startswith("#"):
+            continue
+        subgroup = TAGCOMPLETE_TYPE_LABELS.get(tag_type, "其他")
+        local = str(row[2] or "").strip() if len(row) > 2 and not str(row[2] or "").strip().isdigit() else ""
+        local = zh_map.get(prompt.casefold(), local)
+        kind = _infer_prompt_market_kind(prompt, local, group, subgroup)
+        items.append({
+            "prompt": prompt,
+            "local": local,
+            "group": group,
+            "subgroup": subgroup,
+            "kind": kind,
+        })
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _items_from_prompt_groups(groups, source):
+    items = []
+    for group in groups or []:
+        if not isinstance(group, dict):
+            continue
+        group_name = str(group.get("name") or source["label"]).strip()
+        kind = "negative" if group_name == "反向提示词" else "positive"
+        for sub_group in group.get("groups") or []:
+            if not isinstance(sub_group, dict) or sub_group.get("type") == "wrap":
+                continue
+            subgroup_name = str(sub_group.get("name") or "提示词").strip()
+            sub_kind = _infer_prompt_market_kind(group_name, subgroup_name)
+            for tag in sub_group.get("tags") or []:
+                prompt = str(tag.get("prompt") or "").strip()
+                if not prompt:
+                    continue
+                items.append({
+                    "prompt": prompt,
+                    "local": str(tag.get("local") or "").strip(),
+                    "group": group_name,
+                    "subgroup": subgroup_name,
+                    "kind": "negative" if kind == "negative" or sub_kind == "negative" else "positive",
+                })
+    return items
+
+
+def _items_from_current_bridge_library(source):
+    items = []
+    webui_groups = _load_webui_prompt_all_in_one_group_tags("zh_CN")
+    if webui_groups:
+        items.extend(_items_from_prompt_groups(webui_groups, source))
+
+    tag_file = TAGCOMPLETE_DIR / "tags" / "danbooru.csv"
+    if tag_file.exists():
+        try:
+            with tag_file.open("r", encoding="utf-8-sig", newline="") as file:
+                tag_text = file.read()
+            tag_source = dict(source)
+            tag_source["group"] = "WebUI TagComplete"
+            tag_source["limit"] = min(int(source.get("limit") or 2000), max(0, int(source.get("limit") or 2000) - len(items)))
+            if tag_source["limit"] > 0:
+                items.extend(_items_from_tagcomplete_csv(tag_text, tag_source))
+        except Exception:
+            pass
+    if not items:
+        try:
+            online_source = PROMPT_MARKET_SOURCES["prompt_all_in_one_zh_cn"]
+            text = _download_prompt_market_text(online_source)
+            items.extend(_items_from_prompt_all_in_one_yaml(text, online_source))
+        except Exception:
+            pass
+    if len(items) < int(source.get("limit") or 2000):
+        try:
+            online_source = dict(PROMPT_MARKET_SOURCES["tagcomplete_danbooru_top"])
+            online_source["group"] = "Danbooru"
+            online_source["limit"] = min(
+                int(online_source.get("limit") or 1200),
+                max(0, int(source.get("limit") or 2000) - len(items)),
+            )
+            if online_source["limit"] > 0:
+                text = _download_prompt_market_text(online_source)
+                items.extend(_items_from_tagcomplete_csv(text, online_source))
+        except Exception:
+            pass
+    if not items and _should_use_builtin_prompt_data(webui_groups):
+        items.extend(_items_from_prompt_groups(_builtin_prompt_all_in_one_group_tags("zh_CN"), source))
+    return items[: int(source.get("limit") or 2000)]
+
+
+def _load_prompt_market_items(source_id):
+    source = PROMPT_MARKET_SOURCES.get(source_id)
+    if not source:
+        raise ValueError("unknown prompt market source")
+    if not source.get("importable"):
+        raise ValueError("this prompt market source can only be opened in browser")
+    source_format = source.get("format")
+    if source_format == "current_bridge_library":
+        items = _items_from_current_bridge_library(source)
+    elif source.get("download_url"):
+        text = _download_prompt_market_text(source)
+        if source_format == "prompt_all_in_one_yaml":
+            items = _items_from_prompt_all_in_one_yaml(text, source)
+        elif source_format == "tagcomplete_csv":
+            items = _items_from_tagcomplete_csv(text, source)
+        else:
+            raise ValueError("unsupported prompt market format")
+    else:
+        raise ValueError("this prompt market source has no downloadable or local data")
+    if not items:
+        raise ValueError("没有读到可导入的 WebUI/本地词库，请先连接 WebUI 或下载本地数据包")
+    return source, items
+
+
+def _import_prompt_market_source(source_id):
+    source, items = _load_prompt_market_items(source_id)
+    result = _import_custom_tags(items)
+    config = dict(LOCAL_CONFIG) if isinstance(LOCAL_CONFIG, dict) else {}
+    imported_sources = config.get("prompt_market_imports")
+    if not isinstance(imported_sources, dict):
+        imported_sources = {}
+    imported_sources[source_id] = {
+        "label": source["label"],
+        "imported_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "downloaded": len(items),
+        "imported": result.get("imported", 0),
+    }
+    config["prompt_market_imports"] = imported_sources
+    _write_local_config(config)
+    _apply_local_config(config)
+    return {
+        **result,
+        "source": {
+            "id": source_id,
+            "label": source["label"],
+            "open_url": source.get("open_url", ""),
+        },
+        "downloaded": len(items),
+        "imported_at": imported_sources[source_id]["imported_at"],
     }
 
 
@@ -2471,6 +3066,49 @@ def _register_routes():
             data = {}
         return web.json_response(_update_bridge_settings(data))
 
+    @routes.get("/webui_prompt_bridge/ai_config")
+    async def bridge_ai_config_get(request):
+        return web.json_response(_ai_config_response())
+
+    @routes.post("/webui_prompt_bridge/ai_config")
+    async def bridge_ai_config_post(request):
+        rejected = reject_cross_origin(request)
+        if rejected is not None:
+            return rejected
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        return web.json_response(_update_ai_config(data))
+
+    @routes.post("/webui_prompt_bridge/ai_config/test")
+    async def bridge_ai_config_test(request):
+        rejected = reject_cross_origin(request)
+        if rejected is not None:
+            return rejected
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        try:
+            return web.json_response(_test_ai_config(data.get("prompt") or "Generate a short Stable Diffusion prompt for a girl in a garden."))
+        except Exception as exc:
+            return web.json_response({"success": False, "error": str(exc)}, status=400)
+
+    @routes.post("/webui_prompt_bridge/ai_config/models")
+    async def bridge_ai_config_models(request):
+        rejected = reject_cross_origin(request)
+        if rejected is not None:
+            return rejected
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        try:
+            return web.json_response(_list_ai_models(data))
+        except Exception as exc:
+            return web.json_response({"success": False, "error": str(exc)}, status=400)
+
     @routes.post("/webui_prompt_bridge/import_tags")
     async def bridge_import_tags(request):
         rejected = reject_cross_origin(request)
@@ -2510,6 +3148,25 @@ def _register_routes():
         try:
             index = int(request.query.get("index", "-1"))
             return web.json_response(_delete_custom_tag(index))
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+    @routes.get("/webui_prompt_bridge/prompt_market")
+    async def bridge_prompt_market_get(request):
+        return web.json_response(_prompt_market_sources_response())
+
+    @routes.post("/webui_prompt_bridge/prompt_market/import")
+    async def bridge_prompt_market_import(request):
+        rejected = reject_cross_origin(request)
+        if rejected is not None:
+            return rejected
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        try:
+            source_id = str(data.get("source_id") or data.get("id") or "").strip()
+            return web.json_response(_import_prompt_market_source(source_id))
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
