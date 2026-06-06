@@ -461,6 +461,14 @@ function looksLikeLegacyDefaultSize(size) {
         Math.abs(Number(size[1] || 0) - LEGACY_PANEL_HEIGHT) <= 8;
 }
 
+function looksLikeAutoExtendedDefaultSize(size) {
+    if (!Array.isArray(size)) return false;
+    const width = Number(size[0] || 0);
+    const height = Number(size[1] || 0);
+    const defaultOrRoomyWidth = width >= DEFAULT_PANEL_WIDTH - 40 && width <= 1420;
+    return defaultOrRoomyWidth && height >= 1450;
+}
+
 function hideWidget(widget) {
     if (!widget || widget.__webuiBridgeHidden) return;
     installWidgetSerializationFallback(widget);
@@ -5885,7 +5893,7 @@ function buildPanel(node) {
         el("button", { title: "Compact size", onclick: () => setNodeSize(840, 620) }, "S"),
         el("button", { title: "Smaller node", onclick: () => resizeNode(-120, -90) }, "-"),
         el("button", { title: "Larger node", onclick: () => resizeNode(120, 90) }, "+"),
-        el("button", { title: "Fit default size", onclick: () => setNodeSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT) }, "Fit"),
+        el("button", { title: "恢复节点默认尺寸", onclick: () => setNodeSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT) }, "默认尺寸"),
     ]);
     let layoutPresetControls = null;
     const updateLayoutPresetControls = () => {
@@ -6231,9 +6239,6 @@ function buildPanel(node) {
         updateLayoutPresetControls();
         positiveTagPanel.__webuiBridgeRender?.();
         negativeTagPanel.__webuiBridgeRender?.();
-        if (!node.__webuiBridgeFreshNode && state.settings?.layout_preset && state.settings.layout_preset !== "default") {
-            requestAnimationFrame(() => applyLayoutPreset(state.settings.layout_preset));
-        }
         maybeShowStartupWizard();
     });
 
@@ -6299,10 +6304,16 @@ function installWebUIPanel(node) {
         });
         node.__webuiBridgeSerializeWrapped = true;
     }
+    if (looksLikeAutoExtendedDefaultSize(node.__webuiBridgeDesiredSize) || looksLikeAutoExtendedDefaultSize(node.size)) {
+        node.__webuiBridgeDesiredSize = clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT);
+        node.setSize(node.__webuiBridgeDesiredSize);
+    }
     if (!node.__webuiBridgeDesiredSize) {
         node.__webuiBridgeDesiredSize = node.__webuiBridgeFreshNode && !node.__webuiBridgeWasConfigured
             ? clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT)
             : looksLikeLegacyDefaultSize(node.size)
+                ? clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT)
+            : looksLikeAutoExtendedDefaultSize(node.size)
                 ? clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT)
             : clampPanelSize(
                 Math.max(node.size?.[0] || DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_WIDTH),
@@ -6369,6 +6380,9 @@ function installWebUIPanel(node) {
         window.setTimeout(enforceFreshSize, 0);
         window.setTimeout(enforceFreshSize, 250);
     } else if (looksLikeLegacyDefaultSize(node.size)) {
+        node.__webuiBridgeDesiredSize = clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT);
+        node.setSize(node.__webuiBridgeDesiredSize);
+    } else if (looksLikeAutoExtendedDefaultSize(node.size)) {
         node.__webuiBridgeDesiredSize = clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT);
         node.setSize(node.__webuiBridgeDesiredSize);
     } else if (!node.size || node.size[0] < PANEL_MIN_WIDTH || node.size[1] < PANEL_MIN_HEIGHT) {
