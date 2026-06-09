@@ -40,6 +40,8 @@ _NETWORK_TRANSLATE_CACHE = {}
 _TAG_TRANSLATION_MAP_CACHE = None
 _LORA_PREVIEW_EXTENSIONS = (".preview.png", ".preview.jpg", ".preview.jpeg", ".preview.webp", ".png", ".jpg", ".jpeg", ".webp")
 _LORA_DESCRIPTION_EXTENSIONS = (".txt", ".description.txt", ".desc.txt")
+_REGIONAL_SEPARATOR_RE = re.compile(r"\b(ADDCOMM|ADDBASE|ADDCOL|ADDROW|BREAK|AND)\b", re.IGNORECASE)
+_REGIONAL_GRID_SEPARATORS = {"ADDCOL", "ADDROW"}
 _IMAGE_SIGNATURES = {
     ".png": (b"\x89PNG\r\n\x1a\n",),
     ".jpg": (b"\xff\xd8\xff",),
@@ -2964,6 +2966,208 @@ def _install_extension_assets(data):
     }
 
 
+def _regional_split_prompt(text):
+    """Split Regional Prompter style text while keeping explicit separators."""
+    parts = []
+    separators = []
+    source = text or ""
+    last = 0
+    for match in _REGIONAL_SEPARATOR_RE.finditer(source):
+        chunk = source[last:match.start()].strip()
+        if chunk:
+            parts.append(chunk)
+        separators.append(match.group(1).upper())
+        last = match.end()
+    tail = source[last:].strip()
+    if tail:
+        parts.append(tail)
+    return parts, separators
+
+
+def _regional_float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _regional_ratio_row(text):
+    values = []
+    for raw in re.split(r"[,，\s]+", str(text or "")):
+        if not raw:
+            continue
+        value = _regional_float(raw, 0.0)
+        if value > 0:
+            values.append(value)
+    return values or [1.0]
+
+
+def _regional_parse_ratio_grid(ratios, split):
+    ratio_text = str(ratios or "").strip()
+    if split == "grid" or ";" in ratio_text or "；" in ratio_text:
+        rows = [_regional_ratio_row(row) for row in re.split(r"[;；]+", ratio_text) if row.strip()]
+        return rows or [[1.0, 1.0]]
+    return [_regional_ratio_row(ratio_text)]
+
+
+def _regional_cells_from_ratios(ratios, split, region_count):
+    rows = _regional_parse_ratio_grid(ratios, split)
+    cells = []
+    if split == "vertical":
+        row = rows[0]
+        total = sum(row) or 1.0
+        y = 0.0
+        for value in row:
+            height = value / total
+            cells.append({"x": 0.0, "y": y, "width": 1.0, "height": height})
+            y += height
+    elif split == "horizontal":
+        row = rows[0]
+        total = sum(row) or 1.0
+        x = 0.0
+        for value in row:
+            width = value / total
+            cells.append({"x": x, "y": 0.0, "width": width, "height": 1.0})
+            x += width
+    else:
+        row_totals = [sum(row) or 1.0 for row in rows]
+        total_y = sum(row_totals) or 1.0
+        y = 0.0
+        for row, row_total in zip(rows, row_totals):
+            height = row_total / total_y
+            x = 0.0
+            total_x = sum(row) or 1.0
+            for value in row:
+                width = value / total_x
+                cells.append({"x": x, "y": y, "width": width, "height": height})
+                x += width
+            y += height
+
+    if not cells:
+        cells = [{"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}]
+    while len(cells) < region_count:
+        cells.append(cells[-1].copy())
+    return cells[:region_count]
+
+
+def _regional_prepare_prompt_parts(text, base_enabled=False, common_enabled=False):
+    parts, separators = _regional_split_prompt(text)
+    explicit_base = "ADDBASE" in separators
+    explicit_common = "ADDCOMM" in separators
+    base_enabled = bool(base_enabled or explicit_base)
+    common_enabled = bool(common_enabled or explicit_common)
+    grid_requested = any(separator in _REGIONAL_GRID_SEPARATORS for separator in separators)
+
+    common = ""
+    base = ""
+    index = 0
+    if common_enabled and index < len(parts):
+        common = parts[index]
+        index += 1
+    if base_enabled and index < len(parts):
+        base = parts[index]
+        index += 1
+
+    regions = [part for part in parts[index:] if part.strip()]
+    if not regions and base:
+        regions = [base]
+        base = ""
+        base_enabled = False
+    if not regions and common:
+        regions = [common]
+        common = ""
+        common_enabled = False
+    if not regions:
+        regions = [(text or "").strip()]
+
+    if common:
+        regions = [f"{common}, {region}".strip(" ,") for region in regions]
+
+    return {
+        "base": base,
+        "regions": regions,
+        "base_enabled": base_enabled and bool(base),
+        "common_enabled": common_enabled and bool(common),
+        "grid_requested": grid_requested,
+    }
+
+
+def _regional_prepare_negative_parts(text, region_count):
+    parts, _ = _regional_split_prompt(text)
+    parts = [part for part in parts if part.strip()]
+    if not parts:
+        return ["" for _ in range(region_count)]
+    if len(parts) == 1:
+        return [parts[0] for _ in range(region_count)]
+    while len(parts) < region_count:
+        parts.append(parts[-1])
+    return parts[:region_count]
+
+
+def _conditioning_set_values(conditioning, values):
+    result = []
+    for item in conditioning:
+        metadata = dict(item[1]) if len(item) > 1 and isinstance(item[1], dict) else {}
+        metadata.update(values)
+        result.append([item[0], metadata])
+    return result
+
+
+def _conditioning_set_area(conditioning, cell, strength):
+    return _conditioning_set_values(conditioning, {
+        "area": ("percentage", cell["height"], cell["width"], cell["y"], cell["x"]),
+        "strength": strength,
+        "set_area_to_bounds": False,
+    })
+
+
+def _regional_encode(clip, text, cell=None, strength=1.0):
+    conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(text or ""))
+    if cell is None:
+        return _conditioning_set_values(conditioning, {"strength": strength})
+    return _conditioning_set_area(conditioning, cell, strength)
+
+
+def _build_regional_conditioning(clip, positive_text, negative_text, split, ratios, base_enabled, common_enabled, base_ratio, strength):
+    positive_parts = _regional_prepare_prompt_parts(positive_text, base_enabled, common_enabled)
+    regions = positive_parts["regions"]
+    if len(regions) <= 1 and not positive_parts["base_enabled"]:
+        return None
+
+    split = "grid" if positive_parts["grid_requested"] else (split or "vertical")
+    if split not in {"vertical", "horizontal", "grid"}:
+        split = "vertical"
+
+    region_count = len(regions)
+    cells = _regional_cells_from_ratios(ratios, split, region_count)
+    base_ratio = min(1.0, max(0.0, _regional_float(base_ratio, 0.0)))
+    strength = max(0.0, _regional_float(strength, 1.0))
+    region_strength = strength * max(0.0, 1.0 - base_ratio if positive_parts["base_enabled"] else 1.0)
+
+    positive = []
+    if positive_parts["base_enabled"] and base_ratio > 0:
+        positive.extend(_regional_encode(clip, positive_parts["base"], None, base_ratio * strength))
+    for region, cell in zip(regions, cells):
+        positive.extend(_regional_encode(clip, region, cell, region_strength))
+
+    negative_regions = _regional_prepare_negative_parts(negative_text, region_count)
+    if len(set(negative_regions)) == 1:
+        negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_regions[0] or ""))
+    else:
+        negative = []
+        for region, cell in zip(negative_regions, cells):
+            negative.extend(_regional_encode(clip, region, cell, 1.0))
+
+    return {
+        "positive": positive,
+        "negative": negative,
+        "region_count": region_count,
+        "split": split,
+        "base_enabled": positive_parts["base_enabled"],
+        "common_enabled": positive_parts["common_enabled"],
+    }
+
+
 class WebUIPromptBridge:
     CATEGORY = "conditioning/webui"
     FUNCTION = "build"
@@ -2995,6 +3199,14 @@ class WebUIPromptBridge:
                 ),
                 "default_clip_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05}),
                 "fail_on_missing_lora": ("BOOLEAN", {"default": True}),
+                "regional_enabled": ("BOOLEAN", {"default": False}),
+                "regional_mode": (["matrix"], {"default": "matrix"}),
+                "regional_split": (["vertical", "horizontal", "grid"], {"default": "vertical"}),
+                "regional_ratios": ("STRING", {"default": "1,1", "multiline": False}),
+                "regional_base_enabled": ("BOOLEAN", {"default": False}),
+                "regional_common_enabled": ("BOOLEAN", {"default": False}),
+                "regional_base_ratio": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "regional_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -3010,7 +3222,25 @@ class WebUIPromptBridge:
             self.loaded_loras[lora_path] = cached
         return cached
 
-    def build(self, model, clip, positive_prompt, negative_prompt, default_clip_strength, fail_on_missing_lora, prompt=None, unique_id=None):
+    def build(
+        self,
+        model,
+        clip,
+        positive_prompt,
+        negative_prompt,
+        default_clip_strength,
+        fail_on_missing_lora,
+        regional_enabled=False,
+        regional_mode="matrix",
+        regional_split="vertical",
+        regional_ratios="1,1",
+        regional_base_enabled=False,
+        regional_common_enabled=False,
+        regional_base_ratio=0.2,
+        regional_strength=1.0,
+        prompt=None,
+        unique_id=None,
+    ):
         try:
             default_clip_strength = float(default_clip_strength)
         except (TypeError, ValueError):
@@ -3048,9 +3278,44 @@ class WebUIPromptBridge:
         if missing and fail_on_missing_lora:
             raise ValueError("Missing LoRA(s): " + ", ".join(missing))
 
-        positive = clip.encode_from_tokens_scheduled(clip.tokenize(positive_text))
-        negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_text))
+        regional_info = None
+        if regional_enabled:
+            if regional_mode != "matrix":
+                regional_info = {"warning": f"Unsupported regional mode: {regional_mode}"}
+            else:
+                try:
+                    regional_info = _build_regional_conditioning(
+                        clip,
+                        positive_text,
+                        negative_text,
+                        regional_split,
+                        regional_ratios,
+                        regional_base_enabled,
+                        regional_common_enabled,
+                        regional_base_ratio,
+                        regional_strength,
+                    )
+                except Exception as error:
+                    regional_info = {"warning": f"Regional conditioning disabled: {error}"}
+
+        if regional_info and "positive" in regional_info:
+            positive = regional_info["positive"]
+            negative = regional_info["negative"]
+        else:
+            positive = clip.encode_from_tokens_scheduled(clip.tokenize(positive_text))
+            negative = clip.encode_from_tokens_scheduled(clip.tokenize(negative_text))
         info = "Applied LoRAs: " + (", ".join(applied) if applied else "None")
+        if regional_enabled:
+            if regional_info and "positive" in regional_info:
+                info += (
+                    f" | Regional: {regional_info['region_count']} {regional_info['split']} region(s)"
+                    f", base={'on' if regional_info['base_enabled'] else 'off'}"
+                    f", common={'on' if regional_info['common_enabled'] else 'off'}"
+                )
+            elif regional_info and regional_info.get("warning"):
+                info += " | " + regional_info["warning"]
+            else:
+                info += " | Regional: no BREAK/region parts found; using normal conditioning"
         if applied and not model_output_connected:
             warning = "Bridge model output is not connected; LoRA model changes will not reach the sampler"
             info += " | Warning: " + warning

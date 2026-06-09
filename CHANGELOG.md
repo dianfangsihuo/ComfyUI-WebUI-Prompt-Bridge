@@ -1,5 +1,13 @@
 # 更新日志
 
+## 0.3.0 - 2026-06-09
+
+- 新增 WebUI Regional Prompter 风格区域控制：支持 `BREAK` / `AND` / `ADDROW` / `ADDCOL` / `ADDBASE` / `ADDCOMM` 写法，并在 Bridge 节点内提供区域开关、横向/纵向/网格比例、Base/Common、强度和区域预览。
+- 区域控制会输出 ComfyUI 原生区域 conditioning，兼容常见 SD1/SDXL/XL/Anima 工作流；关闭区域控制时保持旧工作流行为。
+- 优化 Bridge DOM 节点布局：隐藏 ComfyUI 原生 widget 占位空行，修复节点顶部/底部大片空白，并增加右侧控制栏显示/隐藏按钮。
+- 优化接口可读性：输出端口名称移到节点外侧显示，不遮挡 Bridge 面板内部控件，也不拦截拖线连接。
+- 完善 WebUI 起手式/Styles 管理：支持套用、提取、编辑、新建、保存和删除起手式，兼容 WebUI `{prompt}` 占位符合并/提取规则并写入 `styles.csv`。
+
 ## 0.2.10 - 2026-06-06
 
 - 兼容修复已经在旧版中保存成超长的 `WebUIPromptBridge` 节点：刷新后如果识别到明显由 LoRA 全显示布局 bug 造成的异常尺寸，会自动恢复到默认节点尺寸。

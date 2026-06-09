@@ -2,7 +2,20 @@ import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
 const TARGET_NODE = "WebUIPromptBridge";
-const PROMPT_WIDGETS = new Set(["positive_prompt", "negative_prompt", "default_clip_strength", "fail_on_missing_lora"]);
+const PROMPT_WIDGETS = new Set([
+    "positive_prompt",
+    "negative_prompt",
+    "default_clip_strength",
+    "fail_on_missing_lora",
+    "regional_enabled",
+    "regional_mode",
+    "regional_split",
+    "regional_ratios",
+    "regional_base_enabled",
+    "regional_common_enabled",
+    "regional_base_ratio",
+    "regional_strength",
+]);
 const EXTRA_SEPARATOR = ", ";
 const ATTENTION_STEP = 0.1;
 const EXTRA_STEP = 0.05;
@@ -560,6 +573,42 @@ function repairClipStrengthWidget(node) {
     const repaired = normalizeClipStrength(widget.value);
     if (widget.value !== repaired) widget.value = repaired;
     return repaired;
+}
+
+function bridgeWidgetValue(node, name, fallback) {
+    const value = getWidget(node, name)?.value;
+    return value === undefined || value === null || value === "" ? fallback : value;
+}
+
+function parseRegionalPromptParts(text = "") {
+    return String(text || "")
+        .split(/\b(?:BREAK|AND|ADDCOL|ADDROW|ADDBASE|ADDCOMM)\b/i)
+        .map((part) => part.trim())
+        .filter(Boolean);
+}
+
+function parseRegionalRatioRows(ratios = "1,1", split = "vertical") {
+    const text = String(ratios || "").trim();
+    const rowTexts = split === "grid" || /[;；]/.test(text) ? text.split(/[;；]+/) : [text];
+    const rows = rowTexts
+        .map((row) => row.split(/[,，\s]+/).map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0))
+        .filter((row) => row.length);
+    return rows.length ? rows : [[1, 1]];
+}
+
+function countRegionalCells(ratios = "1,1", split = "vertical") {
+    const rows = parseRegionalRatioRows(ratios, split);
+    if (split === "grid" || /[;；]/.test(String(ratios || ""))) return rows.reduce((total, row) => total + row.length, 0);
+    return rows[0]?.length || 1;
+}
+
+function regionalPromptRegionCount(text = "", baseEnabled = false, commonEnabled = false) {
+    const source = String(text || "");
+    const parts = parseRegionalPromptParts(source);
+    let offset = 0;
+    if (commonEnabled || /\bADDCOMM\b/i.test(source)) offset += 1;
+    if (baseEnabled || /\bADDBASE\b/i.test(source)) offset += 1;
+    return Math.max(0, parts.length - offset);
 }
 
 function resolvePanelFontMetrics(value) {
@@ -1622,6 +1671,59 @@ function applyStyleText(base, styleText) {
     if (!styleText) return base;
     if (styleText.includes("{prompt}")) return styleText.replaceAll("{prompt}", base);
     return base.trim() ? `${base}${EXTRA_SEPARATOR}${styleText}` : styleText;
+}
+
+function extractStyleTextFromPrompt(styleText = "", prompt = "") {
+    const strippedPrompt = String(prompt || "").trim();
+    const strippedStyleText = String(styleText || "").trim();
+    if (strippedStyleText.includes("{prompt}")) {
+        const index = strippedStyleText.indexOf("{prompt}");
+        const left = strippedStyleText.slice(0, index);
+        const right = strippedStyleText.slice(index + "{prompt}".length);
+        if (strippedPrompt.startsWith(left) && strippedPrompt.endsWith(right)) {
+            return [true, strippedPrompt.slice(left.length, strippedPrompt.length - right.length)];
+        }
+    } else if (strippedPrompt.endsWith(strippedStyleText)) {
+        let extracted = strippedPrompt.slice(0, strippedPrompt.length - strippedStyleText.length);
+        if (extracted.endsWith(", ")) extracted = extracted.slice(0, -2);
+        return [true, extracted];
+    }
+    return [false, prompt];
+}
+
+function extractOriginalPromptsFromStyle(style, prompt = "", negativePrompt = "") {
+    if (!style?.prompt && !style?.negative_prompt) return [false, prompt, negativePrompt];
+    const [positiveMatched, extractedPositive] = extractStyleTextFromPrompt(style.prompt || "", prompt);
+    if (!positiveMatched) return [false, prompt, negativePrompt];
+    const [negativeMatched, extractedNegative] = extractStyleTextFromPrompt(style.negative_prompt || "", negativePrompt);
+    if (!negativeMatched) return [false, prompt, negativePrompt];
+    return [true, extractedPositive, extractedNegative];
+}
+
+function extractStylesFromPrompts(styles = [], prompt = "", negativePrompt = "") {
+    const extracted = [];
+    const applicable = styles.filter((style) => style?.name && !String(style.name).startsWith("---"));
+    let currentPrompt = prompt;
+    let currentNegative = negativePrompt;
+    while (applicable.length) {
+        let foundIndex = -1;
+        for (let index = 0; index < applicable.length; index += 1) {
+            const [matched, nextPrompt, nextNegative] = extractOriginalPromptsFromStyle(applicable[index], currentPrompt, currentNegative);
+            if (!matched) continue;
+            foundIndex = index;
+            currentPrompt = nextPrompt;
+            currentNegative = nextNegative;
+            break;
+        }
+        if (foundIndex < 0) break;
+        extracted.push(applicable[foundIndex].name);
+        applicable.splice(foundIndex, 1);
+    }
+    return {
+        styles: extracted.reverse(),
+        prompt: currentPrompt,
+        negative_prompt: currentNegative,
+    };
 }
 
 function fetchJsonWithTimeout(url, options = {}, timeoutMs = 0) {
@@ -4114,6 +4216,13 @@ function buildPanel(node) {
     const negativeWidget = getWidget(node, "negative_prompt");
     const clipStrengthWidget = getWidget(node, "default_clip_strength");
     const failOnMissingWidget = getWidget(node, "fail_on_missing_lora");
+    const regionalEnabledWidget = getWidget(node, "regional_enabled");
+    const regionalSplitWidget = getWidget(node, "regional_split");
+    const regionalRatiosWidget = getWidget(node, "regional_ratios");
+    const regionalBaseEnabledWidget = getWidget(node, "regional_base_enabled");
+    const regionalCommonEnabledWidget = getWidget(node, "regional_common_enabled");
+    const regionalBaseRatioWidget = getWidget(node, "regional_base_ratio");
+    const regionalStrengthWidget = getWidget(node, "regional_strength");
     const initialClipStrength = repairClipStrengthWidget(node);
     const state = {
         bridgeNode: node,
@@ -4137,10 +4246,12 @@ function buildPanel(node) {
     };
     let clearPromptPlacementWarning = () => {};
     let statusTimer = null;
+    let syncRegionalWidgets = () => {};
 
     const sync = () => {
         setWidgetValue(node, "positive_prompt", positive.textarea.value);
         setWidgetValue(node, "negative_prompt", negative.textarea.value);
+        syncRegionalWidgets?.();
         updateCounters();
     };
 
@@ -4307,6 +4418,103 @@ function buildPanel(node) {
         onchange: (event) => setWidgetValue(node, "fail_on_missing_lora", event.currentTarget.checked),
     });
     failOnMissingInput.checked = Boolean(failOnMissingWidget?.value ?? true);
+
+    const regionalEnabledInput = el("input", { type: "checkbox", title: "启用 WebUI Regional Prompter 风格区域控制" });
+    regionalEnabledInput.checked = Boolean(regionalEnabledWidget?.value ?? false);
+    const regionalSplitSelect = el("select", { class: "webui-bridge-regional-select", title: "区域切分方向" }, [
+        el("option", { value: "vertical" }, "纵向"),
+        el("option", { value: "horizontal" }, "横向"),
+        el("option", { value: "grid" }, "网格"),
+    ]);
+    regionalSplitSelect.value = String(regionalSplitWidget?.value || "vertical");
+    const regionalRatiosInput = el("input", {
+        class: "webui-bridge-regional-ratios",
+        value: bridgeWidgetValue(node, "regional_ratios", "1,1"),
+        placeholder: "1,1 或 1,2;1,1",
+        title: "区域比例；网格用分号分行",
+    });
+    const regionalBaseInput = el("input", { type: "checkbox", title: "第一段作为所有区域共享的 base prompt" });
+    regionalBaseInput.checked = Boolean(regionalBaseEnabledWidget?.value ?? false);
+    const regionalCommonInput = el("input", { type: "checkbox", title: "第一段追加到每个区域 prompt" });
+    regionalCommonInput.checked = Boolean(regionalCommonEnabledWidget?.value ?? false);
+    const regionalBaseRatioInput = el("input", {
+        type: "number",
+        min: "0",
+        max: "1",
+        step: "0.05",
+        value: bridgeWidgetValue(node, "regional_base_ratio", 0.2),
+        title: "Base prompt 混合比例",
+    });
+    const regionalStrengthInput = el("input", {
+        type: "number",
+        min: "0",
+        max: "10",
+        step: "0.05",
+        value: bridgeWidgetValue(node, "regional_strength", 1),
+        title: "区域 prompt 强度",
+    });
+    const regionalStatus = el("div", { class: "webui-bridge-regional-status" });
+    const regionalPreview = el("div", { class: "webui-bridge-regional-preview" });
+    const regionalTemplateButton = el("button", {
+        class: "webui-bridge-network-tool",
+        type: "button",
+        title: "按当前区域数生成 BREAK 模板",
+        onclick: () => {
+            const split = regionalSplitSelect.value;
+            const count = countRegionalCells(regionalRatiosInput.value, split);
+            const prefix = regionalCommonInput.checked ? "common prompt ADDCOMM\n" : "";
+            const base = regionalBaseInput.checked ? "base prompt ADDBASE\n" : "";
+            const parts = Array.from({ length: Math.max(1, count) }, (_, index) => `region ${index + 1} prompt`);
+            positive.textarea.value = `${prefix}${base}${parts.join(" BREAK\n")}`;
+            sync();
+            renderRegionalPreview();
+            renderPromptPanels();
+        },
+    }, "生成模板");
+
+    const renderRegionalPreview = () => {
+        const split = regionalSplitSelect.value;
+        const ratios = regionalRatiosInput.value;
+        const rows = parseRegionalRatioRows(ratios, split);
+        const cellCount = countRegionalCells(ratios, split);
+        const promptCount = regionalPromptRegionCount(positive.textarea.value, regionalBaseInput.checked, regionalCommonInput.checked);
+        const negativeCount = parseRegionalPromptParts(negative.textarea.value).length;
+        const warnings = [];
+        if (regionalEnabledInput.checked && promptCount > 0 && promptCount !== cellCount) warnings.push(`Prompt 区域 ${promptCount} 个，比例区域 ${cellCount} 个`);
+        if (regionalEnabledInput.checked && negativeCount > 1 && negativeCount !== promptCount) warnings.push(`反向词区域 ${negativeCount} 个，正向区域 ${promptCount} 个`);
+        regionalStatus.textContent = regionalEnabledInput.checked
+            ? (warnings.length ? warnings.join("；") : `区域 ${cellCount} 个；使用 BREAK/ADDCOL/ADDROW 分隔提示词`)
+            : "区域控制关闭";
+        regionalStatus.classList.toggle("error", warnings.length > 0);
+        regionalPreview.innerHTML = "";
+        const previewRows = split === "grid" || /[;；]/.test(String(ratios || "")) ? rows : [rows[0]];
+        previewRows.forEach((row, rowIndex) => {
+            const rowEl = el("div", { class: "webui-bridge-regional-preview-row" });
+            const total = row.reduce((sum, value) => sum + value, 0) || 1;
+            row.forEach((value, index) => {
+                rowEl.append(el("div", {
+                    class: "webui-bridge-regional-preview-cell",
+                    style: { flex: `${value / total} 1 0` },
+                }, `${rowIndex * row.length + index + 1}`));
+            });
+            regionalPreview.append(rowEl);
+        });
+    };
+    syncRegionalWidgets = () => {
+        setWidgetValue(node, "regional_enabled", regionalEnabledInput.checked);
+        setWidgetValue(node, "regional_mode", "matrix");
+        setWidgetValue(node, "regional_split", regionalSplitSelect.value);
+        setWidgetValue(node, "regional_ratios", regionalRatiosInput.value.trim() || "1,1");
+        setWidgetValue(node, "regional_base_enabled", regionalBaseInput.checked);
+        setWidgetValue(node, "regional_common_enabled", regionalCommonInput.checked);
+        setWidgetValue(node, "regional_base_ratio", normalizeClipStrength(regionalBaseRatioInput.value, 0.2));
+        setWidgetValue(node, "regional_strength", normalizeClipStrength(regionalStrengthInput.value, 1));
+        renderRegionalPreview();
+    };
+    for (const control of [regionalEnabledInput, regionalSplitSelect, regionalRatiosInput, regionalBaseInput, regionalCommonInput, regionalBaseRatioInput, regionalStrengthInput]) {
+        control.addEventListener("input", syncRegionalWidgets);
+        control.addEventListener("change", syncRegionalWidgets);
+    }
 
     const setStatus = (message, options = {}) => {
         window.clearTimeout(statusTimer);
@@ -5421,6 +5629,15 @@ function buildPanel(node) {
             styleSelect.append(el("option", { value: style.name }, style.name));
         }
     };
+    const selectStyleOptions = (names = []) => {
+        const selected = new Set(names);
+        for (const option of styleSelect.options) option.selected = selected.has(option.value);
+    };
+    const selectedStyleNames = () => [...styleSelect.selectedOptions].map((option) => option.value);
+    const selectedStyle = () => {
+        const name = styleName.value.trim() || styleSelect.selectedOptions[0]?.value || "";
+        return state.styles.find((style) => style.name === name) || null;
+    };
 
     const renderTree = () => {
         const tree = buildLoraFolderTree(state.loras);
@@ -5636,7 +5853,7 @@ function buildPanel(node) {
     };
 
     const applyStyles = () => {
-        const selected = [...styleSelect.selectedOptions].map((option) => option.value);
+        const selected = selectedStyleNames();
         for (const name of selected) {
             const style = state.styles.find((x) => x.name === name);
             if (!style) continue;
@@ -5670,6 +5887,152 @@ function buildPanel(node) {
         renderStyles();
         styleName.value = "";
         setStatus(`Deleted style: ${name}`);
+    };
+
+    const materializeSelectedStyles = () => {
+        const selected = selectedStyleNames();
+        if (!selected.length) {
+            setStatus("请选择要套用的起手式", { kind: "error" });
+            return;
+        }
+        applyStyles();
+        setStatus(`已套用 ${selected.length} 个起手式`, { kind: "success" });
+    };
+
+    const extractAppliedStyles = () => {
+        const result = extractStylesFromPrompts(state.styles, positive.textarea.value, negative.textarea.value);
+        if (!result.styles.length) {
+            setStatus("没有从当前 prompt 中识别到已套用的起手式", { kind: "error" });
+            return;
+        }
+        positive.textarea.value = result.prompt;
+        negative.textarea.value = result.negative_prompt;
+        selectStyleOptions(result.styles);
+        styleName.value = result.styles[0] || "";
+        sync();
+        renderPromptPanels();
+        setStatus(`已提取起手式: ${result.styles.join(", ")}`, { kind: "success", duration: 8000 });
+    };
+
+    const showStyleEditorDialog = () => {
+        const mask = el("div", { class: "webui-bridge-config-mask" });
+        const listId = `webui-bridge-style-list-${Math.random().toString(36).slice(2)}`;
+        const selection = el("input", {
+            class: "webui-bridge-config-input",
+            list: listId,
+            placeholder: "选择或输入新起手式名称",
+        });
+        selection.value = styleName.value.trim() || styleSelect.selectedOptions[0]?.value || "";
+        const datalist = el("datalist", { id: listId });
+        const promptInput = el("textarea", {
+            class: "webui-bridge-style-dialog-textarea",
+            rows: "5",
+            placeholder: "正向起手式，可使用 {prompt}",
+        });
+        const negativeInput = el("textarea", {
+            class: "webui-bridge-style-dialog-textarea",
+            rows: "5",
+            placeholder: "反向起手式，可使用 {prompt}",
+        });
+        const statusLine = el("div", { class: "webui-bridge-config-status" }, "起手式会写入 WebUI styles.csv；{prompt} 会在套用时替换为当前 prompt。");
+        const refreshList = () => {
+            datalist.innerHTML = "";
+            for (const style of state.styles) datalist.append(el("option", { value: style.name }));
+        };
+        const fill = (name = selection.value.trim()) => {
+            const style = state.styles.find((item) => item.name === name);
+            promptInput.value = style?.prompt || "";
+            negativeInput.value = style?.negative_prompt || "";
+            statusLine.textContent = style ? `正在编辑: ${style.name}` : "新建起手式";
+        };
+        const close = () => mask.remove();
+        const save = async () => {
+            const name = selection.value.trim();
+            if (!name) {
+                statusLine.textContent = "请先填写起手式名称";
+                return;
+            }
+            try {
+                state.styles = await updateStyle("save", name, promptInput.value, negativeInput.value);
+                renderStyles();
+                selectStyleOptions([name]);
+                styleName.value = name;
+                refreshList();
+                statusLine.textContent = `已保存: ${name}`;
+                setStatus(`已保存起手式: ${name}`, { kind: "success" });
+            } catch (error) {
+                statusLine.textContent = `保存失败: ${error?.message || error}`;
+            }
+        };
+        const remove = async () => {
+            const name = selection.value.trim();
+            if (!name) {
+                statusLine.textContent = "请选择要删除的起手式";
+                return;
+            }
+            if (!confirm(`Delete style "${name}"?`)) return;
+            try {
+                state.styles = await updateStyle("delete", name);
+                renderStyles();
+                selection.value = "";
+                styleName.value = "";
+                promptInput.value = "";
+                negativeInput.value = "";
+                refreshList();
+                statusLine.textContent = `已删除: ${name}`;
+                setStatus(`已删除起手式: ${name}`);
+            } catch (error) {
+                statusLine.textContent = `删除失败: ${error?.message || error}`;
+            }
+        };
+        const copyCurrent = () => {
+            promptInput.value = positive.textarea.value;
+            negativeInput.value = negative.textarea.value;
+            statusLine.textContent = "已复制当前正向/反向 prompt 到编辑器";
+        };
+        const applyEdited = () => {
+            positive.textarea.value = applyStyleText(positive.textarea.value, promptInput.value);
+            negative.textarea.value = applyStyleText(negative.textarea.value, negativeInput.value);
+            sync();
+            renderPromptPanels();
+            statusLine.textContent = "已把编辑器里的起手式套用到当前 prompt";
+        };
+        const materializeAndClose = () => {
+            materializeSelectedStyles();
+            close();
+        };
+        selection.addEventListener("change", () => fill());
+        selection.addEventListener("input", () => {
+            const style = state.styles.find((item) => item.name === selection.value.trim());
+            if (style) fill(style.name);
+        });
+        mask.addEventListener("mousedown", (event) => {
+            if (event.target === mask) close();
+        });
+        refreshList();
+        fill();
+        mask.append(el("div", { class: "webui-bridge-config-panel webui-bridge-style-dialog" }, [
+            el("div", { class: "webui-bridge-config-head" }, [
+                el("span", {}, "起手式编辑"),
+                el("button", { type: "button", onclick: close }, "×"),
+            ]),
+            el("div", { class: "webui-bridge-config-body" }, [
+                datalist,
+                el("label", {}, [el("span", {}, "名称"), selection]),
+                el("label", {}, [el("span", {}, "正向 Prompt"), promptInput]),
+                el("label", {}, [el("span", {}, "Negative prompt"), negativeInput]),
+                statusLine,
+            ]),
+            el("div", { class: "webui-bridge-config-actions" }, [
+                el("button", { type: "button", onclick: copyCurrent }, "复制当前"),
+                el("button", { type: "button", onclick: applyEdited }, "套用编辑器"),
+                el("button", { type: "button", onclick: materializeAndClose }, "套用选中"),
+                el("button", { type: "button", onclick: extractAppliedStyles }, "提取起手式"),
+                el("button", { type: "button", onclick: remove }, "删除"),
+                el("button", { type: "button", class: "primary", onclick: save }, "保存"),
+            ]),
+        ]));
+        document.body.append(mask);
     };
 
     const pasteParams = async () => {
@@ -5746,6 +6109,21 @@ function buildPanel(node) {
         if (!validateNumericParameters()) return;
         const positiveText = positive.textarea.value.trim();
         const negativeText = negative.textarea.value.trim();
+        if (regionalEnabledInput.checked) {
+            const promptRegions = regionalPromptRegionCount(positiveText, regionalBaseInput.checked, regionalCommonInput.checked);
+            const ratioRegions = countRegionalCells(regionalRatiosInput.value, regionalSplitSelect.value);
+            const negativeRegions = parseRegionalPromptParts(negativeText).length;
+            if (promptRegions > 0 && ratioRegions !== promptRegions) {
+                setStatus(`区域配置不匹配：Prompt 有 ${promptRegions} 个区域，但比例生成 ${ratioRegions} 个区域。请调整 BREAK 或比例。`, { kind: "error", sticky: true });
+                renderRegionalPreview();
+                return;
+            }
+            if (negativeRegions > 1 && negativeRegions !== promptRegions) {
+                setStatus(`区域反向词不匹配：Negative prompt 有 ${negativeRegions} 个区域，正向区域是 ${promptRegions} 个。`, { kind: "error", sticky: true });
+                renderRegionalPreview();
+                return;
+            }
+        }
         if (
             (promptHasAnyLora(positiveText) || promptHasAnyLora(negativeText)) &&
             !bridgeModelOutputConnected(node) &&
@@ -6027,8 +6405,10 @@ function buildPanel(node) {
     const topRowHeightKey = "webui-bridge-toprow-height";
     const extraHeightKey = "webui-bridge-extra-height";
     const extraCollapsedKey = "webui-bridge-extra-collapsed";
+    const actionCollapsedKey = "webui-bridge-action-column-collapsed";
     migrateLayoutStorage([topRowHeightKey, extraHeightKey]);
     let extraCollapsed = readLocalBoolean(extraCollapsedKey, false);
+    let actionCollapsed = readLocalBoolean(actionCollapsedKey, false);
     let loraOverlayOpen = false;
     const extraBody = el("div", { class: "webui-bridge-extra-body" }, [
         networkTree,
@@ -6109,55 +6489,99 @@ function buildPanel(node) {
         requestAnimationFrame(ensureUsableExtraHeight);
     }
     applyExtraCollapsedState();
+    const regionalSection = el("details", { class: "webui-bridge-regional-section", open: Boolean(regionalEnabledInput.checked) }, [
+        el("summary", {}, [
+            el("span", {}, "区域控制"),
+            regionalEnabledInput,
+        ]),
+        el("div", { class: "webui-bridge-regional-grid" }, [
+            el("label", {}, [el("span", {}, "切分"), regionalSplitSelect]),
+            el("label", {}, [el("span", {}, "比例"), regionalRatiosInput]),
+            el("label", {}, [regionalBaseInput, el("span", {}, "Base")]),
+            el("label", {}, [regionalCommonInput, el("span", {}, "Common")]),
+            el("label", {}, [el("span", {}, "Base比例"), regionalBaseRatioInput]),
+            el("label", {}, [el("span", {}, "强度"), regionalStrengthInput]),
+        ]),
+        el("div", { class: "webui-bridge-regional-actions" }, [
+            regionalTemplateButton,
+            regionalStatus,
+        ]),
+        regionalPreview,
+    ]);
+    renderRegionalPreview();
 
-    const topRow = el("div", { class: "webui-bridge-toprow" }, [
-        promptsColumn,
-        el("div", { class: "webui-bridge-action-column" }, [
-            el("button", { class: "webui-bridge-generate", title: "Queue Prompt", onclick: queuePrompt }, "Generate"),
-            status,
-            modelSwitchControls,
-            animaModeControls,
-            sizeControls,
-            layoutPresetControls,
-            toolbar,
-            el("div", { class: "webui-bridge-backend-settings" }, [
-                el("button", {
-                    class: "webui-bridge-config-button",
-                    type: "button",
-                    title: "只填写 WebUI 根目录，自动接入 Prompt All in One、TagComplete、styles、LoRA 和模型目录",
-                    onclick: showWebUIIntegrationDialog,
-                }, "一键接入 WebUI"),
-                quickLoraOverlayButton = el("button", {
-                    class: "webui-bridge-config-button",
-                    type: "button",
-                    title: "打开 LoRA / LyCORIS 浮层，添加完成后可关闭让节点更紧凑",
-                    onclick: openLoraOverlay,
-                }, "快速添加 LoRA"),
-                el("button", {
-                    class: "webui-bridge-config-button",
-                    type: "button",
-                    title: "设置数据来源、翻译、布局、Tag 和 LoRA 卡片显示",
-                    onclick: showBridgeSettingsDialog,
-                }, "设置"),
-                el("label", {}, [
-                    el("span", {}, "CLIP"),
-                    clipStrengthInput,
-                ]),
-                el("label", {}, [
-                    failOnMissingInput,
-                    el("span", {}, "Missing LoRA stops"),
-                ]),
+    let topRow = null;
+    let actionColumn = null;
+    const actionToggle = el("button", {
+        class: "webui-bridge-side-toggle",
+        type: "button",
+        onclick: () => {
+            actionCollapsed = !actionCollapsed;
+            writeLocalBoolean(actionCollapsedKey, actionCollapsed);
+            applyActionCollapsedState();
+        },
+    });
+    function applyActionCollapsedState() {
+        topRow?.classList?.toggle("action-collapsed", actionCollapsed);
+        actionColumn?.classList?.toggle("collapsed", actionCollapsed);
+        actionToggle.textContent = actionCollapsed ? "显示侧栏" : "隐藏侧栏";
+        actionToggle.title = actionCollapsed ? "显示右侧控制栏" : "隐藏右侧控制栏，露出节点接口";
+    }
+    actionColumn = el("div", { class: "webui-bridge-action-column" }, [
+        el("button", { class: "webui-bridge-generate", title: "Queue Prompt", onclick: queuePrompt }, "Generate"),
+        status,
+        modelSwitchControls,
+        regionalSection,
+        animaModeControls,
+        sizeControls,
+        layoutPresetControls,
+        toolbar,
+        el("div", { class: "webui-bridge-backend-settings" }, [
+            el("button", {
+                class: "webui-bridge-config-button",
+                type: "button",
+                title: "只填写 WebUI 根目录，自动接入 Prompt All in One、TagComplete、styles、LoRA 和模型目录",
+                onclick: showWebUIIntegrationDialog,
+            }, "一键接入 WebUI"),
+            quickLoraOverlayButton = el("button", {
+                class: "webui-bridge-config-button",
+                type: "button",
+                title: "打开 LoRA / LyCORIS 浮层，添加完成后可关闭让节点更紧凑",
+                onclick: openLoraOverlay,
+            }, "快速添加 LoRA"),
+            el("button", {
+                class: "webui-bridge-config-button",
+                type: "button",
+                title: "设置数据来源、翻译、布局、Tag 和 LoRA 卡片显示",
+                onclick: showBridgeSettingsDialog,
+            }, "设置"),
+            el("label", {}, [
+                el("span", {}, "CLIP"),
+                clipStrengthInput,
             ]),
-            el("div", { class: "webui-bridge-style-row" }, [
-                styleSelect,
-                el("div", { class: "webui-bridge-style-edit" }, [
-                    styleName,
-                    createToolButton("+", "Save current prompts as style", saveStyle),
-                    createToolButton("-", "Delete selected style", deleteStyle),
-                ]),
+            el("label", {}, [
+                failOnMissingInput,
+                el("span", {}, "Missing LoRA stops"),
+            ]),
+        ]),
+        el("div", { class: "webui-bridge-style-row" }, [
+            styleSelect,
+            el("div", { class: "webui-bridge-style-edit" }, [
+                styleName,
+                createToolButton("套", "套用选中的起手式到当前 prompt", materializeSelectedStyles),
+                createToolButton("提", "从当前 prompt 中识别并提取已套用的起手式", extractAppliedStyles),
+                createToolButton("编", "打开起手式编辑器", showStyleEditorDialog),
+                createToolButton("+", "保存当前 prompt 为起手式", saveStyle),
+                createToolButton("-", "删除选中或输入的起手式", deleteStyle),
             ]),
         ]),
     ]);
+    promptsColumn.prepend(actionToggle);
+    topRow = el("div", { class: "webui-bridge-toprow" }, [
+        promptsColumn,
+        actionColumn,
+    ]);
+    applyActionCollapsedState();
     topRow.__webuiBridgeHeightKey = topRowHeightKey;
     topRow.__webuiBridgeMinHeight = 220;
     topRow.__webuiBridgeMaxHeight = 100000;
@@ -6400,9 +6824,9 @@ function addStyles() {
     style.textContent = `
         .webui-bridge-panel {
             position: relative;
-            width: 100%;
+            width: 100% !important;
             min-width: 0;
-            height: 100%;
+            height: 100% !important;
             min-height: ${PANEL_MIN_HEIGHT}px;
             padding: 6px 6px 2px;
             box-sizing: border-box;
@@ -6416,6 +6840,84 @@ function addStyles() {
             font-size: var(--webui-bridge-font-size, 12px);
             overflow: hidden;
             container-type: inline-size;
+        }
+        .webui-bridge-side-toggle {
+            align-self: flex-start;
+            flex: 0 0 auto;
+            min-width: 72px;
+            height: 24px;
+            margin: 0 0 -2px;
+            padding: 0 8px;
+            border: 1px solid #5f728c;
+            border-radius: 5px;
+            background: #243043;
+            color: #eaf1fb;
+            font-size: 11px;
+            line-height: 1;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, .32);
+        }
+        .webui-bridge-side-toggle:hover {
+            background: #2f3e56;
+        }
+        .lg-node:has(.webui-bridge-panel) .lg-node-widgets {
+            position: absolute;
+            left: 8px;
+            right: 12px;
+            top: 34px;
+            bottom: 10px;
+            width: auto;
+            height: auto;
+            padding-right: 0;
+            display: block;
+            z-index: 1;
+        }
+        .lg-node:has(.webui-bridge-panel) .lg-slot--output {
+            position: relative;
+            z-index: 20;
+            pointer-events: auto;
+            overflow: visible;
+        }
+        .lg-node:has(.webui-bridge-panel) .lg-slot--output > .relative {
+            overflow: visible;
+        }
+        .lg-node:has(.webui-bridge-panel) .lg-slot--output .text-node-component-slot-text {
+            position: absolute;
+            z-index: 21;
+            left: calc(100% + 18px);
+            top: 50%;
+            transform: translateY(-50%);
+            max-width: none;
+            padding: 0 4px;
+            border-radius: 4px;
+            background: rgba(17, 22, 32, .82);
+            color: #eaf1fb;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, .9);
+            overflow: visible;
+            pointer-events: none;
+            white-space: nowrap;
+        }
+        .lg-node:has(.webui-bridge-panel) .lg-slot--output .slot-dot {
+            position: relative;
+            z-index: 22;
+        }
+        .lg-node:has(.webui-bridge-panel) .lg-node-widgets > .lg-node-widget:not(:has(.webui-bridge-panel)) {
+            display: none !important;
+        }
+        .lg-node:has(.webui-bridge-panel) .lg-node-widget:has(.webui-bridge-panel),
+        .lg-node:has(.webui-bridge-panel) .lg-node-widget:has(.webui-bridge-panel) > div {
+            width: 100%;
+            height: 100%;
+        }
+        .lg-node:has(.webui-bridge-panel) .lg-node-widget:has(.webui-bridge-panel) {
+            grid-template-rows: minmax(0, 1fr) !important;
+        }
+        .lg-node:has(.webui-bridge-panel) .lg-node-widget:has(.webui-bridge-panel) > div:not(:has(.webui-bridge-panel)) {
+            display: none !important;
+        }
+        .lg-node:has(.webui-bridge-panel) .lg-node-widget:has(.webui-bridge-panel) > div:has(.webui-bridge-panel) {
+            grid-column: 1 / -1 !important;
+            grid-row: 1 !important;
         }
         .webui-bridge-panel-error {
             justify-content: center;
@@ -6658,6 +7160,9 @@ function addStyles() {
             min-height: 0;
             max-height: none;
             overflow: hidden;
+        }
+        .webui-bridge-toprow.action-collapsed {
+            grid-template-columns: minmax(0, 1fr);
         }
         .webui-bridge-toprow.negative-collapsed {
             align-items: start;
@@ -7340,6 +7845,9 @@ function addStyles() {
             min-height: 0;
             overflow: auto;
         }
+        .webui-bridge-action-column.collapsed {
+            display: none !important;
+        }
         .webui-bridge-generate {
             height: clamp(42px, 7vh, 62px);
             border: 0;
@@ -7404,6 +7912,100 @@ function addStyles() {
             margin: 0;
             accent-color: #2f73d9;
         }
+        .webui-bridge-regional-section {
+            border: 1px solid #3e4654;
+            border-radius: 5px;
+            background: #171a20;
+            color: #cbd4e1;
+            font-size: 11px;
+        }
+        .webui-bridge-regional-section summary {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 6px;
+            cursor: pointer;
+            font-weight: 700;
+        }
+        .webui-bridge-regional-section summary input {
+            width: 14px;
+            height: 14px;
+            margin: 0;
+            accent-color: #2f73d9;
+        }
+        .webui-bridge-regional-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+            gap: 5px;
+            padding: 0 6px 6px;
+        }
+        .webui-bridge-regional-grid label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            min-width: 0;
+        }
+        .webui-bridge-regional-grid input[type="number"],
+        .webui-bridge-regional-grid input[type="text"],
+        .webui-bridge-regional-grid select,
+        .webui-bridge-regional-ratios,
+        .webui-bridge-regional-select {
+            min-width: 0;
+            width: 100%;
+            height: 24px;
+            padding: 2px 5px;
+            box-sizing: border-box;
+            border: 1px solid #4d5666;
+            border-radius: 4px;
+            background: #111318;
+            color: #f2f4f8;
+        }
+        .webui-bridge-regional-actions {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 0 6px 6px;
+            min-width: 0;
+        }
+        .webui-bridge-regional-status {
+            flex: 1 1 auto;
+            min-width: 0;
+            color: #aeb8c8;
+            line-height: 1.25;
+        }
+        .webui-bridge-regional-status.error {
+            color: #ff9aa2;
+        }
+        .webui-bridge-regional-preview {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            height: 86px;
+            margin: 0 6px 6px;
+            padding: 3px;
+            border: 1px solid #323946;
+            border-radius: 4px;
+            background: #101318;
+        }
+        .webui-bridge-regional-preview-row {
+            display: flex;
+            flex: 1 1 0;
+            gap: 2px;
+            min-height: 0;
+        }
+        .webui-bridge-regional-preview-cell {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 12px;
+            border: 1px solid #5073a6;
+            border-radius: 3px;
+            background: #1d395e;
+            color: #dbeafe;
+            font-size: 10px;
+            overflow: hidden;
+        }
         .webui-bridge-config-button {
             min-height: 30px;
             border: 1px solid #4f7db8;
@@ -7432,7 +8034,7 @@ function addStyles() {
         }
         .webui-bridge-style-edit {
             display: grid;
-            grid-template-columns: minmax(0, 1fr) 30px 30px;
+            grid-template-columns: minmax(0, 1fr) repeat(5, 28px);
             gap: 5px;
             margin-top: 5px;
         }
@@ -7446,6 +8048,29 @@ function addStyles() {
             background: #111318;
             color: #f2f4f8;
             font-size: 12px;
+        }
+        .webui-bridge-style-edit .webui-bridge-tool {
+            width: 28px;
+            height: 30px;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        .webui-bridge-style-dialog {
+            width: min(760px, calc(100vw - 48px));
+        }
+        .webui-bridge-style-dialog .webui-bridge-config-body {
+            grid-template-columns: 1fr;
+        }
+        .webui-bridge-style-dialog-textarea {
+            min-height: 92px;
+            resize: vertical;
+            box-sizing: border-box;
+            padding: 9px 10px;
+            border: 1px solid #40506a;
+            border-radius: 6px;
+            background: #090e16;
+            color: #f3f6fb;
+            font: 13px/1.45 Consolas, Monaco, monospace;
         }
         .webui-bridge-status {
             min-height: 0;
