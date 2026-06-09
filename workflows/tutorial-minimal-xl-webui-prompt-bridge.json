@@ -7,48 +7,192 @@
     {
       "id": 1,
       "type": "CheckpointLoaderSimple",
-      "pos": [40, 1180],
-      "size": [360, 82],
-      "flags": {"collapsed": true},
+      "pos": [
+        40,
+        1180
+      ],
+      "size": [
+        360,
+        82
+      ],
+      "flags": {
+        "collapsed": true
+      },
       "order": 0,
       "mode": 0,
-      "inputs": [{"label": "ckpt_name", "name": "ckpt_name", "type": "COMBO", "widget": {"name": "ckpt_name"}, "link": null}],
+      "inputs": [
+        {
+          "label": "ckpt_name",
+          "name": "ckpt_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "ckpt_name"
+          },
+          "link": null
+        }
+      ],
       "outputs": [
-        {"label": "MODEL", "name": "MODEL", "type": "MODEL", "slot_index": 0, "links": [1]},
-        {"label": "CLIP", "name": "CLIP", "type": "CLIP", "slot_index": 1, "links": [2]},
-        {"label": "VAE", "name": "VAE", "type": "VAE", "slot_index": 2, "links": [5]}
+        {
+          "label": "MODEL",
+          "name": "MODEL",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            1
+          ]
+        },
+        {
+          "label": "CLIP",
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 1,
+          "links": [
+            2
+          ]
+        },
+        {
+          "label": "VAE",
+          "name": "VAE",
+          "type": "VAE",
+          "slot_index": 2,
+          "links": [
+            5
+          ]
+        }
       ],
       "title": "XL Checkpoint",
-      "properties": {"cnr_id": "comfy-core", "ver": "0.3.40", "Node name for S&R": "CheckpointLoaderSimple"},
-      "widgets_values": ["waiNSFWIllustrious_v140.safetensors"]
+      "properties": {
+        "Node name for S&R": "CheckpointLoaderSimple"
+      },
+      "widgets_values": [
+        "WAI_NSFW-illustrious-SDXL_v15.safetensors"
+      ]
     },
     {
       "id": 2,
       "type": "WebUIPromptBridge",
-      "pos": [40, 40],
-      "size": [1180, 1040],
+      "pos": [
+        40,
+        40
+      ],
+      "size": [
+        1180,
+        1040
+      ],
       "flags": {},
       "order": 1,
       "mode": 0,
       "inputs": [
-        {"label": "model", "name": "model", "type": "MODEL", "link": 1},
-        {"label": "clip", "name": "clip", "type": "CLIP", "link": 2},
-        {"label": "positive_prompt", "name": "positive_prompt", "type": "STRING", "widget": {"name": "positive_prompt"}, "link": null},
-        {"label": "negative_prompt", "name": "negative_prompt", "type": "STRING", "widget": {"name": "negative_prompt"}, "link": null},
-        {"label": "default_clip_strength", "name": "default_clip_strength", "type": "FLOAT", "widget": {"name": "default_clip_strength"}, "link": null},
-        {"label": "fail_on_missing_lora", "name": "fail_on_missing_lora", "type": "BOOLEAN", "widget": {"name": "fail_on_missing_lora"}, "link": null}
+        {
+          "label": "model",
+          "name": "model",
+          "type": "MODEL",
+          "link": 1
+        },
+        {
+          "label": "clip",
+          "name": "clip",
+          "type": "CLIP",
+          "link": 2
+        },
+        {
+          "label": "positive_prompt",
+          "name": "positive_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "positive_prompt"
+          },
+          "link": null
+        },
+        {
+          "label": "negative_prompt",
+          "name": "negative_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": null
+        },
+        {
+          "label": "default_clip_strength",
+          "name": "default_clip_strength",
+          "type": "FLOAT",
+          "widget": {
+            "name": "default_clip_strength"
+          },
+          "link": null
+        },
+        {
+          "label": "fail_on_missing_lora",
+          "name": "fail_on_missing_lora",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "fail_on_missing_lora"
+          },
+          "link": null
+        }
       ],
       "outputs": [
-        {"label": "model", "name": "model", "type": "MODEL", "slot_index": 0, "links": [3]},
-        {"label": "clip", "name": "clip", "type": "CLIP", "slot_index": 1, "links": []},
-        {"label": "positive", "name": "positive", "type": "CONDITIONING", "slot_index": 2, "links": [4]},
-        {"label": "negative", "name": "negative", "type": "CONDITIONING", "slot_index": 3, "links": [6]},
-        {"label": "positive_text", "name": "positive_text", "type": "STRING", "slot_index": 4, "links": []},
-        {"label": "negative_text", "name": "negative_text", "type": "STRING", "slot_index": 5, "links": []},
-        {"label": "lora_info", "name": "lora_info", "type": "STRING", "slot_index": 6, "links": []}
+        {
+          "label": "model",
+          "name": "model",
+          "type": "MODEL",
+          "slot_index": 0,
+          "links": [
+            3
+          ]
+        },
+        {
+          "label": "clip",
+          "name": "clip",
+          "type": "CLIP",
+          "slot_index": 1,
+          "links": []
+        },
+        {
+          "label": "positive",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "slot_index": 2,
+          "links": [
+            4
+          ]
+        },
+        {
+          "label": "negative",
+          "name": "negative",
+          "type": "CONDITIONING",
+          "slot_index": 3,
+          "links": [
+            6
+          ]
+        },
+        {
+          "label": "positive_text",
+          "name": "positive_text",
+          "type": "STRING",
+          "slot_index": 4,
+          "links": []
+        },
+        {
+          "label": "negative_text",
+          "name": "negative_text",
+          "type": "STRING",
+          "slot_index": 5,
+          "links": []
+        },
+        {
+          "label": "lora_info",
+          "name": "lora_info",
+          "type": "STRING",
+          "slot_index": 6,
+          "links": []
+        }
       ],
       "title": "WebUI Prompt Bridge - XL Tutorial",
-      "properties": {"Node name for S&R": "WebUIPromptBridge"},
+      "properties": {
+        "Node name for S&R": "WebUIPromptBridge"
+      },
       "widgets_values": [
         "masterpiece, best quality, score_9, score_8_up, anime style, 1girl, solo, portrait, long hair, detailed eyes, soft lighting, garden background",
         "worst quality, low quality, lowres, blurry, bad anatomy, bad hands, extra fingers, watermark, text",
@@ -62,112 +206,431 @@
     {
       "id": 3,
       "type": "EmptyLatentImage",
-      "pos": [1300, 40],
-      "size": [270, 106],
+      "pos": [
+        1300,
+        40
+      ],
+      "size": [
+        270,
+        106
+      ],
       "flags": {},
       "order": 2,
       "mode": 0,
       "inputs": [
-        {"label": "width", "name": "width", "type": "INT", "widget": {"name": "width"}, "link": null},
-        {"label": "height", "name": "height", "type": "INT", "widget": {"name": "height"}, "link": null},
-        {"label": "batch_size", "name": "batch_size", "type": "INT", "widget": {"name": "batch_size"}, "link": null}
+        {
+          "label": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "label": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        },
+        {
+          "label": "batch_size",
+          "name": "batch_size",
+          "type": "INT",
+          "widget": {
+            "name": "batch_size"
+          },
+          "link": null
+        }
       ],
-      "outputs": [{"label": "LATENT", "name": "LATENT", "type": "LATENT", "slot_index": 0, "links": [7]}],
+      "outputs": [
+        {
+          "label": "LATENT",
+          "name": "LATENT",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            7
+          ]
+        }
+      ],
       "title": "Image Size",
-      "properties": {"cnr_id": "comfy-core", "ver": "0.3.40", "Node name for S&R": "EmptyLatentImage"},
-      "widgets_values": [1024, 1024, 1]
+      "properties": {
+        "Node name for S&R": "EmptyLatentImage"
+      },
+      "widgets_values": [
+        1024,
+        1024,
+        1
+      ]
     },
     {
       "id": 4,
       "type": "KSampler",
-      "pos": [1300, 210],
-      "size": [315, 474],
+      "pos": [
+        1300,
+        210
+      ],
+      "size": [
+        315,
+        474
+      ],
       "flags": {},
       "order": 3,
       "mode": 0,
       "inputs": [
-        {"label": "model", "name": "model", "type": "MODEL", "link": 3},
-        {"label": "positive", "name": "positive", "type": "CONDITIONING", "link": 4},
-        {"label": "negative", "name": "negative", "type": "CONDITIONING", "link": 6},
-        {"label": "latent_image", "name": "latent_image", "type": "LATENT", "link": 7},
-        {"label": "seed", "name": "seed", "type": "INT", "widget": {"name": "seed"}, "link": null},
-        {"label": "steps", "name": "steps", "type": "INT", "widget": {"name": "steps"}, "link": null},
-        {"label": "cfg", "name": "cfg", "type": "FLOAT", "widget": {"name": "cfg"}, "link": null},
-        {"label": "sampler_name", "name": "sampler_name", "type": "COMBO", "widget": {"name": "sampler_name"}, "link": null},
-        {"label": "scheduler", "name": "scheduler", "type": "COMBO", "widget": {"name": "scheduler"}, "link": null},
-        {"label": "denoise", "name": "denoise", "type": "FLOAT", "widget": {"name": "denoise"}, "link": null}
+        {
+          "label": "model",
+          "name": "model",
+          "type": "MODEL",
+          "link": 3
+        },
+        {
+          "label": "positive",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 4
+        },
+        {
+          "label": "negative",
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 6
+        },
+        {
+          "label": "latent_image",
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 7
+        },
+        {
+          "label": "seed",
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        },
+        {
+          "label": "steps",
+          "name": "steps",
+          "type": "INT",
+          "widget": {
+            "name": "steps"
+          },
+          "link": null
+        },
+        {
+          "label": "cfg",
+          "name": "cfg",
+          "type": "FLOAT",
+          "widget": {
+            "name": "cfg"
+          },
+          "link": null
+        },
+        {
+          "label": "sampler_name",
+          "name": "sampler_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "sampler_name"
+          },
+          "link": null
+        },
+        {
+          "label": "scheduler",
+          "name": "scheduler",
+          "type": "COMBO",
+          "widget": {
+            "name": "scheduler"
+          },
+          "link": null
+        },
+        {
+          "label": "denoise",
+          "name": "denoise",
+          "type": "FLOAT",
+          "widget": {
+            "name": "denoise"
+          },
+          "link": null
+        }
       ],
-      "outputs": [{"label": "LATENT", "name": "LATENT", "type": "LATENT", "slot_index": 0, "links": [8]}],
+      "outputs": [
+        {
+          "label": "LATENT",
+          "name": "LATENT",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            8
+          ]
+        }
+      ],
       "title": "Sample",
-      "properties": {"cnr_id": "comfy-core", "ver": "0.3.40", "Node name for S&R": "KSampler"},
-      "widgets_values": [123456789, "randomize", 28, 5, "euler", "normal", 1]
+      "properties": {
+        "Node name for S&R": "KSampler"
+      },
+      "widgets_values": [
+        123456789,
+        "randomize",
+        28,
+        5,
+        "euler",
+        "normal",
+        1
+      ]
     },
     {
       "id": 5,
       "type": "VAEDecode",
-      "pos": [1680, 210],
-      "size": [210, 46],
+      "pos": [
+        1680,
+        210
+      ],
+      "size": [
+        210,
+        46
+      ],
       "flags": {},
       "order": 4,
       "mode": 0,
       "inputs": [
-        {"label": "samples", "name": "samples", "type": "LATENT", "link": 8},
-        {"label": "vae", "name": "vae", "type": "VAE", "link": 5}
+        {
+          "label": "samples",
+          "name": "samples",
+          "type": "LATENT",
+          "link": 8
+        },
+        {
+          "label": "vae",
+          "name": "vae",
+          "type": "VAE",
+          "link": 5
+        }
       ],
-      "outputs": [{"label": "IMAGE", "name": "IMAGE", "type": "IMAGE", "slot_index": 0, "links": [9, 10]}],
-      "properties": {"cnr_id": "comfy-core", "ver": "0.3.40", "Node name for S&R": "VAEDecode"},
+      "outputs": [
+        {
+          "label": "IMAGE",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "slot_index": 0,
+          "links": [
+            9,
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
       "widgets_values": []
     },
     {
       "id": 6,
       "type": "PreviewImage",
-      "pos": [1680, 320],
-      "size": [360, 420],
+      "pos": [
+        1680,
+        320
+      ],
+      "size": [
+        360,
+        420
+      ],
       "flags": {},
       "order": 5,
       "mode": 0,
-      "inputs": [{"label": "images", "name": "images", "type": "IMAGE", "link": 9}],
+      "inputs": [
+        {
+          "label": "images",
+          "name": "images",
+          "type": "IMAGE",
+          "link": 9
+        }
+      ],
       "outputs": [],
       "title": "Preview",
-      "properties": {"cnr_id": "comfy-core", "ver": "0.3.40", "Node name for S&R": "PreviewImage"},
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
       "widgets_values": []
     },
     {
       "id": 7,
       "type": "SaveImage",
-      "pos": [1680, 790],
-      "size": [360, 270],
+      "pos": [
+        1680,
+        790
+      ],
+      "size": [
+        360,
+        270
+      ],
       "flags": {},
       "order": 6,
       "mode": 0,
       "inputs": [
-        {"label": "images", "name": "images", "type": "IMAGE", "link": 10},
-        {"label": "filename_prefix", "name": "filename_prefix", "type": "STRING", "widget": {"name": "filename_prefix"}, "link": null}
+        {
+          "label": "images",
+          "name": "images",
+          "type": "IMAGE",
+          "link": 10
+        },
+        {
+          "label": "filename_prefix",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        }
       ],
       "outputs": [],
       "title": "Save",
-      "properties": {"cnr_id": "comfy-core", "ver": "0.3.40", "Node name for S&R": "SaveImage"},
-      "widgets_values": ["WebUIBridge_Tutorial_XL"]
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "WebUIBridge_Tutorial_XL"
+      ]
     }
   ],
   "links": [
-    [1, 1, 0, 2, 0, "MODEL"],
-    [2, 1, 1, 2, 1, "CLIP"],
-    [3, 2, 0, 4, 0, "MODEL"],
-    [4, 2, 2, 4, 1, "CONDITIONING"],
-    [5, 1, 2, 5, 1, "VAE"],
-    [6, 2, 3, 4, 2, "CONDITIONING"],
-    [7, 3, 0, 4, 3, "LATENT"],
-    [8, 4, 0, 5, 0, "LATENT"],
-    [9, 5, 0, 6, 0, "IMAGE"],
-    [10, 5, 0, 7, 0, "IMAGE"]
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "MODEL"
+    ],
+    [
+      2,
+      1,
+      1,
+      2,
+      1,
+      "CLIP"
+    ],
+    [
+      3,
+      2,
+      0,
+      4,
+      0,
+      "MODEL"
+    ],
+    [
+      4,
+      2,
+      2,
+      4,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      5,
+      1,
+      2,
+      5,
+      1,
+      "VAE"
+    ],
+    [
+      6,
+      2,
+      3,
+      4,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      7,
+      3,
+      0,
+      4,
+      3,
+      "LATENT"
+    ],
+    [
+      8,
+      4,
+      0,
+      5,
+      0,
+      "LATENT"
+    ],
+    [
+      9,
+      5,
+      0,
+      6,
+      0,
+      "IMAGE"
+    ],
+    [
+      10,
+      5,
+      0,
+      7,
+      0,
+      "IMAGE"
+    ]
   ],
   "groups": [
-    {"id": 1, "title": "1. Prompt Bridge", "bounding": [20, 0, 1230, 1120], "color": "#314d63", "flags": {}},
-    {"id": 2, "title": "2. Minimal Generate Chain", "bounding": [1260, 0, 820, 1120], "color": "#49643a", "flags": {}},
-    {"id": 3, "title": "3. XL Checkpoint", "bounding": [20, 1120, 420, 160], "color": "#584d36", "flags": {}}
+    {
+      "id": 1,
+      "title": "1. Prompt Bridge",
+      "bounding": [
+        20,
+        0,
+        1230,
+        1120
+      ],
+      "color": "#314d63",
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "2. Minimal Generate Chain",
+      "bounding": [
+        1260,
+        0,
+        820,
+        1120
+      ],
+      "color": "#49643a",
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "3. XL Checkpoint",
+      "bounding": [
+        20,
+        1120,
+        420,
+        160
+      ],
+      "color": "#584d36",
+      "flags": {}
+    }
   ],
   "config": {},
-  "extra": {"ds": {"scale": 0.64, "offset": [50, 50]}, "workflowRendererVersion": "LG"},
+  "extra": {
+    "ds": {
+      "scale": 0.64,
+      "offset": [
+        50,
+        50
+      ]
+    },
+    "workflowRendererVersion": "LG"
+  },
   "version": 0.4
 }

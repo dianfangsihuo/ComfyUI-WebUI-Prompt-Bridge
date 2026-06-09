@@ -56,8 +56,6 @@
       ],
       "title": "Anima UNET",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.11.0",
         "Node name for S&R": "UNETLoader"
       },
       "widgets_values": [
@@ -128,8 +126,6 @@
       ],
       "title": "Anima Text Encoder",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.11.0",
         "Node name for S&R": "CLIPLoader"
       },
       "widgets_values": [
@@ -180,8 +176,6 @@
       ],
       "title": "Anima VAE",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40",
         "Node name for S&R": "VAELoader"
       },
       "widgets_values": [
@@ -248,8 +242,6 @@
       ],
       "title": "Size / Batch",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40",
         "Node name for S&R": "EmptyLatentImage"
       },
       "widgets_values": [
@@ -376,8 +368,6 @@
       ],
       "title": "Anima sampler",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40",
         "Node name for S&R": "KSampler"
       },
       "widgets_values": [
@@ -435,8 +425,6 @@
         }
       ],
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40",
         "Node name for S&R": "VAEDecode"
       },
       "widgets_values": []
@@ -467,8 +455,6 @@
       "outputs": [],
       "title": "Final Preview (switchable)",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40",
         "Node name for S&R": "PreviewImage"
       },
       "widgets_values": []
@@ -509,8 +495,6 @@
       "outputs": [],
       "title": "Final Save (switchable)",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40",
         "Node name for S&R": "SaveImage"
       },
       "widgets_values": [
@@ -770,8 +754,6 @@
       ],
       "title": "HiRes latent upscale x1.5",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40",
         "Node name for S&R": "LatentUpscaleBy"
       },
       "widgets_values": [
@@ -888,8 +870,6 @@
       ],
       "title": "HiRes refiner sampler",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40",
         "Node name for S&R": "KSampler"
       },
       "widgets_values": [
@@ -945,8 +925,6 @@
       ],
       "title": "HiRes decode",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40",
         "Node name for S&R": "VAEDecode"
       },
       "widgets_values": []
@@ -2078,8 +2056,6 @@
       ],
       "title": "模型超分模型 / Select Upscale Model",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40",
         "Node name for S&R": "UpscaleModelLoader"
       },
       "widgets_values": [
@@ -2129,8 +2105,6 @@
       ],
       "title": "模型超分 / RealESRGAN or selected model",
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40",
         "Node name for S&R": "ImageUpscaleWithModel"
       },
       "widgets_values": []
@@ -10964,9 +10938,7 @@
       ],
       "title": "明显模型切换 / Select Any Checkpoint Model",
       "properties": {
-        "Node name for S&R": "CheckpointLoaderSimple",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.40"
+        "Node name for S&R": "CheckpointLoaderSimple"
       },
       "widgets_values": [
         "Qwen-Rapid-AIO-NSFW-v16.safetensors"

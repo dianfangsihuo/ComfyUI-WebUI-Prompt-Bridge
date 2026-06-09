@@ -57,7 +57,7 @@ CheckpointLoaderSimple
 默认 checkpoint 文件名：
 
 ```text
-waiNSFWIllustrious_v140.safetensors
+WAI_NSFW-illustrious-SDXL_v15.safetensors
 ```
 
 如果你的 ComfyUI 里没有这个模型，在 `XL Checkpoint` 节点或 Bridge 面板右侧的模型切换下拉里改成自己的 SDXL / Pony / Illustrious / Noob checkpoint 即可。

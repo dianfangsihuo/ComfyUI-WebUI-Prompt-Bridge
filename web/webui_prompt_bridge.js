@@ -1,6 +1,9 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
+const BRIDGE_DEBUG = window.__webuiPromptBridgeDebug = window.__webuiPromptBridgeDebug || {};
+BRIDGE_DEBUG.app = app;
+
 const TARGET_NODE = "WebUIPromptBridge";
 const PROMPT_WIDGETS = new Set([
     "positive_prompt",
@@ -15,6 +18,9 @@ const PROMPT_WIDGETS = new Set([
     "regional_common_enabled",
     "regional_base_ratio",
     "regional_strength",
+    "regional_canvas_auto",
+    "regional_canvas_width",
+    "regional_canvas_height",
 ]);
 const EXTRA_SEPARATOR = ", ";
 const ATTENTION_STEP = 0.1;
@@ -25,17 +31,43 @@ const MIN_FONT_SIZE = 10;
 const MAX_FONT_SIZE = 22;
 const WORD_DELIMITERS = ",;，；、\n\r\t";
 const DEFAULT_PANEL_WIDTH = 1180;
-const DEFAULT_PANEL_HEIGHT = 1040;
+const DEFAULT_PANEL_HEIGHT = 1180;
+const ACTION_SIDEBAR_DEFAULT_WIDTH = 400;
+const ACTION_SIDEBAR_MIN_WIDTH = 300;
+const ACTION_SIDEBAR_MAX_WIDTH = 560;
+const ACTION_SIDEBAR_PROMPT_MIN_WIDTH = 420;
 const LEGACY_PANEL_WIDTH = 1280;
 const LEGACY_PANEL_HEIGHT = 1120;
 const PANEL_MIN_WIDTH = 420;
 const PANEL_MAX_WIDTH = 100000;
 const PANEL_MIN_HEIGHT = 360;
+const PANEL_MAX_HEIGHT = 1560;
 const DOM_WIDGET_LAYOUT_PAD = 128;
 const PROMPT_CHIPS_MIN_HEIGHT = 104;
-const EXTRA_NETWORKS_MIN_HEIGHT = 72;
-const EXTRA_NETWORKS_MAX_HEIGHT = 100000;
-const LAYOUT_STORAGE_VERSION = "2026-06-05-anchored-resizable-frames";
+const EXTRA_NETWORKS_MIN_HEIGHT = 190;
+const EXTRA_NETWORKS_MAX_HEIGHT = 820;
+const EXTRA_NETWORKS_DEFAULT_VISIBLE_HEIGHT = 420;
+const DEFAULT_REGIONAL_CANVAS_WIDTH = 1024;
+const DEFAULT_REGIONAL_CANVAS_HEIGHT = 1024;
+const REGIONAL_WIDTH_ALIASES = [
+    "width",
+    "image_width",
+    "image width",
+    "latent_width",
+    "target_width",
+    "resize_width",
+    "crop_width",
+];
+const REGIONAL_HEIGHT_ALIASES = [
+    "height",
+    "image_height",
+    "image height",
+    "latent_height",
+    "target_height",
+    "resize_height",
+    "crop_height",
+];
+const LAYOUT_STORAGE_VERSION = "2026-06-10-lora-bottom-anchor-v1";
 const AIO_POSITIVE_MIN_HEIGHT = 180;
 const AIO_NEGATIVE_MIN_HEIGHT = 220;
 const DEFAULT_BRIDGE_SETTINGS = {
@@ -319,11 +351,28 @@ function resizeTargetLayoutHeight(target) {
     return target.offsetHeight || target.getBoundingClientRect?.().height || 0;
 }
 
+function resizeTargetLayoutWidth(target) {
+    if (!target) return 0;
+    return target.offsetWidth || target.getBoundingClientRect?.().width || 0;
+}
+
 function resizeTargetViewportScale(target) {
     const layoutHeight = target?.offsetHeight || 0;
     const viewportHeight = target?.getBoundingClientRect?.().height || 0;
     if (!layoutHeight || !viewportHeight) return 1;
     return viewportHeight / layoutHeight || 1;
+}
+
+function resizeTargetViewportXScale(target) {
+    const layoutWidth = target?.offsetWidth || 0;
+    const viewportWidth = target?.getBoundingClientRect?.().width || 0;
+    if (!layoutWidth || !viewportWidth) return 1;
+    return viewportWidth / layoutWidth || 1;
+}
+
+function gridColumnGap(target) {
+    const value = Number.parseFloat(getComputedStyle(target).columnGap);
+    return Number.isFinite(value) ? value : 0;
 }
 
 function setResizeTargetHeight(target, storageKey, height, { min = 48, max = 640 } = {}) {
@@ -391,8 +440,10 @@ function createHeightResizeGrip(target, storageKey, { min = 48, max = 640, title
 }
 
 function createHeightSplitGrip(beforeTarget, afterTarget, beforeKey, afterKey, options = {}) {
+    const label = String(options.label || "").trim();
     const grip = el("div", {
-        class: `webui-bridge-section-resizer webui-bridge-split-resizer${options.className ? ` ${options.className}` : ""}`,
+        class: `webui-bridge-section-resizer webui-bridge-split-resizer${label ? " has-label" : ""}${options.className ? ` ${options.className}` : ""}`,
+        "aria-label": options.title || label || "上下拖动调整两侧高度",
         title: options.title || "上下拖动调整两侧高度，双击恢复",
         ondblclick: (event) => {
             event.preventDefault();
@@ -451,12 +502,110 @@ function createHeightSplitGrip(beforeTarget, afterTarget, beforeKey, afterKey, o
             document.addEventListener("pointerup", onUp, true);
             document.addEventListener("pointercancel", onUp, true);
         },
-    });
+    }, label ? [el("span", { class: "webui-bridge-resizer-label" }, label)] : []);
     return grip;
 }
 
+function sidebarWidthMax(topRow, { min = ACTION_SIDEBAR_MIN_WIDTH, max = ACTION_SIDEBAR_MAX_WIDTH, promptMin = ACTION_SIDEBAR_PROMPT_MIN_WIDTH } = {}) {
+    const rowWidth = resizeTargetLayoutWidth(topRow);
+    const gripWidth = topRow?.__webuiBridgeSidebarGrip?.offsetWidth || 10;
+    const gaps = gridColumnGap(topRow) * 2;
+    const available = rowWidth ? rowWidth - gripWidth - gaps - promptMin : max;
+    return Math.max(min, Math.min(max, available));
+}
+
+function setSidebarWidth(topRow, storageKey, width, options = {}) {
+    if (!topRow) return;
+    const min = options.min ?? ACTION_SIDEBAR_MIN_WIDTH;
+    const max = sidebarWidthMax(topRow, options);
+    const nextWidth = clampNumber(width, min, max);
+    topRow.style.setProperty("--webui-bridge-sidebar-width", `${nextWidth}px`);
+    if (storageKey) writeLocalNumber(storageKey, nextWidth);
+}
+
+function applyStoredSidebarWidth(topRow, storageKey, options = {}) {
+    const width = readLocalNumber(storageKey, options.defaultWidth ?? ACTION_SIDEBAR_DEFAULT_WIDTH);
+    setSidebarWidth(topRow, storageKey, width, options);
+}
+
+function resetSidebarWidth(topRow, storageKey, options = {}) {
+    if (!topRow) return;
+    if (storageKey) clearLocalValue(storageKey);
+    setSidebarWidth(topRow, "", options.defaultWidth ?? ACTION_SIDEBAR_DEFAULT_WIDTH, options);
+}
+
+function startSidebarWidthDrag(handle, topRowRef, storageKey, options, event) {
+    event.preventDefault();
+    event.stopPropagation();
+    const topRow = resolveResizeValue(topRowRef);
+    if (!topRow || topRow.classList?.contains("action-collapsed")) return;
+    const startX = event.clientX;
+    const startWidth = readLocalNumber(storageKey, Number.parseFloat(getComputedStyle(topRow).getPropertyValue("--webui-bridge-sidebar-width")) || options.defaultWidth || ACTION_SIDEBAR_DEFAULT_WIDTH);
+    const viewportScale = resizeTargetViewportXScale(topRow);
+    let moved = false;
+    handle.classList.add("dragging");
+    document.body?.classList?.add("webui-bridge-resizing-sidebar");
+    handle.setPointerCapture?.(event.pointerId);
+    const onMove = (moveEvent) => {
+        const delta = (moveEvent.clientX - startX) / viewportScale;
+        if (!moved && Math.abs(delta) < 3) return;
+        moved = true;
+        setSidebarWidth(topRow, storageKey, startWidth - delta, options);
+    };
+    const onUp = () => {
+        handle.classList.remove("dragging");
+        document.body?.classList?.remove("webui-bridge-resizing-sidebar");
+        document.removeEventListener("pointermove", onMove, true);
+        document.removeEventListener("pointerup", onUp, true);
+        document.removeEventListener("pointercancel", onUp, true);
+    };
+    document.addEventListener("pointermove", onMove, true);
+    document.addEventListener("pointerup", onUp, true);
+    document.addEventListener("pointercancel", onUp, true);
+}
+
+function createSidebarWidthGrip(topRowRef, storageKey, options = {}) {
+    const grip = el("div", {
+        class: "webui-bridge-side-resizer",
+        role: "separator",
+        "aria-orientation": "vertical",
+        "aria-label": "拖动调整侧边栏宽度",
+        title: options.title || "左右拖动调整侧边栏宽度，双击恢复默认宽度",
+        ondblclick: (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            resetSidebarWidth(resolveResizeValue(topRowRef), storageKey, options);
+        },
+        onpointerdown: (event) => startSidebarWidthDrag(grip, topRowRef, storageKey, options, event),
+    }, [
+        el("span", { class: "webui-bridge-side-resizer-handle" }, [
+            el("span", { class: "webui-bridge-side-resizer-icon" }, "↔"),
+            el("span", { class: "webui-bridge-side-resizer-text" }, "拖动调宽"),
+        ]),
+    ]);
+    return grip;
+}
+
+function createSidebarWidthButton(topRowRef, storageKey, options = {}) {
+    const button = el("button", {
+        class: "webui-bridge-sidebar-width-button",
+        type: "button",
+        title: options.title || "拖动调整侧边栏宽度，双击恢复默认宽度",
+        ondblclick: (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            resetSidebarWidth(resolveResizeValue(topRowRef), storageKey, options);
+        },
+        onpointerdown: (event) => startSidebarWidthDrag(button, topRowRef, storageKey, options, event),
+    }, [
+        el("span", { class: "webui-bridge-sidebar-width-icon" }, "↔"),
+        el("span", { class: "webui-bridge-sidebar-width-text" }, "拖动调宽侧栏"),
+    ]);
+    return button;
+}
+
 function clampPanelSize(width, height) {
-    const nextHeight = Math.max(PANEL_MIN_HEIGHT, Math.round(height || DEFAULT_PANEL_HEIGHT));
+    const nextHeight = Math.min(PANEL_MAX_HEIGHT, Math.max(PANEL_MIN_HEIGHT, Math.round(height || DEFAULT_PANEL_HEIGHT)));
     const nextWidth = Math.min(PANEL_MAX_WIDTH, Math.max(PANEL_MIN_WIDTH, Math.round(width || DEFAULT_PANEL_WIDTH)));
     return [nextWidth, nextHeight];
 }
@@ -479,7 +628,7 @@ function looksLikeAutoExtendedDefaultSize(size) {
     const width = Number(size[0] || 0);
     const height = Number(size[1] || 0);
     const defaultOrRoomyWidth = width >= DEFAULT_PANEL_WIDTH - 40 && width <= 1420;
-    return defaultOrRoomyWidth && height >= 1450;
+    return height > PANEL_MAX_HEIGHT || (defaultOrRoomyWidth && height >= 1450);
 }
 
 function hideWidget(widget) {
@@ -543,6 +692,17 @@ function isBridgePanelUsable(node) {
     return Boolean((node.widgets || []).some((widget) => widget?.name === "webui_prompt_frontend" && widget.element === panel));
 }
 
+function getAppGraphSafe() {
+    if (app.rootGraph) return app.rootGraph;
+    if (app.canvas?.graph) return app.canvas.graph;
+    if (!app.canvas) return null;
+    try {
+        return app.graph || null;
+    } catch {
+        return null;
+    }
+}
+
 function scheduleBridgePanelInstall(node) {
     if (node.__webuiBridgeInstallScheduled) return;
     node.__webuiBridgeInstallScheduled = true;
@@ -552,12 +712,35 @@ function scheduleBridgePanelInstall(node) {
     });
 }
 
+function markGraphChanged(targetNode = null) {
+    const graph = getAppGraphSafe();
+    targetNode?.setDirtyCanvas?.(true, true);
+    graph?.setDirtyCanvas?.(true, true);
+    graph?.change?.();
+    app.canvas?.setDirty?.(true, true);
+    app.canvas?.setDirtyCanvas?.(true, true);
+
+    const workflowCandidates = [
+        app.extensionManager?.workflow?.activeWorkflow,
+        app.workflowManager?.activeWorkflow,
+        app.ui?.workflowManager?.activeWorkflow,
+        window.comfyAPI?.workflow?.activeWorkflow,
+    ].filter(Boolean);
+    for (const workflow of [...new Set(workflowCandidates)]) {
+        workflow.changeTracker?.captureCanvasState?.();
+        workflow.changeTracker?.checkState?.();
+    }
+    window.dispatchEvent(new CustomEvent("webui-prompt-bridge-graph-changed", {
+        detail: { nodeId: targetNode?.id ?? null },
+    }));
+}
+
 function setWidgetValue(node, name, value) {
     const widget = getWidget(node, name);
     if (!widget) return;
     widget.value = value;
     widget.callback?.(value);
-    app.graph?.setDirtyCanvas(true, true);
+    markGraphChanged(node);
 }
 
 function normalizeClipStrength(value, fallback = DEFAULT_CLIP_STRENGTH) {
@@ -580,9 +763,16 @@ function bridgeWidgetValue(node, name, fallback) {
     return value === undefined || value === null || value === "" ? fallback : value;
 }
 
+function bridgeBooleanWidgetValue(node, name, fallback = false) {
+    const value = getWidget(node, name)?.value;
+    if (value === undefined || value === null || value === "") return fallback;
+    if (typeof value === "string") return !/^(false|0|off|no)$/i.test(value.trim());
+    return Boolean(value);
+}
+
 function parseRegionalPromptParts(text = "") {
     return String(text || "")
-        .split(/\b(?:BREAK|AND|ADDCOL|ADDROW|ADDBASE|ADDCOMM)\b/i)
+        .split(/\b(?:BREAK|ADDCOL|ADDROW|ADDBASE|ADDCOMM)\b/i)
         .map((part) => part.trim())
         .filter(Boolean);
 }
@@ -609,6 +799,275 @@ function regionalPromptRegionCount(text = "", baseEnabled = false, commonEnabled
     if (commonEnabled || /\bADDCOMM\b/i.test(source)) offset += 1;
     if (baseEnabled || /\bADDBASE\b/i.test(source)) offset += 1;
     return Math.max(0, parts.length - offset);
+}
+
+function normalizeRegionalCanvasDimension(value, fallback) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return fallback;
+    return Math.min(16384, Math.max(64, Math.round(numeric)));
+}
+
+function normalizeRegionalCanvasSize(width, height, fallbackWidth = DEFAULT_REGIONAL_CANVAS_WIDTH, fallbackHeight = DEFAULT_REGIONAL_CANVAS_HEIGHT) {
+    return {
+        width: normalizeRegionalCanvasDimension(width, fallbackWidth),
+        height: normalizeRegionalCanvasDimension(height, fallbackHeight),
+    };
+}
+
+function compactKey(value) {
+    return String(value || "").replace(/[\s_\-]+/g, "").toLowerCase();
+}
+
+function widgetValueByAliases(graphNode, aliases) {
+    const wanted = new Set(aliases.map(compactKey));
+    for (const widget of graphNode?.widgets || []) {
+        const keys = [widget?.name, widget?.label, widget?.displayName, widget?.options?.name].map(compactKey);
+        if (keys.some((key) => wanted.has(key))) return widget.value;
+    }
+    return undefined;
+}
+
+function widgetByAliases(graphNode, aliases) {
+    const wanted = new Set(aliases.map(compactKey));
+    for (const widget of graphNode?.widgets || []) {
+        const keys = [widget?.name, widget?.label, widget?.displayName, widget?.options?.name].map(compactKey);
+        if (keys.some((key) => wanted.has(key))) return widget;
+    }
+    return null;
+}
+
+function parseSizeText(value) {
+    const match = String(value ?? "").match(/\b(\d{2,5})\s*[xX×*]\s*(\d{2,5})\b/);
+    if (!match) return null;
+    const width = Number(match[1]);
+    const height = Number(match[2]);
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+    if (width < 64 || height < 64 || width > 16384 || height > 16384) return null;
+    return { width: Math.round(width), height: Math.round(height) };
+}
+
+function regionalNodeLabel(graphNode) {
+    return String(graphNode?.title || graphNode?.type || `Node ${graphNode?.id ?? ""}`).trim();
+}
+
+function regionalCanvasSizeFromWidgets(graphNode) {
+    const width = widgetValueByAliases(graphNode, REGIONAL_WIDTH_ALIASES);
+    const height = widgetValueByAliases(graphNode, REGIONAL_HEIGHT_ALIASES);
+    if (width !== undefined && height !== undefined) {
+        const size = normalizeRegionalCanvasSize(width, height, null, null);
+        if (size.width && size.height) return { ...size, source: regionalNodeLabel(graphNode) };
+    }
+    for (const text of [
+        graphNode?.title,
+        graphNode?.type,
+        graphNode?.properties?.["Node name for S&R"],
+        ...(graphNode?.widgets || []).map((widget) => widget?.value),
+    ]) {
+        const parsed = parseSizeText(text);
+        if (parsed) return { ...parsed, source: regionalNodeLabel(graphNode) };
+    }
+    return null;
+}
+
+function regionalCanvasWritableTarget(graphNode) {
+    const widthWidget = widgetByAliases(graphNode, REGIONAL_WIDTH_ALIASES);
+    const heightWidget = widgetByAliases(graphNode, REGIONAL_HEIGHT_ALIASES);
+    if (!widthWidget || !heightWidget) return null;
+    return {
+        node: graphNode,
+        widthWidget,
+        heightWidget,
+        source: regionalNodeLabel(graphNode),
+    };
+}
+
+function regionalCanvasSizeFromImagePreview(graphNode) {
+    const images = [
+        ...(Array.isArray(graphNode?.imgs) ? graphNode.imgs : []),
+        graphNode?.img,
+        graphNode?.image,
+        graphNode?.preview,
+    ].filter(Boolean);
+    for (const image of images) {
+        const width = image.naturalWidth || image.videoWidth || image.width;
+        const height = image.naturalHeight || image.videoHeight || image.height;
+        if (Number.isFinite(width) && Number.isFinite(height) && width >= 64 && height >= 64) {
+            return { width: Math.round(width), height: Math.round(height), source: regionalNodeLabel(graphNode) };
+        }
+    }
+    return null;
+}
+
+function linkedSourceNode(targetNode, inputSlot) {
+    const link = getGraphLink(targetNode?.inputs?.[inputSlot]?.link);
+    return getGraphNodeById(linkOriginId(link));
+}
+
+function sortedRegionalSizeInputs(graphNode) {
+    return [...(graphNode?.inputs || [])]
+        .map((input, slot) => ({ input, slot }))
+        .filter(({ input }) => input?.link !== undefined && input?.link !== null)
+        .sort((a, b) => {
+            const score = (entry) => {
+                const name = `${entry.input?.name || ""} ${entry.input?.label || ""}`.toLowerCase();
+                const type = String(entry.input?.type || "").toUpperCase();
+                if (name.includes("latent") || name.includes("samples") || type === "LATENT") return 0;
+                if (name.includes("image") || type === "IMAGE") return 1;
+                return 2;
+            };
+            return score(a) - score(b);
+        });
+}
+
+function resolveRegionalCanvasSizeFromNode(graphNode, depth = 5, visited = new Set()) {
+    if (!graphNode || depth < 0 || visited.has(graphNode.id)) return null;
+    visited.add(graphNode.id);
+    const direct = regionalCanvasSizeFromWidgets(graphNode) || regionalCanvasSizeFromImagePreview(graphNode);
+    if (direct) return direct;
+    for (const { slot } of sortedRegionalSizeInputs(graphNode)) {
+        const found = resolveRegionalCanvasSizeFromNode(linkedSourceNode(graphNode, slot), depth - 1, visited);
+        if (found) return found;
+    }
+    return null;
+}
+
+function resolveRegionalCanvasTargetFromNode(graphNode, depth = 5, visited = new Set()) {
+    if (!graphNode || depth < 0 || visited.has(graphNode.id)) return null;
+    visited.add(graphNode.id);
+    const direct = regionalCanvasWritableTarget(graphNode);
+    if (direct) return direct;
+    for (const { slot } of sortedRegionalSizeInputs(graphNode)) {
+        const found = resolveRegionalCanvasTargetFromNode(linkedSourceNode(graphNode, slot), depth - 1, visited);
+        if (found) return found;
+    }
+    return null;
+}
+
+function collectRegionalDownstreamNodes(sourceNode, maxDepth = 5) {
+    const found = [];
+    const queue = [{ node: sourceNode, depth: 0 }];
+    const seen = new Set([sourceNode?.id]);
+    while (queue.length) {
+        const { node: current, depth } = queue.shift();
+        if (!current || depth >= maxDepth) continue;
+        for (const output of current.outputs || []) {
+            for (const linkId of output.links || []) {
+                const link = getGraphLink(linkId);
+                const target = getGraphNodeById(linkTargetId(link));
+                if (!target || seen.has(target.id)) continue;
+                seen.add(target.id);
+                found.push(target);
+                queue.push({ node: target, depth: depth + 1 });
+            }
+        }
+    }
+    return found;
+}
+
+function looksLikeSamplerNode(graphNode) {
+    const text = `${graphNode?.type || ""} ${graphNode?.title || ""}`.toLowerCase();
+    const hasLatentInput = (graphNode?.inputs || []).some((input) => {
+        const name = String(input?.name || input?.label || "").toLowerCase();
+        const type = String(input?.type || "").toUpperCase();
+        return type === "LATENT" && /latent|sample/.test(name);
+    });
+    return hasLatentInput && (/sampler|sample|ksampler/.test(text) || (graphNode?.inputs || []).some((input) => /positive|negative/i.test(input?.name || "")));
+}
+
+function regionalSamplerLatentInputSlot(graphNode) {
+    const preferred = ["latent_image", "latent", "samples"];
+    for (const name of preferred) {
+        const slot = findInputSlot(graphNode, name);
+        if (slot >= 0) return slot;
+    }
+    return (graphNode?.inputs || []).findIndex((input) => String(input?.type || "").toUpperCase() === "LATENT");
+}
+
+function detectRegionalCanvasSizeFromGraph(bridgeNode) {
+    const downstream = collectRegionalDownstreamNodes(bridgeNode, 6);
+    for (const sampler of downstream.filter(looksLikeSamplerNode)) {
+        const slot = regionalSamplerLatentInputSlot(sampler);
+        const size = resolveRegionalCanvasSizeFromNode(linkedSourceNode(sampler, slot), 6);
+        if (size) return { ...size, source: `${size.source} -> ${regionalNodeLabel(sampler)}` };
+    }
+    for (const candidate of downstream) {
+        const size = resolveRegionalCanvasSizeFromNode(candidate, 2);
+        if (size) return size;
+    }
+    for (const candidate of getGraphNodes()) {
+        const text = `${candidate?.type || ""} ${candidate?.title || ""}`.toLowerCase();
+        if (!/latent|image|resize|scale|load/.test(text)) continue;
+        const size = resolveRegionalCanvasSizeFromNode(candidate, 1);
+        if (size) return size;
+    }
+    return null;
+}
+
+function detectRegionalCanvasTargetFromGraph(bridgeNode) {
+    const downstream = collectRegionalDownstreamNodes(bridgeNode, 6);
+    for (const sampler of downstream.filter(looksLikeSamplerNode)) {
+        const slot = regionalSamplerLatentInputSlot(sampler);
+        const target = resolveRegionalCanvasTargetFromNode(linkedSourceNode(sampler, slot), 6);
+        if (target) return { ...target, source: `${target.source} -> ${regionalNodeLabel(sampler)}` };
+    }
+    for (const candidate of downstream) {
+        const target = resolveRegionalCanvasTargetFromNode(candidate, 2);
+        if (target) return target;
+    }
+    for (const candidate of getGraphNodes()) {
+        const text = `${candidate?.type || ""} ${candidate?.title || ""}`.toLowerCase();
+        if (!/latent|image|resize|scale|load/.test(text)) continue;
+        const target = resolveRegionalCanvasTargetFromNode(candidate, 1);
+        if (target) return target;
+    }
+    return null;
+}
+
+function setGraphNodeWidgetObjectValue(graphNode, widget, value) {
+    if (!graphNode || !widget || value === undefined || value === null || value === "") return false;
+    let nextValue = value;
+    if (typeof widget.value === "number") {
+        nextValue = Number(value);
+        if (!Number.isFinite(nextValue)) return false;
+        if (Number.isInteger(widget.value)) nextValue = Math.round(nextValue);
+    }
+    widget.value = nextValue;
+    widget.callback?.(nextValue);
+    graphNode.setDirtyCanvas?.(true, true);
+    markGraphChanged(graphNode);
+    return true;
+}
+
+function applyRegionalCanvasSizeToGraph(bridgeNode, width, height) {
+    const size = normalizeRegionalCanvasSize(width, height);
+    const target = detectRegionalCanvasTargetFromGraph(bridgeNode);
+    if (!target) {
+        return {
+            ok: false,
+            width: size.width,
+            height: size.height,
+            message: "未找到可写入宽高的 Image Size / Resize 节点",
+        };
+    }
+    const widthOk = setGraphNodeWidgetObjectValue(target.node, target.widthWidget, size.width);
+    const heightOk = setGraphNodeWidgetObjectValue(target.node, target.heightWidget, size.height);
+    return {
+        ok: widthOk && heightOk,
+        width: size.width,
+        height: size.height,
+        source: target.source,
+        message: widthOk && heightOk
+            ? `已同步尺寸到 ${target.source}`
+            : `找到 ${target.source}，但宽高写入失败`,
+    };
+}
+
+function regionalPreviewLayoutRows(rows, split) {
+    const grid = split === "grid";
+    if (grid) return rows.map((row) => ({ values: row, weight: row.reduce((sum, value) => sum + value, 0) || 1 }));
+    const row = rows[0] || [1, 1];
+    if (split === "horizontal") return row.map((value) => ({ values: [1], weight: value }));
+    return [{ values: row, weight: 1 }];
 }
 
 function resolvePanelFontMetrics(value) {
@@ -1766,11 +2225,259 @@ async function loadBridgeData(options = {}) {
 }
 
 function getGraphNodes() {
-    return app.graph?._nodes || [];
+    return getAppGraphSafe()?._nodes || [];
 }
 
 function getGraphNodeById(id) {
-    return app.graph?.getNodeById?.(id) || getGraphNodes().find((graphNode) => String(graphNode.id) === String(id));
+    return getAppGraphSafe()?.getNodeById?.(id) || getGraphNodes().find((graphNode) => String(graphNode.id) === String(id));
+}
+
+function repairComfyCorePackageMetadata() {
+    let changed = 0;
+    for (const graphNode of getGraphNodes()) {
+        const properties = graphNode?.properties;
+        if (!properties || String(properties.cnr_id || "") !== "comfy-core") continue;
+        delete properties.cnr_id;
+        delete properties.ver;
+        changed += 1;
+    }
+    if (changed) markGraphChanged();
+    return changed;
+}
+
+function isComfyCoreMissingNodeWarning(item) {
+    if (!item || typeof item === "string") return false;
+    return String(item.cnrId || item.cnr_id || "") === "comfy-core";
+}
+
+function getNodeCnrId(graphNode) {
+    const properties = graphNode?.properties || graphNode?.last_serialization?.properties;
+    return String(properties?.cnrId || properties?.cnr_id || "");
+}
+
+function filterComfyCoreMissingNodeWarnings(missingNodes) {
+    if (!Array.isArray(missingNodes)) return 0;
+    let writeIndex = 0;
+    let changed = 0;
+    for (const item of missingNodes) {
+        if (isComfyCoreMissingNodeWarning(item)) {
+            changed += 1;
+            continue;
+        }
+        missingNodes[writeIndex] = item;
+        writeIndex += 1;
+    }
+    if (changed) missingNodes.length = writeIndex;
+    return changed;
+}
+
+function pageShowsMissingNodeWarning() {
+    const text = document.body?.innerText || "";
+    return /缺失节点包|部分节点缺失|Missing Node Packs|comfy-core/i.test(text);
+}
+
+function isNodeMutedOrBypassed(graphNode) {
+    const mode = Number(graphNode?.mode);
+    return mode === 2 || mode === 4;
+}
+
+function graphNodeLooksRegistered(graphNode, originalType, registered) {
+    if (!originalType) return true;
+    if (originalType in registered) return true;
+    const constructor = graphNode?.constructor || {};
+    const nodeData = constructor.nodeData || {};
+    const constructorTypes = [
+        constructor.comfyClass,
+        constructor.type,
+        nodeData.name,
+        nodeData.display_name,
+    ].map((value) => String(value || ""));
+    if (constructorTypes.includes(originalType)) return true;
+    for (const registeredNode of Object.values(registered || {})) {
+        const registeredData = registeredNode?.nodeData || {};
+        const registeredTypes = [
+            registeredNode?.comfyClass,
+            registeredNode?.type,
+            registeredData.name,
+            registeredData.display_name,
+        ].map((value) => String(value || ""));
+        if (registeredTypes.includes(originalType)) return true;
+    }
+    return false;
+}
+
+function liveGraphMissingNodeWarnings() {
+    const registered = window.LiteGraph?.registered_node_types || {};
+    const warnings = [];
+    const visit = (graph, prefix = "") => {
+        const nodes = graph?._nodes || graph?.nodes || [];
+        for (const graphNode of nodes) {
+            if (!graphNode || isNodeMutedOrBypassed(graphNode)) continue;
+            const originalType = String(graphNode.last_serialization?.type || graphNode.type || "");
+            if (originalType && !graphNodeLooksRegistered(graphNode, originalType, registered)) {
+                const nodeId = prefix ? `${prefix}:${graphNode.id}` : String(graphNode.id);
+                warnings.push({
+                    type: originalType,
+                    nodeId,
+                    cnrId: getNodeCnrId(graphNode),
+                    liveType: String(graphNode.type || ""),
+                    constructorName: String(graphNode.constructor?.name || ""),
+                    constructorComfyClass: String(graphNode.constructor?.comfyClass || ""),
+                    constructorType: String(graphNode.constructor?.type || ""),
+                    nodeDataName: String(graphNode.constructor?.nodeData?.name || ""),
+                    nodeDataDisplayName: String(graphNode.constructor?.nodeData?.display_name || ""),
+                    registeredCount: Object.keys(registered).length,
+                });
+            }
+            const subgraph = graphNode.subgraph;
+            if (subgraph) {
+                const nextPrefix = prefix ? `${prefix}:${graphNode.id}` : String(graphNode.id);
+                visit(subgraph, nextPrefix);
+            }
+        }
+    };
+    visit(getAppGraphSafe());
+    return warnings;
+}
+
+function getDialogServiceModuleUrls() {
+    const urls = [];
+    const addUrl = (value) => {
+        if (!value) return;
+        const absolute = new URL(value, window.location.href).href;
+        if (!/\/assets\/dialogService-[^/]+\.js(?:$|\?)/.test(absolute)) return;
+        if (!urls.includes(absolute)) urls.push(absolute);
+    };
+    document.querySelectorAll('link[rel="modulepreload"], script[type="module"]').forEach((element) => {
+        addUrl(element.getAttribute("href") || element.getAttribute("src"));
+    });
+    return urls;
+}
+
+async function loadComfyWorkflowService() {
+    if (BRIDGE_DEBUG.workflowServicePromise) return BRIDGE_DEBUG.workflowServicePromise;
+    BRIDGE_DEBUG.workflowServicePromise = (async () => {
+        const urls = getDialogServiceModuleUrls();
+        BRIDGE_DEBUG.workflowServiceUrls = urls;
+        for (const url of urls) {
+            try {
+                const module = await import(url);
+                const useWorkflowService = module.useWorkflowService || module.K;
+                if (typeof useWorkflowService === "function") return useWorkflowService();
+            } catch (error) {
+                console.debug("[WebUI Prompt Bridge] Failed to import ComfyUI workflow service", url, error);
+            }
+        }
+        return null;
+    })();
+    return BRIDGE_DEBUG.workflowServicePromise;
+}
+
+async function clearStaleMissingNodeWarningIfGraphClean(reason = "scheduled") {
+    const visibleWarning = pageShowsMissingNodeWarning();
+    if (!visibleWarning) {
+        BRIDGE_DEBUG.lastMissingNodeClear = { reason, cleared: false, liveWarnings: [], visibleWarning: false, skipped: true };
+        return true;
+    }
+    let liveWarnings = [];
+    try {
+        liveWarnings = liveGraphMissingNodeWarnings();
+    } catch (error) {
+        BRIDGE_DEBUG.lastMissingNodeClear = { reason, cleared: false, graphUnavailable: true, error: String(error?.message || error) };
+        return false;
+    }
+    const realWarnings = liveWarnings.filter((item) => !isComfyCoreMissingNodeWarning(item));
+    if (realWarnings.length) {
+        BRIDGE_DEBUG.lastMissingNodeClear = { reason, cleared: false, liveWarnings, realWarnings };
+        console.warn("[WebUI Prompt Bridge] Missing-node warning preserved; live graph still has missing nodes", JSON.stringify(BRIDGE_DEBUG.lastMissingNodeClear));
+        return false;
+    }
+    const workflowService = await loadComfyWorkflowService();
+    if (typeof workflowService?.showPendingWarnings !== "function") {
+        BRIDGE_DEBUG.lastMissingNodeClear = { reason, cleared: false, liveWarnings, serviceMissing: true };
+        console.warn("[WebUI Prompt Bridge] Missing-node warning clear skipped; workflow service not found", BRIDGE_DEBUG.lastMissingNodeClear);
+        return false;
+    }
+    workflowService.showPendingWarnings({ pendingWarnings: null }, { silent: true });
+    BRIDGE_DEBUG.lastMissingNodeClear = { reason, cleared: true, liveWarnings };
+    return true;
+}
+
+function scheduleStaleMissingNodeWarningClear(reason = "scheduled") {
+    window.setTimeout(() => clearStaleMissingNodeWarningIfGraphClean(reason), 700);
+    window.setTimeout(() => clearStaleMissingNodeWarningIfGraphClean(reason), 1800);
+    window.setTimeout(() => clearStaleMissingNodeWarningIfGraphClean(reason), 3600);
+}
+
+function sanitizeComfyCorePackageMetadataInWorkflowData(data) {
+    if (!data || typeof data !== "object") return 0;
+    let changed = 0;
+    const cleanNodes = (nodes) => {
+        if (!Array.isArray(nodes)) return;
+        for (const nodeData of nodes) {
+            const properties = nodeData?.properties;
+            if (!properties || String(properties.cnr_id || "") !== "comfy-core") continue;
+            delete properties.cnr_id;
+            delete properties.ver;
+            changed += 1;
+        }
+    };
+    cleanNodes(data.nodes);
+    for (const subgraph of data.definitions?.subgraphs || []) {
+        cleanNodes(subgraph?.nodes);
+    }
+    return changed;
+}
+
+async function repairComfyCorePackageMetadataAndReload() {
+    if (app.__webuiBridgeComfyCoreReloadDone || typeof app.loadGraphData !== "function") return 0;
+    const changed = repairComfyCorePackageMetadata();
+    if (!changed) return 0;
+    const graphData = safeGraphSerialization();
+    if (!graphData || graphData.error || !Array.isArray(graphData.nodes)) return changed;
+    sanitizeComfyCorePackageMetadataInWorkflowData(graphData);
+    app.__webuiBridgeComfyCoreReloadDone = true;
+    try {
+        await app.loadGraphData(graphData, true, true, undefined, {
+            checkForRerouteMigration: false,
+            silentAssetErrors: true,
+            skipAssetScans: true,
+        });
+    } catch (error) {
+        console.warn("[WebUI Prompt Bridge] Failed to reload repaired comfy-core workflow metadata", error);
+    }
+    return changed;
+}
+
+function scheduleComfyCorePackageMetadataRepair() {
+    window.setTimeout(repairComfyCorePackageMetadataAndReload, 500);
+    window.setTimeout(repairComfyCorePackageMetadataAndReload, 1500);
+    window.setTimeout(repairComfyCorePackageMetadataAndReload, 3000);
+}
+
+function installWorkflowLoadSanitizer() {
+    if (app.__webuiBridgeWorkflowLoadSanitizerInstalled) return;
+    app.__webuiBridgeWorkflowLoadSanitizerInstalled = true;
+    if (typeof app.loadGraphData === "function") {
+        const originalLoadGraphData = app.loadGraphData.bind(app);
+        app.loadGraphData = async function (graphData, ...args) {
+            sanitizeComfyCorePackageMetadataInWorkflowData(graphData);
+            return originalLoadGraphData(graphData, ...args);
+        };
+    }
+    const installGraphConfigurePatch = () => {
+        const prototype = window.LGraph?.prototype;
+        if (!prototype || prototype.__webuiBridgeWorkflowLoadSanitizerInstalled || typeof prototype.configure !== "function") return;
+        const originalConfigure = prototype.configure;
+        prototype.configure = function (graphData, ...args) {
+            sanitizeComfyCorePackageMetadataInWorkflowData(graphData);
+            return originalConfigure.call(this, graphData, ...args);
+        };
+        prototype.__webuiBridgeWorkflowLoadSanitizerInstalled = true;
+    };
+    installGraphConfigurePatch();
+    window.setTimeout(installGraphConfigurePatch, 0);
+    window.setTimeout(installGraphConfigurePatch, 500);
 }
 
 function getGraphLink(linkId) {
@@ -2281,8 +2988,7 @@ function setNodeWidgetValue(targetNode, widgetName, value) {
     }
     widget.value = nextValue;
     widget.callback?.(nextValue);
-    targetNode.setDirtyCanvas?.(true, true);
-    app.graph?.setDirtyCanvas(true, true);
+    markGraphChanged(targetNode);
     return true;
 }
 
@@ -2306,6 +3012,22 @@ function findFirstNode(types) {
 
 function findCheckpointLoaderNodes() {
     return getGraphNodes().filter((graphNode) => graphNode.type === "CheckpointLoaderSimple");
+}
+
+function checkpointWidgetLooksLikeCheckpoint(graphNode, widget) {
+    const widgetName = String(widget?.name || "").toLowerCase();
+    const nodeText = `${graphNode?.type || ""} ${graphNode?.title || ""} ${graphNode?.properties?.["Node name for S&R"] || ""}`.toLowerCase();
+    return widgetName === "ckpt_name" || (widgetName.includes("ckpt") && /checkpoint/.test(nodeText));
+}
+
+function findCheckpointWidgetTargets() {
+    const targets = [];
+    for (const graphNode of getGraphNodes()) {
+        for (const widget of graphNode.widgets || []) {
+            if (checkpointWidgetLooksLikeCheckpoint(graphNode, widget)) targets.push({ graphNode, widget });
+        }
+    }
+    return targets;
 }
 
 function findBridgeNodes() {
@@ -2580,7 +3302,7 @@ function findDirectCheckpointLoader() {
     ];
     app.graph.add(loader);
     state.checkpointNodeId = loader.id;
-    app.graph.setDirtyCanvas(true, true);
+    markGraphChanged(loader);
     return loader;
 }
 
@@ -2603,13 +3325,15 @@ function findVaeTargetsForDirectSwitch() {
     return targets;
 }
 
-function applyDirectCheckpointModel(modelName) {
+function applyDirectCheckpointModel(modelName, models = {}) {
     const loader = findDirectCheckpointLoader();
     if (!loader) return { changed: false, message: "未找到也无法创建 CheckpointLoaderSimple" };
     const modelChanged = setNodeWidgetValue(loader, "ckpt_name", modelName);
     const state = directSwitchState();
     state.checkpointNodeId = loader.id;
     let changed = modelChanged ? 1 : 0;
+    const syncedMissing = syncMissingCheckpointLoadersToModel(modelName, { models, skipNodeId: loader.id });
+    changed += syncedMissing;
     for (const bridgeNode of findBridgeNodes()) {
         for (const [inputName, outputName] of [["model", "MODEL"], ["clip", "CLIP"]]) {
             const inputSlot = findInputSlot(bridgeNode, inputName);
@@ -2624,7 +3348,7 @@ function applyDirectCheckpointModel(modelName) {
     }
     return {
         changed: changed > 0,
-        message: `已直接切换到整合模型: ${modelName}`,
+        message: `已直接切换到整合模型: ${modelName}${syncedMissing ? `；已同步 ${syncedMissing} 个缺失 CheckpointLoader` : ""}`,
     };
 }
 
@@ -2660,14 +3384,168 @@ function collectCheckpointOptions(models = {}) {
         seen.add(text);
         options.push(text);
     };
-    for (const checkpoint of models.checkpoints || []) add(checkpoint);
-    for (const loader of findCheckpointLoaderNodes()) {
-        const widget = getWidget(loader, "ckpt_name");
+    const checkpointList = (models.checkpoints || []).map((checkpoint) => String(checkpoint || "").trim()).filter(Boolean);
+    const checkpointKeys = new Set();
+    for (const checkpoint of checkpointList) {
+        add(checkpoint);
+        addCheckpointLookupKeys(checkpointKeys, checkpoint);
+    }
+    for (const { widget } of findCheckpointWidgetTargets()) {
+        if (checkpointList.length) {
+            if (checkpointLookupHas(checkpointKeys, widget?.value)) add(widget?.value);
+            continue;
+        }
         for (const value of widget?.options?.values || []) add(value);
         add(widget?.value);
     }
     return options;
 }
+
+function checkpointLookupKeys(value) {
+    const text = String(value || "").trim().replace(/\\/g, "/");
+    if (!text) return [];
+    const lower = text.toLowerCase();
+    const base = lower.split("/").pop();
+    return [...new Set([lower, base].filter(Boolean))];
+}
+
+function addCheckpointLookupKeys(target, value) {
+    for (const key of checkpointLookupKeys(value)) target.add(key);
+}
+
+function checkpointLookupHas(target, value) {
+    return checkpointLookupKeys(value).some((key) => target.has(key));
+}
+
+function checkpointNamesMatch(left, right) {
+    if (!left || !right) return false;
+    const rightKeys = new Set(checkpointLookupKeys(right));
+    return checkpointLookupKeys(left).some((key) => rightKeys.has(key));
+}
+
+function availableCheckpointLookupKeys(models = {}) {
+    const keys = new Set();
+    const checkpointList = (models.checkpoints || []).map((checkpoint) => String(checkpoint || "").trim()).filter(Boolean);
+    for (const checkpoint of checkpointList) addCheckpointLookupKeys(keys, checkpoint);
+    if (checkpointList.length) return keys;
+    for (const { widget } of findCheckpointWidgetTargets()) {
+        for (const value of widget?.options?.values || []) addCheckpointLookupKeys(keys, value);
+    }
+    return keys;
+}
+
+function syncMissingCheckpointLoadersToModel(modelName, options = {}) {
+    const selected = String(modelName || "").trim();
+    const available = availableCheckpointLookupKeys(options.models || {});
+    if (!selected || !available.size || !checkpointLookupHas(available, selected)) return 0;
+    let changed = 0;
+    for (const { graphNode, widget } of findCheckpointWidgetTargets()) {
+        if (String(graphNode.id) === String(options.skipNodeId || "")) continue;
+        const current = String(widget?.value || "").trim();
+        if (!current || checkpointNamesMatch(current, selected) || checkpointLookupHas(available, current)) continue;
+        if (setGraphNodeWidgetObjectValue(graphNode, widget, selected)) changed += 1;
+    }
+    if (changed) markGraphChanged();
+    return changed;
+}
+
+function scheduleMissingModelRefresh(reason = "checkpoint-sync") {
+    window.clearTimeout(BRIDGE_DEBUG.missingModelRefreshTimer);
+    BRIDGE_DEBUG.missingModelRefreshTimer = window.setTimeout(async () => {
+        if (typeof app.refreshMissingModels !== "function") return;
+        try {
+            BRIDGE_DEBUG.lastMissingModelRefresh = {
+                reason,
+                result: await app.refreshMissingModels({ silent: true }),
+            };
+        } catch (error) {
+            BRIDGE_DEBUG.lastMissingModelRefresh = { reason, error: String(error?.message || error) };
+            console.warn("[WebUI Prompt Bridge] Missing-model refresh failed", BRIDGE_DEBUG.lastMissingModelRefresh);
+        }
+    }, 400);
+}
+
+function safeGraphSerialization() {
+    try {
+        const graph = getAppGraphSafe();
+        return graph?.serialize?.() || graph?.asSerialisable?.() || graph?.asSerializable?.() || null;
+    } catch (error) {
+        return { error: String(error?.message || error) };
+    }
+}
+
+function collectTextHits(value, needle, path = "$", hits = [], seen = new Set()) {
+    if (!needle || hits.length >= 200 || value === undefined || value === null) return hits;
+    const lowerNeedle = String(needle).toLowerCase();
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        const text = String(value);
+        if (text.toLowerCase().includes(lowerNeedle)) hits.push({ path, value: text.slice(0, 500) });
+        return hits;
+    }
+    if (typeof value !== "object" || seen.has(value)) return hits;
+    seen.add(value);
+    if (Array.isArray(value)) {
+        value.forEach((item, index) => collectTextHits(item, needle, `${path}[${index}]`, hits, seen));
+        return hits;
+    }
+    for (const [key, item] of Object.entries(value)) {
+        collectTextHits(item, needle, `${path}.${key}`, hits, seen);
+    }
+    return hits;
+}
+
+function checkpointWidgetDebugRows(models = {}) {
+    const available = availableCheckpointLookupKeys(models);
+    return findCheckpointWidgetTargets().map(({ graphNode, widget }) => ({
+        id: graphNode.id,
+        type: graphNode.type,
+        title: graphNode.title,
+        widget: widget.name,
+        value: widget.value,
+        valid: checkpointLookupHas(available, widget.value),
+        optionCount: widget.options?.values?.length || 0,
+    }));
+}
+
+function visibleMissingModelText() {
+    const text = document.body?.innerText || "";
+    const markers = ["缺失模型", "Missing Models", "missing model", "v1-5", "v1_5"];
+    const hits = [];
+    for (const marker of markers) {
+        const index = text.toLowerCase().indexOf(marker.toLowerCase());
+        if (index >= 0) hits.push(text.slice(Math.max(0, index - 120), index + 260));
+    }
+    return [...new Set(hits)];
+}
+
+function installBridgeDebugHelpers() {
+    Object.assign(BRIDGE_DEBUG, {
+        app,
+        markGraphChanged,
+        checkpointWidgets: () => checkpointWidgetDebugRows(BRIDGE_DEBUG.models || {}),
+        checkpointLoaders: () => findCheckpointLoaderNodes().map((graphNode) => ({
+            id: graphNode.id,
+            type: graphNode.type,
+            title: graphNode.title,
+            value: getNodeWidgetValue(graphNode, "ckpt_name"),
+        })),
+        currentCheckpointName,
+        graphHits: (needle = "v1-5") => collectTextHits(safeGraphSerialization(), needle),
+        graphSerialization: safeGraphSerialization,
+        visibleMissingModelText,
+        repairComfyCorePackageMetadata,
+        liveGraphMissingNodeWarnings,
+        clearStaleMissingNodeWarningIfGraphClean,
+        syncMissingTo: (modelName = currentCheckpointName()) => {
+            const changed = syncMissingCheckpointLoadersToModel(modelName, { models: BRIDGE_DEBUG.models || {} });
+            markGraphChanged();
+            if (changed) scheduleMissingModelRefresh("debug-syncMissingTo");
+            return { changed, modelName, checkpointWidgets: checkpointWidgetDebugRows(BRIDGE_DEBUG.models || {}) };
+        },
+    });
+}
+
+installBridgeDebugHelpers();
 
 function currentCheckpointName() {
     const loader = findBridgeNodes()
@@ -2698,11 +3576,11 @@ function isSplitModelMode() {
     return currentModelMode();
 }
 
-function applyCheckpointModel(name) {
+function applyCheckpointModel(name, models = {}) {
     const modelName = String(name || "").trim();
     if (!modelName) return { changed: false, message: "请选择模型" };
     const switchNode = findModelModeSwitchNode();
-    if (!switchNode) return applyDirectCheckpointModel(modelName);
+    if (!switchNode) return applyDirectCheckpointModel(modelName, models);
     const loaders = findCheckpointLoaderNodes();
     if (!loaders.length) return { changed: false, message: "未找到 CheckpointLoaderSimple" };
     let changed = 0;
@@ -3628,20 +4506,20 @@ function createPromptRow(label, value, placeholder, onFocus, onInput, options = 
         prompts?.classList.toggle("negative-collapsed", collapsed);
         applyTopRowCollapsedState(prompts?.closest(".webui-bridge-toprow"), collapsed);
         if (row) row.style.maxHeight = collapsed ? "42px" : "";
-        if (collapseButton) collapseButton.textContent = collapsed ? "展开" : "折叠";
+        if (collapseButton) collapseButton.textContent = collapsed ? "展开反向" : "折叠反向";
         for (const part of [textarea, chips, textChipGrip, chipBottomGrip, counter]) {
             if (part) part.style.display = collapsed ? "none" : "";
         }
     };
     if (options.collapsible) {
         collapseButton = el("button", {
-            class: "webui-bridge-prompt-label-btn",
+            class: "webui-bridge-prompt-label-btn webui-bridge-collapse-btn",
             title: "折叠/展开这个提示词区域",
             onclick: () => {
                 applyCollapsedState(!collapsed);
                 writeLocalBoolean(collapseKey, collapsed);
             },
-        }, collapsed ? "展开" : "折叠");
+        }, collapsed ? "展开反向" : "折叠反向");
         labelTools.unshift(collapseButton);
     }
     textChipGrip = createHeightSplitGrip(textarea, chips, textareaHeightKey, chipHeightKey, {
@@ -3665,6 +4543,10 @@ function createPromptRow(label, value, placeholder, onFocus, onInput, options = 
         counter,
     ]);
     applyCollapsedState(collapsed);
+    row.__webuiBridgeSetCollapsed = (nextCollapsed, persist = false) => {
+        applyCollapsedState(nextCollapsed);
+        if (persist) writeLocalBoolean(collapseKey, collapsed);
+    };
     row.chips = chips;
     row.translateStatus = translateStatus;
     row.__webuiBridgeBottomResizeTarget = () => chips.classList.contains("empty") ? textarea : chips;
@@ -4223,6 +5105,9 @@ function buildPanel(node) {
     const regionalCommonEnabledWidget = getWidget(node, "regional_common_enabled");
     const regionalBaseRatioWidget = getWidget(node, "regional_base_ratio");
     const regionalStrengthWidget = getWidget(node, "regional_strength");
+    const regionalCanvasAutoWidget = getWidget(node, "regional_canvas_auto");
+    const regionalCanvasWidthWidget = getWidget(node, "regional_canvas_width");
+    const regionalCanvasHeightWidget = getWidget(node, "regional_canvas_height");
     const initialClipStrength = repairClipStrengthWidget(node);
     const state = {
         bridgeNode: node,
@@ -4453,8 +5338,56 @@ function buildPanel(node) {
         value: bridgeWidgetValue(node, "regional_strength", 1),
         title: "区域 prompt 强度",
     });
+    const regionalCanvasAutoInput = el("input", {
+        type: "checkbox",
+        title: "自动跟随 KSampler 的 latent/image 画布尺寸；编辑宽高会退出自动跟随",
+    });
+    regionalCanvasAutoInput.checked = bridgeBooleanWidgetValue(node, "regional_canvas_auto", true);
+    const regionalCanvasWidthInput = el("input", {
+        class: "webui-bridge-regional-canvas-size",
+        type: "number",
+        min: "64",
+        max: "16384",
+        step: "8",
+        value: bridgeWidgetValue(node, "regional_canvas_width", DEFAULT_REGIONAL_CANVAS_WIDTH),
+        title: "输入后同步到实际 Image Size / Resize 节点；编辑时会退出自动跟随",
+    });
+    const regionalCanvasHeightInput = el("input", {
+        class: "webui-bridge-regional-canvas-size",
+        type: "number",
+        min: "64",
+        max: "16384",
+        step: "8",
+        value: bridgeWidgetValue(node, "regional_canvas_height", DEFAULT_REGIONAL_CANVAS_HEIGHT),
+        title: "输入后同步到实际 Image Size / Resize 节点；编辑时会退出自动跟随",
+    });
+    const regionalCanvasSource = el("span", { class: "webui-bridge-regional-canvas-source" });
+    const regionalDetectButton = el("button", {
+        class: "webui-bridge-regional-detect",
+        type: "button",
+        title: "重新检测工作流里的画布尺寸，并回到自动读取",
+        onclick: () => {
+            const detected = detectRegionalCanvasSizeFromGraph(node);
+            if (detected) {
+                regionalCanvasWidthInput.value = detected.width;
+                regionalCanvasHeightInput.value = detected.height;
+                regionalCanvasAutoInput.checked = true;
+                setStatus(`已检测画布: ${detected.width}x${detected.height}`);
+            } else {
+                setStatus("未检测到画布尺寸，请手动填写宽高", { kind: "error" });
+            }
+            syncRegionalWidgets();
+        },
+    }, "↻");
     const regionalStatus = el("div", { class: "webui-bridge-regional-status" });
     const regionalPreview = el("div", { class: "webui-bridge-regional-preview" });
+    const regionalPreviewFrame = el("div", { class: "webui-bridge-regional-preview-frame" }, [
+        el("div", { class: "webui-bridge-regional-preview-meta" }, [
+            el("span", {}, "预览"),
+            regionalCanvasSource,
+        ]),
+        regionalPreview,
+    ]);
     const regionalTemplateButton = el("button", {
         class: "webui-bridge-network-tool",
         type: "button",
@@ -4472,6 +5405,38 @@ function buildPanel(node) {
         },
     }, "生成模板");
 
+    const applyRegionalCanvasInputsToGraph = ({ quiet = false } = {}) => {
+        const size = normalizeRegionalCanvasSize(regionalCanvasWidthInput.value, regionalCanvasHeightInput.value);
+        regionalCanvasWidthInput.value = size.width;
+        regionalCanvasHeightInput.value = size.height;
+        const result = applyRegionalCanvasSizeToGraph(node, size.width, size.height);
+        if (!quiet) {
+            setStatus(result.ok
+                ? `${result.message}: ${size.width}x${size.height}`
+                : result.message,
+            { kind: result.ok ? "success" : "error" });
+        }
+        return result;
+    };
+
+    const onRegionalCanvasManualInput = () => {
+        regionalCanvasAutoInput.checked = false;
+        syncRegionalWidgets();
+    };
+
+    const enterRegionalCanvasManualMode = () => {
+        if (!regionalCanvasAutoInput.checked) return;
+        regionalCanvasAutoInput.checked = false;
+        setWidgetValue(node, "regional_canvas_auto", false);
+        renderRegionalPreview();
+    };
+
+    const onRegionalCanvasManualCommit = () => {
+        regionalCanvasAutoInput.checked = false;
+        applyRegionalCanvasInputsToGraph();
+        syncRegionalWidgets();
+    };
+
     const renderRegionalPreview = () => {
         const split = regionalSplitSelect.value;
         const ratios = regionalRatiosInput.value;
@@ -4486,16 +5451,38 @@ function buildPanel(node) {
             ? (warnings.length ? warnings.join("；") : `区域 ${cellCount} 个；使用 BREAK/ADDCOL/ADDROW 分隔提示词`)
             : "区域控制关闭";
         regionalStatus.classList.toggle("error", warnings.length > 0);
+        const manualCanvas = normalizeRegionalCanvasSize(
+            regionalCanvasWidthInput.value,
+            regionalCanvasHeightInput.value,
+        );
+        const detectedCanvas = regionalCanvasAutoInput.checked ? detectRegionalCanvasSizeFromGraph(node) : null;
+        const canvas = detectedCanvas || manualCanvas;
+        regionalPreview.style.setProperty("--webui-bridge-regional-aspect", `${canvas.width} / ${canvas.height}`);
+        regionalCanvasSource.textContent = detectedCanvas
+            ? `${canvas.width}x${canvas.height} · ${detectedCanvas.source}`
+            : `${canvas.width}x${canvas.height} · 手动`;
+        regionalCanvasWidthInput.value = canvas.width;
+        regionalCanvasHeightInput.value = canvas.height;
+        if (detectedCanvas) {
+            setWidgetValue(node, "regional_canvas_width", canvas.width);
+            setWidgetValue(node, "regional_canvas_height", canvas.height);
+        }
         regionalPreview.innerHTML = "";
-        const previewRows = split === "grid" || /[;；]/.test(String(ratios || "")) ? rows : [rows[0]];
+        const previewRows = regionalPreviewLayoutRows(rows, split === "grid" || /[;；]/.test(String(ratios || "")) ? "grid" : split);
+        const totalRowWeight = previewRows.reduce((sum, row) => sum + row.weight, 0) || 1;
+        let cellNumber = 1;
         previewRows.forEach((row, rowIndex) => {
-            const rowEl = el("div", { class: "webui-bridge-regional-preview-row" });
-            const total = row.reduce((sum, value) => sum + value, 0) || 1;
-            row.forEach((value, index) => {
+            const rowEl = el("div", {
+                class: "webui-bridge-regional-preview-row",
+                style: { flex: `${row.weight / totalRowWeight} 1 0` },
+            });
+            const total = row.values.reduce((sum, value) => sum + value, 0) || 1;
+            row.values.forEach((value) => {
                 rowEl.append(el("div", {
                     class: "webui-bridge-regional-preview-cell",
                     style: { flex: `${value / total} 1 0` },
-                }, `${rowIndex * row.length + index + 1}`));
+                }, `${cellNumber}`));
+                cellNumber += 1;
             });
             regionalPreview.append(rowEl);
         });
@@ -4509,12 +5496,64 @@ function buildPanel(node) {
         setWidgetValue(node, "regional_common_enabled", regionalCommonInput.checked);
         setWidgetValue(node, "regional_base_ratio", normalizeClipStrength(regionalBaseRatioInput.value, 0.2));
         setWidgetValue(node, "regional_strength", normalizeClipStrength(regionalStrengthInput.value, 1));
+        setWidgetValue(node, "regional_canvas_auto", regionalCanvasAutoInput.checked);
+        setWidgetValue(node, "regional_canvas_width", normalizeRegionalCanvasDimension(regionalCanvasWidthInput.value, DEFAULT_REGIONAL_CANVAS_WIDTH));
+        setWidgetValue(node, "regional_canvas_height", normalizeRegionalCanvasDimension(regionalCanvasHeightInput.value, DEFAULT_REGIONAL_CANVAS_HEIGHT));
         renderRegionalPreview();
     };
-    for (const control of [regionalEnabledInput, regionalSplitSelect, regionalRatiosInput, regionalBaseInput, regionalCommonInput, regionalBaseRatioInput, regionalStrengthInput]) {
+    for (const control of [regionalEnabledInput, regionalSplitSelect, regionalRatiosInput, regionalBaseInput, regionalCommonInput, regionalBaseRatioInput, regionalStrengthInput, regionalCanvasAutoInput]) {
         control.addEventListener("input", syncRegionalWidgets);
         control.addEventListener("change", syncRegionalWidgets);
     }
+    for (const control of [regionalCanvasWidthInput, regionalCanvasHeightInput]) {
+        control.addEventListener("pointerdown", enterRegionalCanvasManualMode);
+        control.addEventListener("focus", enterRegionalCanvasManualMode);
+        control.addEventListener("beforeinput", enterRegionalCanvasManualMode);
+        control.addEventListener("wheel", enterRegionalCanvasManualMode, { passive: true });
+        control.addEventListener("input", onRegionalCanvasManualInput);
+        control.addEventListener("change", onRegionalCanvasManualCommit);
+        control.addEventListener("keydown", (event) => {
+            if (!["Tab", "Shift", "Control", "Alt", "Meta"].includes(event.key)) enterRegionalCanvasManualMode();
+            if (event.key !== "Enter") return;
+            event.preventDefault();
+            onRegionalCanvasManualCommit();
+        });
+    }
+
+    let regionalCanvasSyncTimer = null;
+    const syncRegionalCanvasFromGraph = () => {
+        if (!regionalCanvasAutoInput.checked) return false;
+        const detected = detectRegionalCanvasSizeFromGraph(node);
+        if (!detected) return false;
+        const sourceText = `${detected.width}x${detected.height} · ${detected.source}`;
+        const currentWidth = normalizeRegionalCanvasDimension(regionalCanvasWidthInput.value, DEFAULT_REGIONAL_CANVAS_WIDTH);
+        const currentHeight = normalizeRegionalCanvasDimension(regionalCanvasHeightInput.value, DEFAULT_REGIONAL_CANVAS_HEIGHT);
+        if (
+            currentWidth === detected.width &&
+            currentHeight === detected.height &&
+            regionalCanvasSource.textContent === sourceText
+        ) {
+            return false;
+        }
+        regionalCanvasWidthInput.value = detected.width;
+        regionalCanvasHeightInput.value = detected.height;
+        setWidgetValue(node, "regional_canvas_width", detected.width);
+        setWidgetValue(node, "regional_canvas_height", detected.height);
+        renderRegionalPreview();
+        return true;
+    };
+    const startRegionalCanvasAutoSync = () => {
+        window.clearInterval(regionalCanvasSyncTimer);
+        regionalCanvasSyncTimer = window.setInterval(() => {
+            if (!regionalPreviewFrame.isConnected) {
+                window.clearInterval(regionalCanvasSyncTimer);
+                regionalCanvasSyncTimer = null;
+                return;
+            }
+            syncRegionalCanvasFromGraph();
+        }, 700);
+    };
+    startRegionalCanvasAutoSync();
 
     const setStatus = (message, options = {}) => {
         window.clearTimeout(statusTimer);
@@ -4758,6 +5797,10 @@ function buildPanel(node) {
             quickLoraOverlayButton.style.display = preset === "minimal_lora" ? "none" : "";
         }
         const collapseNegative = (collapsed) => {
+            if (typeof negative.row.__webuiBridgeSetCollapsed === "function") {
+                negative.row.__webuiBridgeSetCollapsed(collapsed, false);
+                return;
+            }
             negative.row.classList.toggle("collapsed", collapsed);
             promptsColumn?.classList?.toggle("negative-collapsed", collapsed);
             applyTopRowCollapsedState(topRow, collapsed);
@@ -4774,7 +5817,7 @@ function buildPanel(node) {
                     extraSection.style.flex = "1 1 auto";
                 } else if (lora !== undefined && !extraCollapsed) {
                     setResizeTargetHeight(extraSection, extraHeightKey, lora, { min: EXTRA_NETWORKS_MIN_HEIGHT, max: extraSection.__webuiBridgeMaxHeight });
-                    extraSection.style.flex = "1 1 auto";
+                    extraSection.style.flex = "0 0 auto";
                 }
                 if (positiveText === null) {
                     resetResizeTargetHeight(positive.textarea, positive.textarea.__webuiBridgeHeightKey);
@@ -4822,7 +5865,7 @@ function buildPanel(node) {
             extraCollapsed = false;
             writeLocalBoolean(extraCollapsedKey, false);
             applyExtraCollapsedState?.();
-            setPanelHeights({ top: null, lora: null, positiveText: null, positiveTags: null });
+            setPanelHeights({ top: null, lora: EXTRA_NETWORKS_MIN_HEIGHT, positiveText: 120, positiveTags: 220 });
         }
     };
 
@@ -5575,9 +6618,23 @@ function buildPanel(node) {
     };
 
     const renderModelSwitch = () => {
-        const checkpoints = collectCheckpointOptions(state.models);
         const current = currentCheckpointName();
         const split = isSplitModelMode();
+        BRIDGE_DEBUG.models = state.models;
+        BRIDGE_DEBUG.currentCheckpoint = current;
+        BRIDGE_DEBUG.splitModelMode = split;
+        const checkpoints = collectCheckpointOptions(state.models);
+        const availableCheckpoints = availableCheckpointLookupKeys(state.models);
+        const syncTarget = current && checkpointLookupHas(availableCheckpoints, current)
+            ? current
+            : checkpoints[0];
+        const autoSyncedMissing = syncTarget
+            ? syncMissingCheckpointLoadersToModel(syncTarget, { models: state.models })
+            : 0;
+        if (autoSyncedMissing) {
+            scheduleMissingModelRefresh("renderModelSwitch");
+            setStatus(`已自动同步 ${autoSyncedMissing} 个缺失 CheckpointLoader 到可用模型`);
+        }
         const canUseSplit = split !== null || hasSplitAnimaModelSource();
         modelSelect.innerHTML = "";
         if (canUseSplit) {
@@ -5602,7 +6659,7 @@ function buildPanel(node) {
     const applySelectedModel = () => {
         const result = modelSelect.value === SPLIT_ANIMA_MODEL_VALUE
             ? applySplitModelMode()
-            : applyCheckpointModel(modelSelect.value);
+            : applyCheckpointModel(modelSelect.value, state.models);
         renderModelSwitch();
         setStatus(result.message);
     };
@@ -6365,6 +7422,7 @@ function buildPanel(node) {
                 beforeMax: () => promptRowBottomTarget(positive.row).__webuiBridgeMaxHeight || 520,
                 afterMin: () => positiveTagPanel.__webuiBridgeMinHeight,
                 afterMax: () => positiveTagPanel.__webuiBridgeMaxHeight,
+                label: "Prompt / 标签",
                 title: "上下拖动分配提示词区和标签列表高度，双击恢复",
             },
         ),
@@ -6380,6 +7438,7 @@ function buildPanel(node) {
                 beforeMax: () => positiveTagPanel.__webuiBridgeMaxHeight,
                 afterMin: () => negative.textarea.__webuiBridgeMinHeight,
                 afterMax: () => negative.textarea.__webuiBridgeMaxHeight,
+                label: "标签 / 反向词",
                 title: "上下拖动分配标签列表和反向词文本框高度，双击恢复",
             },
         ),
@@ -6395,6 +7454,7 @@ function buildPanel(node) {
                 beforeMax: () => promptRowBottomTarget(negative.row).__webuiBridgeMaxHeight || 520,
                 afterMin: () => negativeTagPanel.__webuiBridgeMinHeight,
                 afterMax: () => negativeTagPanel.__webuiBridgeMaxHeight,
+                label: "反向词 / 标签",
                 title: "上下拖动分配反向词区和反向标签列表高度，双击恢复",
             },
         ),
@@ -6406,7 +7466,21 @@ function buildPanel(node) {
     const extraHeightKey = "webui-bridge-extra-height";
     const extraCollapsedKey = "webui-bridge-extra-collapsed";
     const actionCollapsedKey = "webui-bridge-action-column-collapsed";
-    migrateLayoutStorage([topRowHeightKey, extraHeightKey]);
+    const actionWidthKey = "webui-bridge-action-column-width";
+    const actionWidthOptions = {
+        defaultWidth: ACTION_SIDEBAR_DEFAULT_WIDTH,
+        min: ACTION_SIDEBAR_MIN_WIDTH,
+        max: ACTION_SIDEBAR_MAX_WIDTH,
+        promptMin: ACTION_SIDEBAR_PROMPT_MIN_WIDTH,
+    };
+    migrateLayoutStorage([
+        topRowHeightKey,
+        extraHeightKey,
+        extraCollapsedKey,
+        actionCollapsedKey,
+        actionWidthKey,
+        "webui-bridge-negative-collapsed",
+    ]);
     let extraCollapsed = readLocalBoolean(extraCollapsedKey, false);
     let actionCollapsed = readLocalBoolean(actionCollapsedKey, false);
     let loraOverlayOpen = false;
@@ -6483,9 +7557,9 @@ function buildPanel(node) {
         extraSection.style.height = "";
         extraSection.style.minHeight = "";
         extraSection.style.maxHeight = "";
-        extraSection.style.flex = "1 1 auto";
+        extraSection.style.flex = "0 0 auto";
         applyStoredHeight(extraSection, extraHeightKey, { min: EXTRA_NETWORKS_MIN_HEIGHT, max: extraSection.__webuiBridgeMaxHeight });
-        extraSection.style.flex = "1 1 auto";
+        extraSection.style.flex = "0 0 auto";
         requestAnimationFrame(ensureUsableExtraHeight);
     }
     applyExtraCollapsedState();
@@ -6501,17 +7575,27 @@ function buildPanel(node) {
             el("label", {}, [regionalCommonInput, el("span", {}, "Common")]),
             el("label", {}, [el("span", {}, "Base比例"), regionalBaseRatioInput]),
             el("label", {}, [el("span", {}, "强度"), regionalStrengthInput]),
+            el("label", { class: "webui-bridge-regional-canvas-row" }, [
+                el("span", {}, "画布"),
+                regionalCanvasAutoInput,
+                el("span", {}, "自动"),
+                regionalCanvasWidthInput,
+                el("span", { class: "webui-bridge-regional-canvas-times" }, "x"),
+                regionalCanvasHeightInput,
+                regionalDetectButton,
+            ]),
         ]),
         el("div", { class: "webui-bridge-regional-actions" }, [
             regionalTemplateButton,
             regionalStatus,
         ]),
-        regionalPreview,
+        regionalPreviewFrame,
     ]);
     renderRegionalPreview();
 
     let topRow = null;
     let actionColumn = null;
+    let actionResizeGrip = null;
     const actionToggle = el("button", {
         class: "webui-bridge-side-toggle",
         type: "button",
@@ -6524,10 +7608,12 @@ function buildPanel(node) {
     function applyActionCollapsedState() {
         topRow?.classList?.toggle("action-collapsed", actionCollapsed);
         actionColumn?.classList?.toggle("collapsed", actionCollapsed);
+        actionResizeGrip?.classList?.toggle("collapsed", actionCollapsed);
         actionToggle.textContent = actionCollapsed ? "显示侧栏" : "隐藏侧栏";
         actionToggle.title = actionCollapsed ? "显示右侧控制栏" : "隐藏右侧控制栏，露出节点接口";
     }
     actionColumn = el("div", { class: "webui-bridge-action-column" }, [
+        createSidebarWidthButton(() => topRow, actionWidthKey, actionWidthOptions),
         el("button", { class: "webui-bridge-generate", title: "Queue Prompt", onclick: queuePrompt }, "Generate"),
         status,
         modelSwitchControls,
@@ -6576,15 +7662,21 @@ function buildPanel(node) {
             ]),
         ]),
     ]);
+    actionResizeGrip = createSidebarWidthGrip(() => topRow, actionWidthKey, actionWidthOptions);
     promptsColumn.prepend(actionToggle);
     topRow = el("div", { class: "webui-bridge-toprow" }, [
         promptsColumn,
+        actionResizeGrip,
         actionColumn,
     ]);
+    topRow.__webuiBridgeSidebarGrip = actionResizeGrip;
+    topRow.__webuiBridgeSidebarWidthKey = actionWidthKey;
+    topRow.__webuiBridgeSidebarWidthOptions = actionWidthOptions;
+    applyStoredSidebarWidth(topRow, actionWidthKey, actionWidthOptions);
     applyActionCollapsedState();
     topRow.__webuiBridgeHeightKey = topRowHeightKey;
     topRow.__webuiBridgeMinHeight = 220;
-    topRow.__webuiBridgeMaxHeight = 100000;
+    topRow.__webuiBridgeMaxHeight = Math.max(520, PANEL_MAX_HEIGHT - EXTRA_NETWORKS_MIN_HEIGHT - 140);
     applyStoredHeight(topRow, topRowHeightKey, { min: topRow.__webuiBridgeMinHeight, max: topRow.__webuiBridgeMaxHeight });
     applyTopRowCollapsedState(topRow, negative.row.classList.contains("collapsed"));
 
@@ -6596,13 +7688,26 @@ function buildPanel(node) {
             beforeMax: topRow.__webuiBridgeMaxHeight,
             afterMin: EXTRA_NETWORKS_MIN_HEIGHT,
             afterMax: EXTRA_NETWORKS_MAX_HEIGHT,
-            afterFlex: "1 1 auto",
+            afterFlex: "0 0 auto",
+            label: "提示词 / LoRA",
             title: "上下拖动分配提示词区域和 Extra Networks 高度，双击恢复",
         }),
         extraSection,
         resizeGrip,
     ]);
     applyPanelFontSize(panel);
+    const refreshSidebarWidth = () => setSidebarWidth(
+        topRow,
+        "",
+        readLocalNumber(actionWidthKey, actionWidthOptions.defaultWidth),
+        actionWidthOptions,
+    );
+    if (typeof ResizeObserver !== "undefined") {
+        const sidebarResizeObserver = new ResizeObserver(refreshSidebarWidth);
+        sidebarResizeObserver.observe(topRow);
+        panel.__webuiBridgeSidebarResizeObserver = sidebarResizeObserver;
+    }
+    window.requestAnimationFrame?.(refreshSidebarWidth);
     networkPane.append(cards);
 
     function installPromptKeys(textarea, after) {
@@ -6661,6 +7766,10 @@ function buildPanel(node) {
         importUpstreamLoras();
         updateCounters();
         updateLayoutPresetControls();
+        if (node.__webuiBridgeFreshNode && !node.__webuiBridgeWasConfigured && !node.__webuiBridgeFreshLayoutApplied) {
+            node.__webuiBridgeFreshLayoutApplied = true;
+            applyLayoutPreset(state.settings?.layout_preset || "default");
+        }
         positiveTagPanel.__webuiBridgeRender?.();
         negativeTagPanel.__webuiBridgeRender?.();
         maybeShowStartupWizard();
@@ -6678,6 +7787,7 @@ function buildPanel(node) {
 }
 
 function installWebUIPanel(node) {
+    repairComfyCorePackageMetadata();
     if (node.__webuiBridgePanel) {
         const existingWidget = node.widgets?.find((widget) => widget.name === "webui_prompt_frontend");
         const usablePanel = existingWidget?.element === node.__webuiBridgePanel &&
@@ -6686,6 +7796,7 @@ function installWebUIPanel(node) {
             node.__webuiBridgePanel.style.display = "";
             return;
         }
+        node.__webuiBridgePanel.__webuiBridgeSidebarResizeObserver?.disconnect?.();
         node.__webuiBridgePanel.remove?.();
         node.__webuiBridgePanel = null;
     }
@@ -6756,7 +7867,7 @@ function installWebUIPanel(node) {
         serialize: false,
         hideOnZoom: false,
         getMinHeight: () => 280,
-        getMaxHeight: () => 100000,
+        getMaxHeight: () => Math.max(280, PANEL_MAX_HEIGHT - DOM_WIDGET_LAYOUT_PAD),
     });
     installWidgetSerializationFallback(domWidget, () => null);
     if (Array.isArray(node.widgets)) {
@@ -6771,10 +7882,11 @@ function installWebUIPanel(node) {
     domWidget.y = 0;
     domWidget.last_y = 0;
     const applyDomWidgetSize = (nodeWidth, nodeHeight, widgetTop = 0) => {
+        const [, clampedNodeHeight] = clampPanelSize(nodeWidth, nodeHeight);
         domWidget.y = 0;
         domWidget.last_y = 0;
         const widgetWidth = Math.max(PANEL_MIN_WIDTH, nodeWidth - 20);
-        const widgetHeight = Math.max(280, nodeHeight - Math.max(0, widgetTop) - DOM_WIDGET_LAYOUT_PAD);
+        const widgetHeight = Math.max(280, clampedNodeHeight - Math.max(0, widgetTop) - DOM_WIDGET_LAYOUT_PAD);
         panel.style.width = `${widgetWidth}px`;
         panel.style.height = `${widgetHeight}px`;
         return [widgetWidth, widgetHeight];
@@ -6798,7 +7910,7 @@ function installWebUIPanel(node) {
             if (!node.__webuiBridgeFreshNode || node.__webuiBridgeWasConfigured || !Array.isArray(desired)) return;
             if ((node.size?.[1] || 0) > desired[1] + 8 || (node.size?.[0] || 0) !== desired[0]) {
                 node.setSize(desired);
-                app.graph?.setDirtyCanvas?.(true, true);
+                getAppGraphSafe()?.setDirtyCanvas?.(true, true);
             }
         };
         window.setTimeout(enforceFreshSize, 0);
@@ -6812,7 +7924,7 @@ function installWebUIPanel(node) {
     } else if (!node.size || node.size[0] < PANEL_MIN_WIDTH || node.size[1] < PANEL_MIN_HEIGHT) {
         node.__webuiBridgeDesiredSize = clampPanelSize(node.size?.[0] || DEFAULT_PANEL_WIDTH, node.size?.[1] || DEFAULT_PANEL_HEIGHT);
         node.setSize(node.__webuiBridgeDesiredSize);
-    } else if (node.size[0] > PANEL_MAX_WIDTH) {
+    } else if (node.size[0] > PANEL_MAX_WIDTH || node.size[1] > PANEL_MAX_HEIGHT) {
         node.setSize(clampPanelSize(node.size[0], node.size[1]));
     }
 }
@@ -6966,6 +8078,9 @@ function addStyles() {
         .webui-bridge-section-resizer {
             flex: 0 0 8px;
             min-height: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             cursor: ns-resize;
             background:
                 linear-gradient(to bottom, rgba(255, 255, 255, 0.02), rgba(0, 0, 0, 0.12)),
@@ -6984,14 +8099,59 @@ function addStyles() {
             position: relative;
             z-index: 2;
         }
+        .webui-bridge-split-resizer.has-label {
+            flex-basis: 14px;
+            min-height: 14px;
+        }
+        .webui-bridge-resizer-label {
+            pointer-events: none;
+            max-width: calc(100% - 20px);
+            height: 12px;
+            padding: 0 7px;
+            border: 1px solid rgba(106, 132, 170, .62);
+            border-radius: 999px;
+            background: rgba(21, 29, 42, .94);
+            color: #cbd7ea;
+            font-size: 9px;
+            font-weight: 700;
+            line-height: 12px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, .22);
+        }
+        .webui-bridge-section-resizer:hover .webui-bridge-resizer-label {
+            border-color: rgba(136, 181, 255, .92);
+            color: #eef6ff;
+            background: rgba(28, 48, 78, .96);
+        }
+        .webui-bridge-negative-main-resizer .webui-bridge-resizer-label {
+            border-color: rgba(164, 132, 211, .6);
+            background: rgba(40, 31, 58, .94);
+            color: #eadcff;
+        }
+        .webui-bridge-negative-detail-resizer .webui-bridge-resizer-label {
+            border-color: rgba(205, 131, 143, .62);
+            background: rgba(55, 29, 38, .94);
+            color: #ffdce3;
+        }
         .webui-bridge-panel-splitter {
-            flex: 0 0 12px;
-            min-height: 12px;
+            flex: 0 0 18px;
+            min-height: 18px;
             margin: -4px 0 -4px;
             border-top: 2px solid rgba(112, 143, 190, .8);
             border-bottom: 2px solid rgba(30, 38, 52, .95);
             border-radius: 4px;
             z-index: 8;
+        }
+        .webui-bridge-panel-splitter.has-label {
+            flex-basis: 18px;
+            min-height: 18px;
+        }
+        .webui-bridge-panel-splitter .webui-bridge-resizer-label {
+            border-color: rgba(117, 163, 255, .75);
+            background: rgba(22, 48, 82, .96);
+            color: #dbeafe;
         }
         .webui-bridge-size-controls {
             display: grid;
@@ -7154,9 +8314,11 @@ function addStyles() {
         }
         .webui-bridge-toprow {
             display: grid;
-            grid-template-columns: minmax(0, 1fr) clamp(220px, 24%, 280px);
-            gap: 8px;
-            flex: 0 1 auto;
+            --webui-bridge-sidebar-width: ${ACTION_SIDEBAR_DEFAULT_WIDTH}px;
+            --webui-bridge-sidebar-grip-width: 30px;
+            grid-template-columns: minmax(0, 1fr) var(--webui-bridge-sidebar-grip-width) var(--webui-bridge-sidebar-width);
+            gap: 6px;
+            flex: 1 1 auto;
             min-height: 0;
             max-height: none;
             overflow: hidden;
@@ -7189,6 +8351,122 @@ function addStyles() {
         }
         .webui-bridge-prompts.negative-collapsed .webui-bridge-aio-positive {
             flex: 1 1 auto;
+        }
+        .webui-bridge-side-resizer {
+            position: relative;
+            align-self: stretch;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            width: var(--webui-bridge-sidebar-grip-width);
+            min-width: var(--webui-bridge-sidebar-grip-width);
+            padding-top: 10px;
+            box-sizing: border-box;
+            border: 1px solid #46658f;
+            border-radius: 6px;
+            cursor: ew-resize;
+            touch-action: none;
+            user-select: none;
+            background:
+                linear-gradient(to right, rgba(12, 18, 28, .68), rgba(28, 45, 68, .94), rgba(12, 18, 28, .68));
+            box-shadow:
+                inset 0 0 0 1px rgba(128, 171, 236, .12),
+                0 1px 8px rgba(0, 0, 0, .25);
+            z-index: 4;
+        }
+        .webui-bridge-side-resizer::after {
+            content: "";
+            position: absolute;
+            top: 52px;
+            bottom: 10px;
+            left: 50%;
+            width: 2px;
+            transform: translateX(-50%);
+            border-radius: 2px;
+            background: repeating-linear-gradient(
+                to bottom,
+                rgba(164, 191, 232, .45) 0 8px,
+                transparent 8px 14px
+            );
+        }
+        .webui-bridge-side-resizer-handle {
+            position: sticky;
+            top: 8px;
+            z-index: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 2px;
+            width: 24px;
+            height: 42px;
+            padding: 4px 2px;
+            box-sizing: border-box;
+            border: 1px solid #6f9fe4;
+            border-radius: 6px;
+            background: #203a61;
+            color: #eff6ff;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, .32);
+            cursor: ew-resize;
+            pointer-events: auto;
+        }
+        .webui-bridge-side-resizer-icon {
+            flex: 0 0 auto;
+            font-size: 13px;
+            line-height: 1;
+        }
+        .webui-bridge-side-resizer-text {
+            display: none;
+        }
+        .webui-bridge-side-resizer:hover,
+        .webui-bridge-side-resizer.dragging {
+            background:
+                linear-gradient(to right, rgba(28, 48, 78, .95), rgba(58, 102, 164, .96), rgba(28, 48, 78, .95));
+            border-color: #7db2ff;
+        }
+        .webui-bridge-side-resizer:hover .webui-bridge-side-resizer-handle,
+        .webui-bridge-side-resizer.dragging .webui-bridge-side-resizer-handle {
+            background: #2f5f9e;
+            border-color: #b8d5ff;
+        }
+        .webui-bridge-side-resizer.collapsed {
+            display: none !important;
+        }
+        body.webui-bridge-resizing-sidebar {
+            cursor: ew-resize !important;
+            user-select: none !important;
+        }
+        .webui-bridge-sidebar-width-button {
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 7px;
+            min-width: 0;
+            border: 1px solid #7db2ff;
+            border-radius: 6px;
+            background: #2f73d9;
+            color: #f7fbff;
+            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .12);
+            cursor: ew-resize;
+            font-weight: 700;
+        }
+        .webui-bridge-sidebar-width-button:hover,
+        .webui-bridge-sidebar-width-button.dragging {
+            border-color: #b8d5ff;
+            background: #3d86f0;
+        }
+        .webui-bridge-sidebar-width-icon {
+            flex: 0 0 auto;
+            font-size: 15px;
+            line-height: 1;
+        }
+        .webui-bridge-sidebar-width-text {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            letter-spacing: 0;
         }
         .webui-bridge-prompt-row {
             position: relative;
@@ -7254,6 +8532,24 @@ function addStyles() {
         .webui-bridge-prompt-label-btn:hover {
             border-color: #79a9ef;
             background: #263853;
+        }
+        .webui-bridge-collapse-btn {
+            min-width: 66px;
+            border-color: #9b75dc;
+            background: #3b2760;
+            color: #f5eaff;
+            font-weight: 800;
+            box-shadow:
+                inset 0 0 0 1px rgba(255, 255, 255, .08),
+                0 0 0 1px rgba(155, 117, 220, .28);
+        }
+        .webui-bridge-collapse-btn:hover {
+            border-color: #d4b7ff;
+            background: #56378d;
+            color: #fff;
+            box-shadow:
+                inset 0 0 0 1px rgba(255, 255, 255, .12),
+                0 0 0 2px rgba(155, 117, 220, .28);
         }
         .webui-bridge-prompt-row textarea {
             width: 100%;
@@ -7841,15 +9137,23 @@ function addStyles() {
             display: flex;
             flex-direction: column;
             gap: 8px;
+            width: 100%;
+            justify-self: stretch;
             min-width: 0;
             min-height: 0;
+            box-sizing: border-box;
+            padding-right: 2px;
             overflow: auto;
+        }
+        .webui-bridge-action-column > * {
+            min-width: 0;
         }
         .webui-bridge-action-column.collapsed {
             display: none !important;
         }
         .webui-bridge-generate {
-            height: clamp(42px, 7vh, 62px);
+            height: 52px;
+            min-height: 48px;
             border: 0;
             border-radius: 6px;
             background: #2f73d9;
@@ -7961,6 +9265,43 @@ function addStyles() {
             background: #111318;
             color: #f2f4f8;
         }
+        .webui-bridge-regional-canvas-row {
+            grid-column: 1 / -1;
+            display: grid !important;
+            grid-template-columns: auto auto auto minmax(0, 1fr) auto minmax(0, 1fr) 28px;
+            align-items: center;
+            gap: 5px;
+        }
+        .webui-bridge-regional-canvas-row input[type="checkbox"] {
+            width: 14px;
+            height: 14px;
+            margin: 0;
+            accent-color: #2f73d9;
+        }
+        .webui-bridge-regional-canvas-size {
+            text-align: center;
+        }
+        .webui-bridge-regional-canvas-times,
+        .webui-bridge-regional-canvas-source {
+            color: #94a3b8;
+            font-size: var(--webui-bridge-font-size-mini, 10px);
+            white-space: nowrap;
+        }
+        .webui-bridge-regional-detect {
+            width: 28px;
+            height: 24px;
+            padding: 0;
+            border: 1px solid #4d5666;
+            border-radius: 4px;
+            background: #202633;
+            color: #dbeafe;
+            cursor: pointer;
+            line-height: 1;
+        }
+        .webui-bridge-regional-detect:hover {
+            border-color: #6aa3ff;
+            background: #26344a;
+        }
         .webui-bridge-regional-actions {
             display: flex;
             align-items: center;
@@ -7977,16 +9318,43 @@ function addStyles() {
         .webui-bridge-regional-status.error {
             color: #ff9aa2;
         }
+        .webui-bridge-regional-preview-frame {
+            margin: 0 6px 6px;
+            padding: 4px;
+            border: 1px solid #323946;
+            border-radius: 4px;
+            background: #101318;
+        }
+        .webui-bridge-regional-preview-meta {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin: 0 1px 4px;
+            color: #aeb8c8;
+            font-size: var(--webui-bridge-font-size-mini, 10px);
+            line-height: 1.2;
+            min-width: 0;
+        }
+        .webui-bridge-regional-preview-meta span:last-child {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            text-align: right;
+        }
         .webui-bridge-regional-preview {
             display: flex;
             flex-direction: column;
             gap: 2px;
-            height: 86px;
-            margin: 0 6px 6px;
+            width: auto;
+            height: 112px;
+            max-width: 100%;
+            margin: 0 auto;
             padding: 3px;
             border: 1px solid #323946;
             border-radius: 4px;
             background: #101318;
+            aspect-ratio: var(--webui-bridge-regional-aspect, 1 / 1);
         }
         .webui-bridge-regional-preview-row {
             display: flex;
@@ -8228,9 +9596,10 @@ function addStyles() {
         .webui-bridge-extra-body {
             display: grid;
             grid-template-columns: minmax(170px, 230px) minmax(0, 1fr);
-            height: auto;
+            align-items: stretch;
+            height: 0;
             min-height: 0;
-            flex: 1 1 auto;
+            flex: 1 1 0;
             overflow: hidden;
         }
         .webui-bridge-extra.collapsed {
@@ -8253,8 +9622,8 @@ function addStyles() {
             box-shadow: 0 16px 54px rgba(0, 0, 0, .62);
         }
         .webui-bridge-panel.lora-overlay .webui-bridge-extra-body {
-            height: auto;
-            flex: 1 1 auto;
+            height: 0;
+            flex: 1 1 0;
         }
         .webui-bridge-panel.lora-overlay .webui-bridge-panel-splitter {
             visibility: hidden;
@@ -8277,6 +9646,7 @@ function addStyles() {
         .webui-bridge-network-pane {
             min-width: 0;
             min-height: 0;
+            height: 100%;
             display: flex;
             flex-direction: column;
             overflow: hidden;
@@ -8284,6 +9654,7 @@ function addStyles() {
         .webui-bridge-network-tree {
             min-width: 0;
             min-height: 0;
+            height: 100%;
             padding: 6px 4px;
             overflow: auto;
             border-right: 1px solid #3e4654;
@@ -8555,24 +9926,6 @@ function addStyles() {
         }
         .webui-bridge-autocomplete.compact .webui-bridge-ac-count {
             font-size: 11px;
-        }
-        @container (max-width: 860px) {
-            .webui-bridge-panel {
-                min-width: 760px;
-                width: max(100%, 760px);
-            }
-            .webui-bridge-toprow {
-                grid-template-columns: 1fr;
-            }
-            .webui-bridge-action-column {
-                display: grid;
-                grid-template-columns: minmax(120px, 160px) 1fr;
-                align-items: start;
-            }
-            .webui-bridge-style-row,
-            .webui-bridge-status {
-                grid-column: 1 / -1;
-            }
         }
         @container (max-width: 620px) {
             .webui-bridge-panel {
@@ -9316,9 +10669,13 @@ function addStyles() {
 app.registerExtension({
     name: "WebUI.PromptBridge.Frontend",
     init() {
+        installWorkflowLoadSanitizer();
         addStyles();
+        scheduleComfyCorePackageMetadataRepair();
+        scheduleStaleMissingNodeWarningClear("init");
     },
     beforeRegisterNodeDef(nodeType, nodeData) {
+        installWorkflowLoadSanitizer();
         if (nodeData.name !== TARGET_NODE) return;
         chainCallback(nodeType.prototype, "onNodeCreated", function () {
             this.color = "#2f3a4a";
@@ -9338,5 +10695,14 @@ app.registerExtension({
             this.__webuiBridgeLastHealthInstall = now;
             scheduleBridgePanelInstall(this);
         });
+    },
+    beforeConfigureGraph(graphData, missingNodes) {
+        sanitizeComfyCorePackageMetadataInWorkflowData(graphData);
+        filterComfyCoreMissingNodeWarnings(missingNodes);
+    },
+    afterConfigureGraph(missingNodes) {
+        filterComfyCoreMissingNodeWarnings(missingNodes);
+        repairComfyCorePackageMetadata();
+        scheduleStaleMissingNodeWarningClear("afterConfigureGraph");
     },
 });

@@ -40,7 +40,7 @@ _NETWORK_TRANSLATE_CACHE = {}
 _TAG_TRANSLATION_MAP_CACHE = None
 _LORA_PREVIEW_EXTENSIONS = (".preview.png", ".preview.jpg", ".preview.jpeg", ".preview.webp", ".png", ".jpg", ".jpeg", ".webp")
 _LORA_DESCRIPTION_EXTENSIONS = (".txt", ".description.txt", ".desc.txt")
-_REGIONAL_SEPARATOR_RE = re.compile(r"\b(ADDCOMM|ADDBASE|ADDCOL|ADDROW|BREAK|AND)\b", re.IGNORECASE)
+_REGIONAL_SEPARATOR_RE = re.compile(r"\b(ADDCOMM|ADDBASE|ADDCOL|ADDROW|BREAK)\b", re.IGNORECASE)
 _REGIONAL_GRID_SEPARATORS = {"ADDCOL", "ADDROW"}
 _IMAGE_SIGNATURES = {
     ".png": (b"\x89PNG\r\n\x1a\n",),
@@ -3016,19 +3016,19 @@ def _regional_cells_from_ratios(ratios, split, region_count):
     if split == "vertical":
         row = rows[0]
         total = sum(row) or 1.0
-        y = 0.0
-        for value in row:
-            height = value / total
-            cells.append({"x": 0.0, "y": y, "width": 1.0, "height": height})
-            y += height
-    elif split == "horizontal":
-        row = rows[0]
-        total = sum(row) or 1.0
         x = 0.0
         for value in row:
             width = value / total
             cells.append({"x": x, "y": 0.0, "width": width, "height": 1.0})
             x += width
+    elif split == "horizontal":
+        row = rows[0]
+        total = sum(row) or 1.0
+        y = 0.0
+        for value in row:
+            height = value / total
+            cells.append({"x": 0.0, "y": y, "width": 1.0, "height": height})
+            y += height
     else:
         row_totals = [sum(row) or 1.0 for row in rows]
         total_y = sum(row_totals) or 1.0
@@ -3134,7 +3134,8 @@ def _build_regional_conditioning(clip, positive_text, negative_text, split, rati
     if len(regions) <= 1 and not positive_parts["base_enabled"]:
         return None
 
-    split = "grid" if positive_parts["grid_requested"] else (split or "vertical")
+    ratio_text = str(ratios or "")
+    split = "grid" if positive_parts["grid_requested"] or ";" in ratio_text or "；" in ratio_text else (split or "vertical")
     if split not in {"vertical", "horizontal", "grid"}:
         split = "vertical"
 
@@ -3207,6 +3208,9 @@ class WebUIPromptBridge:
                 "regional_common_enabled": ("BOOLEAN", {"default": False}),
                 "regional_base_ratio": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "regional_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "regional_canvas_auto": ("BOOLEAN", {"default": True}),
+                "regional_canvas_width": ("INT", {"default": 1024, "min": 64, "max": 16384, "step": 8}),
+                "regional_canvas_height": ("INT", {"default": 1024, "min": 64, "max": 16384, "step": 8}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -3238,6 +3242,9 @@ class WebUIPromptBridge:
         regional_common_enabled=False,
         regional_base_ratio=0.2,
         regional_strength=1.0,
+        regional_canvas_auto=True,
+        regional_canvas_width=1024,
+        regional_canvas_height=1024,
         prompt=None,
         unique_id=None,
     ):
