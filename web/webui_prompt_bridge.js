@@ -41,11 +41,11 @@ const LEGACY_PANEL_HEIGHT = 1120;
 const PANEL_MIN_WIDTH = 420;
 const PANEL_MAX_WIDTH = 100000;
 const PANEL_MIN_HEIGHT = 360;
-const PANEL_MAX_HEIGHT = 1560;
+const PANEL_MAX_HEIGHT = 3200;
 const DOM_WIDGET_LAYOUT_PAD = 128;
 const PROMPT_CHIPS_MIN_HEIGHT = 104;
 const EXTRA_NETWORKS_MIN_HEIGHT = 190;
-const EXTRA_NETWORKS_MAX_HEIGHT = 820;
+const EXTRA_NETWORKS_MAX_HEIGHT = PANEL_MAX_HEIGHT;
 const EXTRA_NETWORKS_DEFAULT_VISIBLE_HEIGHT = 420;
 const DEFAULT_REGIONAL_CANVAS_WIDTH = 1024;
 const DEFAULT_REGIONAL_CANVAS_HEIGHT = 1024;
@@ -67,7 +67,7 @@ const REGIONAL_HEIGHT_ALIASES = [
     "resize_height",
     "crop_height",
 ];
-const LAYOUT_STORAGE_VERSION = "2026-06-10-lora-bottom-anchor-v1";
+const LAYOUT_STORAGE_VERSION = "2026-06-10-corner-resize-lora-v1";
 const AIO_POSITIVE_MIN_HEIGHT = 180;
 const AIO_NEGATIVE_MIN_HEIGHT = 220;
 const DEFAULT_BRIDGE_SETTINGS = {
@@ -7224,8 +7224,10 @@ function buildPanel(node) {
         app.graph?.setDirtyCanvas(true, true);
     };
 
+    let resizeExtraWithNode = () => {};
     const resizeNode = (deltaWidth, deltaHeight) => {
         setNodeSize((node.size?.[0] || DEFAULT_PANEL_WIDTH) + deltaWidth, (node.size?.[1] || DEFAULT_PANEL_HEIGHT) + deltaHeight);
+        resizeExtraWithNode(deltaHeight);
     };
 
     const installResizeDrag = (handle) => {
@@ -7237,8 +7239,15 @@ function buildPanel(node) {
             const startY = event.clientY;
             const startWidth = node.size?.[0] || DEFAULT_PANEL_WIDTH;
             const startHeight = node.size?.[1] || DEFAULT_PANEL_HEIGHT;
+            const viewportScale = resizeTargetViewportScale(node.__webuiBridgePanel || handle);
+            const viewportXScale = resizeTargetViewportXScale(node.__webuiBridgePanel || handle);
+            let lastDeltaHeight = 0;
             const onMove = (moveEvent) => {
-                setNodeSize(startWidth + (moveEvent.clientX - startX), startHeight + (moveEvent.clientY - startY));
+                const deltaWidth = (moveEvent.clientX - startX) / viewportXScale;
+                const deltaHeight = (moveEvent.clientY - startY) / viewportScale;
+                setNodeSize(startWidth + deltaWidth, startHeight + deltaHeight);
+                resizeExtraWithNode(deltaHeight - lastDeltaHeight);
+                lastDeltaHeight = deltaHeight;
             };
             const onUp = () => {
                 document.removeEventListener("pointermove", onMove, true);
@@ -7543,6 +7552,15 @@ function buildPanel(node) {
     extraSection.__webuiBridgeHeightKey = extraHeightKey;
     extraSection.__webuiBridgeMinHeight = EXTRA_NETWORKS_MIN_HEIGHT;
     extraSection.__webuiBridgeMaxHeight = EXTRA_NETWORKS_MAX_HEIGHT;
+    resizeExtraWithNode = (deltaHeight) => {
+        if (!deltaHeight || extraCollapsed || loraOverlayOpen || !extraSection?.isConnected) return;
+        const currentHeight = resizeTargetLayoutHeight(extraSection) || EXTRA_NETWORKS_MIN_HEIGHT;
+        setResizeTargetHeight(extraSection, extraHeightKey, currentHeight + deltaHeight, {
+            min: EXTRA_NETWORKS_MIN_HEIGHT,
+            max: extraSection.__webuiBridgeMaxHeight || EXTRA_NETWORKS_MAX_HEIGHT,
+        });
+        extraSection.style.flex = "0 0 auto";
+    };
     function applyExtraCollapsedState() {
         extraSection.classList.toggle("collapsed", extraCollapsed);
         extraBody.style.display = extraCollapsed ? "none" : "";
@@ -8055,25 +8073,50 @@ function addStyles() {
         }
         .webui-bridge-resize-grip {
             position: absolute;
-            right: 4px;
-            bottom: 4px;
-            width: 24px;
-            height: 24px;
+            right: 8px;
+            bottom: 8px;
+            width: 38px;
+            height: 38px;
             display: flex;
             align-items: center;
             justify-content: center;
-            border: 1px solid #4d5666;
-            border-radius: 4px;
-            background: rgba(32, 39, 51, .92);
-            color: #dce6f5;
+            border: 1px solid #8ab8ff;
+            border-radius: 8px;
+            background:
+                linear-gradient(135deg, rgba(47, 115, 217, .96), rgba(18, 36, 58, .96));
+            color: #f7fbff;
             cursor: nwse-resize;
             user-select: none;
-            z-index: 5;
-            font-size: 13px;
+            z-index: 70;
+            font-size: 19px;
+            font-weight: 900;
+            line-height: 1;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, .7);
+            box-shadow:
+                0 0 0 2px rgba(118, 172, 255, .2),
+                0 8px 20px rgba(0, 0, 0, .36),
+                inset 0 0 0 1px rgba(255, 255, 255, .16);
+        }
+        .webui-bridge-resize-grip::before {
+            content: "";
+            position: absolute;
+            right: 7px;
+            bottom: 7px;
+            width: 15px;
+            height: 15px;
+            border-right: 3px solid rgba(255, 255, 255, .88);
+            border-bottom: 3px solid rgba(255, 255, 255, .88);
+            border-radius: 0 0 3px 0;
+            pointer-events: none;
         }
         .webui-bridge-resize-grip:hover {
-            border-color: #6aa3ff;
-            background: #30394a;
+            border-color: #c7dcff;
+            background:
+                linear-gradient(135deg, rgba(61, 134, 240, 1), rgba(28, 64, 106, 1));
+            box-shadow:
+                0 0 0 3px rgba(118, 172, 255, .32),
+                0 10px 24px rgba(0, 0, 0, .42),
+                inset 0 0 0 1px rgba(255, 255, 255, .22);
         }
         .webui-bridge-section-resizer {
             flex: 0 0 8px;
