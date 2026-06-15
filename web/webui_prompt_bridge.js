@@ -536,7 +536,9 @@ function readLocalNumber(key, fallback = null) {
 
 function writeLocalNumber(key, value) {
     try {
-        localStorage.setItem(key, String(Math.round(value)));
+        const nextValue = String(Math.round(value));
+        if (localStorage.getItem(key) === nextValue) return;
+        localStorage.setItem(key, nextValue);
     } catch {
         // Ignore private-mode or quota failures; UI state can be ephemeral.
     }
@@ -558,6 +560,10 @@ function applyStoredHeight(target, storageKey, { min = 48, max = 640 } = {}) {
     const value = readLocalNumber(storageKey, null);
     if (value === null) return;
     const height = clampNumber(value, min, max);
+    if (Math.abs((resizeTargetLayoutHeight(target) || 0) - height) < 1 &&
+        target.style.flex === "0 0 auto") {
+        return;
+    }
     target.style.height = `${height}px`;
     target.style.flex = "0 0 auto";
 }
@@ -617,9 +623,14 @@ function gridColumnGap(target) {
 function setResizeTargetHeight(target, storageKey, height, { min = 48, max = 640 } = {}) {
     if (!target) return;
     const nextHeight = clampNumber(height, min, max);
+    const key = resizeTargetKey(target, storageKey);
+    if (Math.abs((resizeTargetLayoutHeight(target) || 0) - nextHeight) < 1 &&
+        target.style.flex === "0 0 auto") {
+        if (key) writeLocalNumber(key, nextHeight);
+        return;
+    }
     target.style.height = `${nextHeight}px`;
     target.style.flex = "0 0 auto";
-    const key = resizeTargetKey(target, storageKey);
     if (key) writeLocalNumber(key, nextHeight);
 }
 
@@ -648,6 +659,9 @@ function applyTopRowCollapsedState(topRow, collapsed) {
 function createHeightResizeGrip(target, storageKey, { min = 48, max = 640, title = "拖动调整高度，双击恢复" } = {}) {
     const grip = el("div", {
         class: "webui-bridge-section-resizer",
+        role: "separator",
+        "aria-orientation": "horizontal",
+        "aria-label": title,
         title,
         ondblclick: (event) => {
             event.preventDefault();
@@ -661,11 +675,13 @@ function createHeightResizeGrip(target, storageKey, { min = 48, max = 640, title
             const startHeight = resizeTargetLayoutHeight(target);
             const viewportScale = resizeTargetViewportScale(target);
             grip.setPointerCapture?.(event.pointerId);
+            grip.classList.add("dragging");
             const onMove = (moveEvent) => {
                 const delta = (moveEvent.clientY - startY) / viewportScale;
                 setResizeTargetHeight(target, storageKey, startHeight + delta, { min, max });
             };
             const onUp = () => {
+                grip.classList.remove("dragging");
                 document.removeEventListener("pointermove", onMove, true);
                 document.removeEventListener("pointerup", onUp, true);
                 document.removeEventListener("pointercancel", onUp, true);
@@ -682,6 +698,8 @@ function createHeightSplitGrip(beforeTarget, afterTarget, beforeKey, afterKey, o
     const label = String(options.label || "").trim();
     const grip = el("div", {
         class: `webui-bridge-section-resizer webui-bridge-split-resizer${label ? " has-label" : ""}${options.className ? ` ${options.className}` : ""}`,
+        role: "separator",
+        "aria-orientation": "horizontal",
         "aria-label": options.title || label || "上下拖动调整两侧高度",
         title: options.title || "上下拖动调整两侧高度，双击恢复",
         ondblclick: (event) => {
@@ -712,6 +730,7 @@ function createHeightSplitGrip(beforeTarget, afterTarget, beforeKey, afterKey, o
             const total = startBefore + startAfter;
             let moved = false;
             grip.setPointerCapture?.(event.pointerId);
+            grip.classList.add("dragging");
             const onMove = (moveEvent) => {
                 const delta = (moveEvent.clientY - startY) / viewportScale;
                 if (!moved && Math.abs(delta) < 4) return;
@@ -743,6 +762,7 @@ function createHeightSplitGrip(beforeTarget, afterTarget, beforeKey, afterKey, o
                 }
             };
             const onUp = () => {
+                grip.classList.remove("dragging");
                 options.onDragEnd?.();
                 document.removeEventListener("pointermove", onMove, true);
                 document.removeEventListener("pointerup", onUp, true);
@@ -9691,6 +9711,14 @@ function buildPanel(node) {
 
     const setNodeSize = (width, height) => {
         const [nextWidth, nextHeight] = clampPanelSize(width, Math.max(height, node.__webuiBridgeMinNodeHeight?.() || PANEL_MIN_HEIGHT));
+        const currentWidth = Math.round(Number(node.size?.[0] || 0));
+        const currentHeight = Math.round(Number(node.size?.[1] || 0));
+        const desiredWidth = Math.round(Number(node.__webuiBridgeDesiredSize?.[0] || 0));
+        const desiredHeight = Math.round(Number(node.__webuiBridgeDesiredSize?.[1] || 0));
+        if (currentWidth === nextWidth && currentHeight === nextHeight &&
+            desiredWidth === nextWidth && desiredHeight === nextHeight) {
+            return;
+        }
         node.__webuiBridgeDesiredSize = [nextWidth, nextHeight];
         node.setSize([nextWidth, nextHeight]);
         app.graph?.setDirtyCanvas(true, true);
@@ -9731,6 +9759,7 @@ function buildPanel(node) {
             event.preventDefault();
             event.stopPropagation();
             handle.setPointerCapture?.(event.pointerId);
+            handle.classList.add("dragging");
             holdNodeBottomFit();
             const startX = event.clientX;
             const startY = event.clientY;
@@ -9748,6 +9777,7 @@ function buildPanel(node) {
                 lastDeltaHeight = deltaHeight;
             };
             const onUp = () => {
+                handle.classList.remove("dragging");
                 holdNodeBottomFit();
                 scheduleManualResizeSettle();
                 document.removeEventListener("pointermove", onMove, true);
@@ -10627,9 +10657,13 @@ function buildPanel(node) {
         });
     };
 
+    let adaptiveLayoutScheduled = false;
     scheduleAdaptiveLayout = () => {
+        if (adaptiveLayoutScheduled) return;
+        adaptiveLayoutScheduled = true;
         window.requestAnimationFrame?.(() => {
             window.requestAnimationFrame?.(() => {
+                adaptiveLayoutScheduled = false;
                 ensurePanelSplitterVisible();
                 fitPromptColumnToContent();
                 ensurePanelSplitterVisible();
@@ -10745,6 +10779,14 @@ function installWebUIPanel(node) {
         node.setSize = function (size) {
             if (Array.isArray(size) && Number.isFinite(size[0]) && Number.isFinite(size[1])) {
                 const clamped = clampPanelSize(size[0], Math.max(size[1], node.__webuiBridgeMinNodeHeight?.() || PANEL_MIN_HEIGHT));
+                const currentWidth = Math.round(Number(node.size?.[0] || 0));
+                const currentHeight = Math.round(Number(node.size?.[1] || 0));
+                const desiredWidth = Math.round(Number(node.__webuiBridgeDesiredSize?.[0] || 0));
+                const desiredHeight = Math.round(Number(node.__webuiBridgeDesiredSize?.[1] || 0));
+                if (currentWidth === clamped[0] && currentHeight === clamped[1] &&
+                    desiredWidth === clamped[0] && desiredHeight === clamped[1]) {
+                    return node;
+                }
                 node.__webuiBridgeDesiredSize = clamped;
                 const result = originalSetSize(clamped);
                 window.requestAnimationFrame?.(() => node.__webuiBridgePanel?.__webuiBridgeScheduleAdaptiveLayout?.());
@@ -10917,7 +10959,7 @@ function addStyles() {
         .webui-bridge-node-width-resizer {
             flex: 0 0 auto;
             min-width: 76px;
-            height: 26px;
+            height: 28px;
             margin: 0;
             padding: 0 10px;
             border: 1px solid rgba(116, 164, 238, .78);
@@ -10931,6 +10973,7 @@ function addStyles() {
             box-shadow:
                 inset 0 0 0 1px rgba(255, 255, 255, .08),
                 0 2px 8px rgba(0, 0, 0, .32);
+            touch-action: manipulation;
         }
         .webui-bridge-node-width-resizer {
             min-width: 96px;
@@ -10944,6 +10987,10 @@ function addStyles() {
             cursor: ew-resize;
             border-color: #d5e5ff;
             background: #28517f;
+            box-shadow:
+                0 0 0 2px rgba(128, 180, 255, .28),
+                inset 0 0 0 1px rgba(255, 255, 255, .14),
+                0 2px 8px rgba(0, 0, 0, .32);
         }
         .webui-bridge-node-width-icon {
             display: inline-flex;
@@ -10963,6 +11010,17 @@ function addStyles() {
         .webui-bridge-side-toggle:hover {
             border-color: #d5e5ff;
             background: #28517f;
+        }
+        .webui-bridge-panel button:focus-visible,
+        .webui-bridge-panel input:focus-visible,
+        .webui-bridge-panel select:focus-visible,
+        .webui-bridge-panel textarea:focus-visible,
+        .webui-bridge-node-width-resizer:focus-visible,
+        .webui-bridge-resize-grip:focus-visible,
+        .webui-bridge-section-resizer:focus-visible {
+            outline: 2px solid rgba(132, 184, 255, .95);
+            outline-offset: 2px;
+            box-shadow: 0 0 0 4px rgba(54, 112, 190, .28);
         }
         .webui-bridge-top-field,
         .webui-bridge-top-check {
@@ -11115,7 +11173,8 @@ function addStyles() {
             border-radius: 0 0 3px 0;
             pointer-events: none;
         }
-        .webui-bridge-resize-grip:hover {
+        .webui-bridge-resize-grip:hover,
+        .webui-bridge-resize-grip.dragging {
             border-color: #c7dcff;
             background:
                 linear-gradient(135deg, rgba(61, 134, 240, 1), rgba(28, 64, 106, 1));
@@ -11131,6 +11190,7 @@ function addStyles() {
             align-items: center;
             justify-content: center;
             cursor: ns-resize;
+            touch-action: none;
             background:
                 linear-gradient(to bottom, rgba(255, 255, 255, 0.02), rgba(0, 0, 0, 0.12)),
                 repeating-linear-gradient(90deg, transparent 0 7px, rgba(134, 156, 190, .32) 7px 9px, transparent 9px 16px);
@@ -11139,10 +11199,14 @@ function addStyles() {
             box-sizing: border-box;
             user-select: none;
         }
-        .webui-bridge-section-resizer:hover {
+        .webui-bridge-section-resizer:hover,
+        .webui-bridge-section-resizer.dragging {
             background:
                 linear-gradient(to bottom, rgba(106, 163, 255, 0.14), rgba(20, 47, 82, 0.16)),
                 repeating-linear-gradient(90deg, transparent 0 7px, rgba(156, 194, 255, .72) 7px 9px, transparent 9px 16px);
+            box-shadow:
+                inset 0 0 0 1px rgba(148, 194, 255, .22),
+                0 0 0 1px rgba(84, 142, 230, .18);
         }
         .webui-bridge-split-resizer {
             position: relative;
@@ -11227,7 +11291,7 @@ function addStyles() {
             gap: 5px;
         }
         .webui-bridge-size-controls button {
-            height: 26px;
+            height: 28px;
             min-width: 0;
             border: 1px solid #4d5666;
             border-radius: 5px;
@@ -11272,7 +11336,7 @@ function addStyles() {
         }
         .webui-bridge-layout-presets {
             display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(58px, 1fr));
             gap: 4px;
             padding: 5px;
             border: 1px solid #3d4a5d;
@@ -11281,7 +11345,7 @@ function addStyles() {
         }
         .webui-bridge-layout-preset {
             min-width: 0;
-            height: 28px;
+            min-height: 30px;
             padding: 3px 4px;
             border: 1px solid #435066;
             border-radius: 5px;
@@ -14337,6 +14401,12 @@ function addStyles() {
             opacity: .62;
             cursor: default;
             filter: none;
+        }
+        .webui-bridge-panel button,
+        .webui-bridge-panel input,
+        .webui-bridge-panel select,
+        .webui-bridge-panel textarea {
+            touch-action: manipulation;
         }
         .webui-bridge-panel button,
         .webui-bridge-panel input,
