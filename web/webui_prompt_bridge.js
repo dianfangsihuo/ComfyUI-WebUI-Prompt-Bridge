@@ -122,7 +122,7 @@ const REGIONAL_HEIGHT_ALIASES = [
     "resize_height",
     "crop_height",
 ];
-const LAYOUT_STORAGE_VERSION = "2026-06-20-broken-panel-size-v1";
+const LAYOUT_STORAGE_VERSION = "2026-06-20-dom-widget-top-v2";
 const AIO_POSITIVE_MIN_HEIGHT = 180;
 const AIO_NEGATIVE_MIN_HEIGHT = 220;
 const NODE_TUTORIAL_SEEN_KEY = "webui-bridge-node-tutorial-seen-v2";
@@ -976,6 +976,36 @@ function removeBridgeDomWidgets(node) {
         node.widgets = node.widgets.filter((widget) => widget?.name !== "webui_prompt_frontend");
     }
     return removed;
+}
+
+function moveWidgetToFront(node, widget) {
+    if (!Array.isArray(node?.widgets) || !widget) return;
+    const index = node.widgets.indexOf(widget);
+    if (index <= 0) return;
+    node.widgets.splice(index, 1);
+    node.widgets.unshift(widget);
+}
+
+function pinBridgeDomWidgetToTop(node, widget) {
+    if (!widget) return;
+    moveWidgetToFront(node, widget);
+    widget.y = 0;
+    widget.last_y = 0;
+}
+
+function scheduleBridgeDomWidgetPin(node, widget, panel) {
+    const pin = () => {
+        pinBridgeDomWidgetToTop(node, widget);
+        const desired = normalizeBridgePanelSize(node.__webuiBridgeDesiredSize || node.size);
+        node.__webuiBridgeDesiredSize = desired;
+        node.__webuiBridgeApplyDomWidgetSize?.(desired[0], desired[1]);
+        panel?.__webuiBridgeScheduleAdaptiveLayout?.();
+    };
+    pin();
+    requestAnimationFrame(pin);
+    window.setTimeout(pin, 0);
+    window.setTimeout(pin, 120);
+    window.setTimeout(pin, 500);
 }
 
 function shouldHideNativeWidget(widget) {
@@ -10826,11 +10856,12 @@ function installWebUIPanel(node) {
             node.__webuiBridgePanel.style.display = "";
             const desired = normalizeBridgePanelSize(node.__webuiBridgeDesiredSize || node.size);
             node.__webuiBridgeDesiredSize = desired;
+            pinBridgeDomWidgetToTop(node, existingWidget);
             node.__webuiBridgeApplyDomWidgetSize?.(desired[0], desired[1]);
             if (looksLikeBrokenBridgePanelSize(node.size)) {
                 node.__webuiBridgePanel.__webuiBridgeResetNodeLayoutCache?.();
             }
-            window.requestAnimationFrame?.(() => node.__webuiBridgePanel?.__webuiBridgeScheduleAdaptiveLayout?.());
+            scheduleBridgeDomWidgetPin(node, existingWidget, node.__webuiBridgePanel);
             return;
         }
         node.__webuiBridgePanel.__webuiBridgeSidebarResizeObserver?.disconnect?.();
@@ -10881,6 +10912,9 @@ function installWebUIPanel(node) {
     if (!node.__webuiBridgeSerializeWrapped) {
         chainCallback(node, "onSerialize", function (data) {
             if (!data || !Array.isArray(data.widgets_values)) return;
+            const desired = normalizeBridgePanelSize(node.__webuiBridgeDesiredSize || node.size);
+            node.__webuiBridgeDesiredSize = desired;
+            data.size = [...desired];
             if (data.widgets_values.length > 2) {
                 data.widgets_values[2] = normalizeClipStrength(data.widgets_values[2]);
             }
@@ -10924,23 +10958,14 @@ function installWebUIPanel(node) {
         getMaxHeight: () => Math.max(280, PANEL_MAX_HEIGHT - DOM_WIDGET_LAYOUT_PAD),
     });
     installWidgetSerializationFallback(domWidget, () => null);
-    if (Array.isArray(node.widgets)) {
-        const index = node.widgets.indexOf(domWidget);
-        if (index >= 0 && index < node.widgets.length - 1) {
-            node.widgets.splice(index, 1);
-            node.widgets.push(domWidget);
-        }
-    }
+    pinBridgeDomWidgetToTop(node, domWidget);
     for (const widget of node.widgets || []) installWidgetSerializationFallback(widget);
     ensureGraphLinksSerializableCompatibility();
-    domWidget.y = 0;
-    domWidget.last_y = 0;
-    const applyDomWidgetSize = (nodeWidth, nodeHeight, widgetTop = 0) => {
+    const applyDomWidgetSize = (nodeWidth, nodeHeight) => {
         const [, clampedNodeHeight] = clampPanelSize(nodeWidth, nodeHeight);
-        domWidget.y = 0;
-        domWidget.last_y = 0;
+        pinBridgeDomWidgetToTop(node, domWidget);
         const widgetWidth = Math.max(PANEL_MIN_WIDTH, nodeWidth - 20);
-        const widgetHeight = Math.max(280, clampedNodeHeight - Math.max(0, widgetTop) - DOM_WIDGET_LAYOUT_PAD);
+        const widgetHeight = Math.max(280, clampedNodeHeight - DOM_WIDGET_LAYOUT_PAD);
         panel.style.width = `${widgetWidth}px`;
         panel.style.height = `${widgetHeight}px`;
         return [widgetWidth, widgetHeight];
@@ -10950,11 +10975,11 @@ function installWebUIPanel(node) {
         const desired = node.__webuiBridgeDesiredSize || node.size || [width || 1040, 820];
         const nodeWidth = desired[0] || width || 1040;
         const nodeHeight = desired[1] || 820;
-        const widgetTop = Number.isFinite(domWidget.y) && domWidget.y > 0 ? domWidget.y : 0;
-        return applyDomWidgetSize(nodeWidth, nodeHeight, widgetTop);
+        return applyDomWidgetSize(nodeWidth, nodeHeight);
     };
     applyDomWidgetSize(node.__webuiBridgeDesiredSize[0], node.__webuiBridgeDesiredSize[1]);
     node.__webuiBridgePanel = panel;
+    scheduleBridgeDomWidgetPin(node, domWidget, panel);
     node.resizable = true;
     if (hadBrokenPanelSize) {
         window.requestAnimationFrame?.(() => panel.__webuiBridgeResetNodeLayoutCache?.());
