@@ -104,6 +104,11 @@ const PANEL_ANOMALOUS_TALL_HEIGHT = 900;
 const PANEL_ANOMALOUS_TALL_RATIO = 1.75;
 const DOM_WIDGET_LAYOUT_PAD = 128;
 const DOM_WIDGET_PANEL_PAD = 14;
+const WORKFLOW_LAYOUT_REPAIR_DELAYS = [0, 32, 120, 360, 900, 1600, 3200, 6500];
+const WORKFLOW_CONFIGURED_SIZE_LOCK_MS = 6000;
+const WEBUI_STATUS_TIMEOUT_MS = 12000;
+const WEBUI_CONNECT_TIMEOUT_MS = 45000;
+const WEBUI_REFRESH_TIMEOUT_MS = 12000;
 const PROMPT_CHIPS_MIN_HEIGHT = 104;
 const EXTRA_NETWORKS_MIN_HEIGHT = 96;
 const EXTRA_NETWORKS_CARD_ROW_MIN_HEIGHT = 72;
@@ -931,14 +936,6 @@ function looksLikeLegacyDefaultSize(size) {
         Math.abs(values[1] - LEGACY_PANEL_HEIGHT) <= 8;
 }
 
-function looksLikeAutoExtendedDefaultSize(size) {
-    const values = bridgePanelSizeValues(size);
-    if (!values) return false;
-    const [width, height] = values;
-    const defaultOrRoomyWidth = width >= DEFAULT_PANEL_WIDTH - 40 && width <= 1420;
-    return height > PANEL_MAX_HEIGHT || (defaultOrRoomyWidth && height >= 1450);
-}
-
 function looksLikeBrokenBridgePanelSize(size) {
     const values = bridgePanelSizeValues(size);
     if (!values) return true;
@@ -958,7 +955,6 @@ function looksLikeAnomalousNarrowBridgePanelSize(size) {
 
 function shouldRepairBridgePanelSize(size) {
     return looksLikeBrokenBridgePanelSize(size) ||
-        looksLikeAutoExtendedDefaultSize(size) ||
         looksLikeAnomalousNarrowBridgePanelSize(size);
 }
 
@@ -966,7 +962,6 @@ function looksLikeSavedUserBridgePanelSize(size) {
     return Boolean(bridgePanelSizeValues(size)) &&
         !looksLikeLegacyDefaultSize(size) &&
         !looksLikeBrokenBridgePanelSize(size) &&
-        !looksLikeAutoExtendedDefaultSize(size) &&
         !looksLikeAnomalousNarrowBridgePanelSize(size);
 }
 
@@ -978,14 +973,86 @@ function nodeHasSavedUserBridgePanelSize(node) {
         looksLikeSavedUserBridgePanelSize(node?.size);
 }
 
+function bridgeConfiguredSizeLockActive(node) {
+    return Boolean(
+        node &&
+        looksLikeSavedUserBridgePanelSize(node.__webuiBridgeSavedPanelSize) &&
+        (performance?.now?.() || Date.now()) < (node.__webuiBridgePreferConfiguredPanelSizeUntil || 0)
+    );
+}
+
+function bridgePanelSizesMatch(first, second, tolerance = 2) {
+    const firstValues = bridgePanelSizeValues(first);
+    const secondValues = bridgePanelSizeValues(second);
+    if (!firstValues || !secondValues) return false;
+    return Math.abs(firstValues[0] - secondValues[0]) <= tolerance &&
+        Math.abs(firstValues[1] - secondValues[1]) <= tolerance;
+}
+
+function looksLikeCurrentDefaultBridgePanelSize(size) {
+    const values = bridgePanelSizeValues(size);
+    if (!values) return false;
+    return Math.abs(values[0] - DEFAULT_PANEL_WIDTH) <= 8 &&
+        Math.abs(values[1] - DEFAULT_PANEL_HEIGHT) <= 8;
+}
+
+function shouldUseLiveBridgePanelSize(node, liveSize, savedSize) {
+    if (!looksLikeSavedUserBridgePanelSize(liveSize)) return false;
+    const liveLooksDefault = looksLikeCurrentDefaultBridgePanelSize(liveSize) || looksLikeLegacyDefaultSize(liveSize);
+    const savedLooksDefault = looksLikeCurrentDefaultBridgePanelSize(savedSize) || looksLikeLegacyDefaultSize(savedSize);
+    if (looksLikeSavedUserBridgePanelSize(savedSize) &&
+        !bridgePanelSizesMatch(liveSize, savedSize) &&
+        liveLooksDefault &&
+        !savedLooksDefault) {
+        return false;
+    }
+    if (!bridgeConfiguredSizeLockActive(node)) return true;
+    if (!looksLikeSavedUserBridgePanelSize(savedSize)) return true;
+    if (bridgePanelSizesMatch(liveSize, savedSize)) return true;
+    return savedLooksDefault && !liveLooksDefault;
+}
+
+function rememberBridgePanelSize(node, size, options = {}) {
+    const desired = normalizeBridgePanelSize(size);
+    node.__webuiBridgeDesiredSize = [...desired];
+    if (looksLikeSavedUserBridgePanelSize(desired)) {
+        node.__webuiBridgeSavedPanelSize = [...desired];
+        if (options.clearConfiguredLock) {
+            node.__webuiBridgePreferConfiguredPanelSizeUntil = 0;
+        }
+    }
+    return desired;
+}
+
 function resolveBridgePanelSize(node) {
+    if (bridgeConfiguredSizeLockActive(node)) {
+        return normalizeBridgePanelSize(node.__webuiBridgeSavedPanelSize);
+    }
+    if (looksLikeSavedUserBridgePanelSize(node?.size)) {
+        return normalizeBridgePanelSize(node.size);
+    }
     if (looksLikeSavedUserBridgePanelSize(node?.__webuiBridgeSavedPanelSize)) {
         return normalizeBridgePanelSize(node.__webuiBridgeSavedPanelSize);
     }
-    if (nodeHasSavedUserBridgePanelSize(node)) {
-        return normalizeBridgePanelSize(node.size);
-    }
     return normalizeBridgePanelSize(node?.__webuiBridgeDesiredSize || node?.size);
+}
+
+function resolveBridgePanelSizeForLiveState(node, options = {}) {
+    const liveSize = looksLikeSavedUserBridgePanelSize(node?.size)
+        ? normalizeBridgePanelSize(node.size)
+        : null;
+    const savedSize = looksLikeSavedUserBridgePanelSize(node?.__webuiBridgeSavedPanelSize)
+        ? normalizeBridgePanelSize(node.__webuiBridgeSavedPanelSize)
+        : null;
+    if (liveSize && shouldUseLiveBridgePanelSize(node, liveSize, savedSize)) {
+        const liveDiffersFromSaved = savedSize && !bridgePanelSizesMatch(liveSize, savedSize);
+        return rememberBridgePanelSize(node, liveSize, {
+            clearConfiguredLock: Boolean(options.clearConfiguredLock && liveDiffersFromSaved),
+        });
+    }
+    const desired = resolveBridgePanelSize(node);
+    node.__webuiBridgeDesiredSize = [...desired];
+    return desired;
 }
 
 function normalizeBridgePanelSize(size, fallback = [DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT]) {
@@ -1072,7 +1139,7 @@ function syncBridgeDomWidgetWrapper(panel, width, height) {
         setImportant(root, "height", "100%");
         setImportant(root, "min-height", "0");
         setImportant(root, "box-sizing", "border-box");
-        setImportant(root, "overflow", "visible");
+        setImportant(root, "overflow", "hidden");
     }
     const host = roots.find((root) => root.classList?.contains("lg-node-widgets"));
     if (host) {
@@ -1095,8 +1162,10 @@ function syncBridgeDomWidgetWrapper(panel, width, height) {
         setImportant(widgetHost, "display", "grid");
         setImportant(widgetHost, "grid-template-rows", "minmax(0, 1fr)");
     }
-    setImportant(panel, "width", `${wrapperWidth}px`);
-    setImportant(panel, "height", `${wrapperHeight}px`);
+    setImportant(panel, "width", "100%");
+    setImportant(panel, "max-width", "100%");
+    setImportant(panel, "height", "100%");
+    setImportant(panel, "max-height", "100%");
 }
 
 function bridgeScrollableWheelTarget(target, deltaY = 0) {
@@ -1116,9 +1185,225 @@ function bridgeScrollableWheelTarget(target, deltaY = 0) {
     return null;
 }
 
+function bridgeCanvasHasPendingNodePlacement() {
+    const canvas = app?.canvas;
+    if (!canvas) return false;
+    return canvas.state?.ghostNodeId !== undefined && canvas.state.ghostNodeId !== null;
+}
+
+function bridgeCanvasPointerIsActive(canvas = app?.canvas) {
+    if (!canvas) return false;
+    return Boolean(canvas.pointer?.isDown || canvas.dragging_canvas || canvas.isDragging || canvas._dragZoomStart);
+}
+
+function bridgeCanvasEventPathIncludes(event, element) {
+    if (!event || !element) return false;
+    if (event.target === element || element.contains?.(event.target)) return true;
+    return Boolean(event.composedPath?.().includes(element));
+}
+
+function recoverBridgeStaleCanvasPointer(event) {
+    const canvas = app?.canvas;
+    if (!canvas?.pointer?.isDown) return false;
+    if (event?.buttons) return false;
+    try {
+        if (typeof canvas.processMouseCancel === "function") {
+            canvas.processMouseCancel(event);
+        } else {
+            canvas.pointer?.reset?.();
+        }
+        canvas.dragging_canvas = false;
+        canvas.isDragging = false;
+        return true;
+    } catch (error) {
+        console.warn("[WebUI Prompt Bridge] Failed to recover stale ComfyUI canvas pointer", error);
+        return false;
+    }
+}
+
+function installBridgeCanvasPointerRecovery() {
+    if (document.__webuiBridgeCanvasPointerRecoveryInstalled) return;
+    document.__webuiBridgeCanvasPointerRecoveryInstalled = true;
+    const recover = (event) => {
+        if ((event.type === "pointerup" || event.type === "mouseup" || event.type === "pointercancel") &&
+            document.__webuiBridgeCanvasPointerRelay) {
+            return;
+        }
+        recoverBridgeStaleCanvasPointer(event);
+    };
+    document.addEventListener("pointermove", recover, true);
+    document.addEventListener("mousemove", recover, true);
+    document.addEventListener("mouseup", recover, true);
+    document.addEventListener("pointerup", recover, true);
+    document.addEventListener("pointercancel", recover, true);
+    document.addEventListener("keyup", (event) => {
+        if (event.key === "Escape") recoverBridgeStaleCanvasPointer();
+    }, true);
+}
+
+function bridgePanelTargetOwnsPointer(target, handleSelector) {
+    if (!(target instanceof Element)) return false;
+    const panel = target.closest?.(".webui-bridge-panel");
+    const localSelector = [
+        handleSelector,
+        "button",
+        "input",
+        "textarea",
+        "select",
+        "option",
+        "label",
+        "summary",
+        "a[href]",
+        "[contenteditable='true']",
+        "[role='button']",
+        "[role='checkbox']",
+        "[role='menuitem']",
+        "[role='radio']",
+        "[role='switch']",
+        "[tabindex]:not(.webui-bridge-panel):not(.webui-bridge-toprow):not(.webui-bridge-extra)",
+        ".webui-bridge-card",
+        ".webui-bridge-card-trigger",
+        ".webui-bridge-tree-item",
+        ".webui-bridge-custom-tag-row",
+        ".webui-bridge-tag-chip",
+        ".webui-bridge-prompt-chip",
+        ".webui-bridge-prompt-label",
+        ".webui-bridge-extra-head",
+        ".webui-bridge-network-controls",
+        ".webui-bridge-model-controls",
+    ].filter(Boolean).join(",");
+    const pointerOwner = target.closest?.(localSelector);
+    if (!pointerOwner) return false;
+    return !panel || panel.contains(pointerOwner);
+}
+
+function forwardBridgeCanvasPointer(event, methodName) {
+    const canvas = app?.canvas;
+    if (typeof canvas?.[methodName] !== "function") return false;
+    try {
+        canvas[methodName](event);
+        if (methodName === "processMouseDown") {
+            try {
+                Object.defineProperty(event, "__webuiBridgeCanvasPointerForwarded", { value: true, configurable: true });
+            } catch {
+                event.__webuiBridgeCanvasPointerForwarded = true;
+            }
+        }
+        return true;
+    } catch (error) {
+        console.warn(`[WebUI Prompt Bridge] Failed to forward ${event.type} to ComfyUI canvas`, error);
+        return false;
+    }
+}
+
+function forwardBridgePendingNodePlacementPointer(event) {
+    if (event.__webuiBridgeCanvasPointerForwarded) return false;
+    if (!bridgeCanvasHasPendingNodePlacement()) return false;
+    const forwarded = forwardBridgeCanvasPointer(event, "processMouseDown");
+    if (forwarded) event.preventDefault?.();
+    return forwarded;
+}
+
+function installBridgeCanvasPointerRelay(startEvent) {
+    const canvas = app?.canvas;
+    const canvasElement = canvas?.canvas;
+    if (!canvas || !canvasElement) return;
+    const previousRelay = document.__webuiBridgeCanvasPointerRelay;
+    previousRelay?.cleanup?.();
+    const pointerId = startEvent.pointerId;
+    const isPointerRelay = startEvent.type.startsWith("pointer");
+    const matchesActivePointer = (event) => {
+        if (isPointerRelay && event.pointerId !== pointerId) return false;
+        return true;
+    };
+    const shouldForward = (event) => {
+        if (!matchesActivePointer(event)) return false;
+        if (bridgeCanvasEventPathIncludes(event, canvasElement)) return false;
+        return bridgeCanvasPointerIsActive(canvas);
+    };
+    const relayMove = (event) => {
+        if (!shouldForward(event)) return;
+        forwardBridgeCanvasPointer(event, "processMouseMove");
+    };
+    const relayUp = (event) => {
+        if (matchesActivePointer(event) && !bridgeCanvasEventPathIncludes(event, canvasElement) && bridgeCanvasPointerIsActive(canvas)) {
+            forwardBridgeCanvasPointer(event, "processMouseUp");
+        }
+        cleanup();
+    };
+    const relayCancel = (event) => {
+        if (matchesActivePointer(event) && bridgeCanvasPointerIsActive(canvas)) {
+            forwardBridgeCanvasPointer(event, "processMouseCancel");
+        }
+        cleanup();
+    };
+    const cleanup = () => {
+        document.removeEventListener("pointermove", relayMove, true);
+        document.removeEventListener("pointerup", relayUp, true);
+        document.removeEventListener("pointercancel", relayCancel, true);
+        document.removeEventListener("mousemove", relayMove, true);
+        document.removeEventListener("mouseup", relayUp, true);
+        window.removeEventListener("blur", relayCancel, true);
+        if (document.__webuiBridgeCanvasPointerRelay?.cleanup === cleanup) {
+            document.__webuiBridgeCanvasPointerRelay = null;
+        }
+    };
+    document.__webuiBridgeCanvasPointerRelay = { cleanup };
+    if (isPointerRelay) {
+        document.addEventListener("pointermove", relayMove, true);
+        document.addEventListener("pointerup", relayUp, true);
+        document.addEventListener("pointercancel", relayCancel, true);
+    } else {
+        document.addEventListener("mousemove", relayMove, true);
+        document.addEventListener("mouseup", relayUp, true);
+    }
+    window.addEventListener("blur", relayCancel, true);
+}
+
+function forwardBridgePanelPointerDown(event, handleSelector) {
+    const canvas = app?.canvas;
+    const isMiddlePan = event.button === 1 || event.buttons === 4;
+    if (event.__webuiBridgeCanvasPointerForwarded) return false;
+    if (!canvas || typeof canvas.processMouseDown !== "function") return false;
+    if (event.defaultPrevented && !isMiddlePan) return false;
+    if (!isMiddlePan && bridgePanelTargetOwnsPointer(event.target, handleSelector)) return false;
+    if (bridgeCanvasPointerIsActive(canvas)) return false;
+    const forwarded = forwardBridgeCanvasPointer(event, "processMouseDown");
+    if (forwarded) event.preventDefault?.();
+    return forwarded;
+}
+
+function stopBridgeCanvasOwnedPointer(event) {
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+}
+
+function installBridgeDocumentCanvasPointerCapture(handleSelector) {
+    if (document.__webuiBridgeDocumentCanvasPointerCaptureInstalled) return;
+    document.__webuiBridgeDocumentCanvasPointerCaptureInstalled = true;
+    const captureCanvasPointer = (event) => {
+        const target = event.target;
+        if (!(target instanceof Element)) return;
+        const panel = target.closest?.(".webui-bridge-panel");
+        if (!panel || target.closest?.(handleSelector)) return;
+        const isPointerStart = event.type === "pointerdown" || (!window.PointerEvent && event.type === "mousedown");
+        if (!isPointerStart) return;
+        const wantsCanvas = bridgeCanvasHasPendingNodePlacement() || event.button === 1 || event.buttons === 4;
+        if (!wantsCanvas) return;
+        installBridgeCanvasPointerRelay(event);
+        if (forwardBridgePendingNodePlacementPointer(event) ||
+            forwardBridgePanelPointerDown(event, handleSelector)) {
+            stopBridgeCanvasOwnedPointer(event);
+        }
+    };
+    document.addEventListener("pointerdown", captureCanvasPointer, true);
+    document.addEventListener("mousedown", captureCanvasPointer, true);
+}
+
 function installBridgePanelCanvasEventGuards(panel) {
     if (!panel || panel.__webuiBridgeCanvasEventGuardsInstalled) return;
     panel.__webuiBridgeCanvasEventGuardsInstalled = true;
+    installBridgeCanvasPointerRecovery();
     const handleSelector = [
         ".webui-bridge-resize-grip",
         ".webui-bridge-section-resizer",
@@ -1127,10 +1412,38 @@ function installBridgePanelCanvasEventGuards(panel) {
         ".webui-bridge-node-width-resizer",
         ".webui-bridge-sidebar-width-button",
     ].join(",");
+    installBridgeDocumentCanvasPointerCapture(handleSelector);
+    const captureCanvasPointer = (event) => {
+        if (event.target?.closest?.(handleSelector)) return;
+        const isPointerStart = event.type === "pointerdown" || (!window.PointerEvent && event.type === "mousedown");
+        if (!isPointerStart) return;
+        const wantsCanvas = bridgeCanvasHasPendingNodePlacement() || event.button === 1 || event.buttons === 4;
+        if (!wantsCanvas) return;
+        installBridgeCanvasPointerRelay(event);
+        if (forwardBridgePendingNodePlacementPointer(event) ||
+            forwardBridgePanelPointerDown(event, handleSelector)) {
+            stopBridgeCanvasOwnedPointer(event);
+        }
+    };
     const stopCanvasPointer = (event) => {
         if (event.target?.closest?.(handleSelector)) return;
+        if (event.type === "pointerdown" || (!window.PointerEvent && event.type === "mousedown")) {
+            installBridgeCanvasPointerRelay(event);
+        }
+        if (event.type === "pointerdown" || (!window.PointerEvent && event.type === "mousedown")) {
+            if (forwardBridgePendingNodePlacementPointer(event)) {
+                event.stopPropagation();
+                return;
+            }
+            if (forwardBridgePanelPointerDown(event, handleSelector)) {
+                event.stopPropagation();
+                return;
+            }
+        }
         event.stopPropagation();
     };
+    panel.addEventListener("pointerdown", captureCanvasPointer, true);
+    panel.addEventListener("mousedown", captureCanvasPointer, true);
     panel.addEventListener("pointerdown", stopCanvasPointer);
     panel.addEventListener("mousedown", stopCanvasPointer);
     panel.addEventListener("dblclick", stopCanvasPointer);
@@ -1171,8 +1484,7 @@ function installBridgePanelCanvasEventGuards(panel) {
 function scheduleBridgeDomWidgetPin(node, widget, panel) {
     const pin = () => {
         pinBridgeDomWidgetToTop(node, widget);
-        const desired = resolveBridgePanelSize(node);
-        node.__webuiBridgeDesiredSize = desired;
+        const desired = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
         node.__webuiBridgeApplyDomWidgetSize?.(desired[0], desired[1]);
         panel?.__webuiBridgeScheduleAdaptiveLayout?.();
     };
@@ -1181,6 +1493,46 @@ function scheduleBridgeDomWidgetPin(node, widget, panel) {
     window.setTimeout(pin, 0);
     window.setTimeout(pin, 120);
     window.setTimeout(pin, 500);
+}
+
+function repairBridgePanelLayoutAfterWorkflow(node, reason = "workflow") {
+    if (!node || node.type !== TARGET_NODE) return;
+    const run = () => {
+        if (!isBridgePanelUsable(node)) {
+            scheduleBridgePanelInstall(node);
+            return;
+        }
+        const widget = node.widgets?.find((item) => item?.name === "webui_prompt_frontend" && item.element === node.__webuiBridgePanel);
+        const panel = node.__webuiBridgePanel;
+        const desired = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
+        pinBridgeDomWidgetToTop(node, widget);
+        if (Math.round(Number(node.size?.[0] || 0)) !== desired[0] ||
+            Math.round(Number(node.size?.[1] || 0)) !== desired[1]) {
+            node.__webuiBridgeApplyingConfiguredSize = bridgeConfiguredSizeLockActive(node);
+            try {
+                node.setSize?.([...desired]);
+            } finally {
+                node.__webuiBridgeApplyingConfiguredSize = false;
+            }
+        }
+        node.__webuiBridgeApplyDomWidgetSize?.(desired[0], desired[1]);
+        panel?.__webuiBridgeScheduleAdaptiveLayout?.();
+        window.requestAnimationFrame?.(() => panel?.__webuiBridgeScheduleAdaptiveLayout?.());
+    };
+    run();
+    for (const delay of WORKFLOW_LAYOUT_REPAIR_DELAYS) {
+        window.setTimeout?.(run, delay);
+    }
+}
+
+function scheduleBridgePanelLayoutRepairForGraph(reason = "workflow") {
+    const repair = () => {
+        visitBridgeNodes(getAppGraphSafe(), (node) => repairBridgePanelLayoutAfterWorkflow(node, reason));
+    };
+    repair();
+    for (const delay of WORKFLOW_LAYOUT_REPAIR_DELAYS) {
+        window.setTimeout?.(repair, delay);
+    }
 }
 
 function shouldHideNativeWidget(widget) {
@@ -1538,10 +1890,13 @@ function installBridgeImageInputPanel(node) {
 }
 
 function getAppGraphSafe() {
-    if (app.rootGraph) return app.rootGraph;
+    if (app.rootGraphInternal) return app.rootGraphInternal;
     if (app.canvas?.graph) return app.canvas.graph;
     if (!app.canvas) return null;
+    const graphReady = typeof app.isGraphReady === "function" ? app.isGraphReady() : app.isGraphReady;
+    if (graphReady === false || (!graphReady && !app.rootGraphInternal)) return null;
     try {
+        if (app.rootGraph) return app.rootGraph;
         return app.graph || null;
     } catch {
         return null;
@@ -1572,8 +1927,11 @@ function markGraphChanged(targetNode = null) {
         window.comfyAPI?.workflow?.activeWorkflow,
     ].filter(Boolean);
     for (const workflow of [...new Set(workflowCandidates)]) {
-        workflow.changeTracker?.captureCanvasState?.();
-        workflow.changeTracker?.checkState?.();
+        if (workflow.changeTracker?.captureCanvasState) {
+            workflow.changeTracker.captureCanvasState();
+        } else {
+            workflow.changeTracker?.checkState?.();
+        }
     }
     window.dispatchEvent(new CustomEvent("webui-prompt-bridge-graph-changed", {
         detail: { nodeId: targetNode?.id ?? null },
@@ -2551,11 +2909,27 @@ function buildLoraFolderTree(loras) {
 function loraMatchesFilter(item, filter) {
     if (!filter || filter === "__all") return true;
     if (filter.startsWith("group:")) return true;
-    if (filter.startsWith("folder:")) return (item.folder || "Root") === filter.slice("folder:".length);
+    if (filter.startsWith("folder:")) {
+        const selectedFolder = filter.slice("folder:".length);
+        const itemFolder = item.folder || "Root";
+        return itemFolder === selectedFolder || (selectedFolder !== "Root" && itemFolder.startsWith(`${selectedFolder}/`));
+    }
     if (filter.startsWith("smart:")) return (item.category_label || loraCategoryForItem(item)) === filter.slice("smart:".length);
     if (filter.startsWith("sd:")) return loraSdVersionLabel(item) === filter.slice("sd:".length);
     if (filter.startsWith("status:")) return loraMetadataStatusLabel(item) === filter.slice("status:".length);
     return item.folder === filter;
+}
+
+function loraTreeNodeTitle(node, isRoot = false) {
+    if (isRoot) return "全部 LoRA";
+    if (node?.path?.startsWith?.("folder:")) {
+        const folder = node.path.slice("folder:".length);
+        return folder === "Root" ? "Root" : folder;
+    }
+    if (node?.path?.startsWith?.("smart:")) return `分类: ${node.name}`;
+    if (node?.path?.startsWith?.("sd:")) return `模型版本: ${node.name}`;
+    if (node?.path?.startsWith?.("status:")) return `整理状态: ${node.name}`;
+    return node?.name || "";
 }
 
 function setPromptTags(textarea, tags) {
@@ -3243,43 +3617,84 @@ function extractStylesFromPrompts(styles = [], prompt = "", negativePrompt = "")
     };
 }
 
-function fetchJsonWithTimeout(url, options = {}, timeoutMs = 0) {
-    if (!timeoutMs) {
-        return api.fetchApi(url, options).then((r) => r.json());
+function bridgeTimeoutError(message) {
+    const error = new Error(message);
+    error.name = "TimeoutError";
+    error.__webuiBridgeTimeout = true;
+    return error;
+}
+
+function bridgeAbortError(message = "请求已取消") {
+    const error = new Error(message);
+    error.name = "AbortError";
+    return error;
+}
+
+async function fetchBridgeApiWithTimeout(url, options = {}, timeoutMs = 0, timeoutMessage = "请求超时，请稍后重试") {
+    const externalSignal = options.signal;
+    if (externalSignal?.aborted) throw bridgeAbortError();
+    const controller = timeoutMs || externalSignal ? new AbortController() : null;
+    let timedOut = false;
+    let timer = 0;
+    let removeExternalAbort = () => {};
+    if (controller && externalSignal) {
+        const onExternalAbort = () => controller.abort();
+        externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+        removeExternalAbort = () => externalSignal.removeEventListener("abort", onExternalAbort);
     }
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    return api.fetchApi(url, { ...options, signal: controller.signal })
-        .then((r) => r.json())
-        .finally(() => clearTimeout(timer));
+    if (controller && timeoutMs) {
+        timer = globalThis.setTimeout?.(() => {
+            timedOut = true;
+            controller.abort();
+        }, timeoutMs);
+    }
+    try {
+        return await api.fetchApi(url, controller ? { ...options, signal: controller.signal } : options);
+    } catch (error) {
+        if (timedOut) throw bridgeTimeoutError(timeoutMessage);
+        if (externalSignal?.aborted) throw bridgeAbortError();
+        throw error;
+    } finally {
+        if (timer) {
+            globalThis.clearTimeout?.(timer);
+        }
+        removeExternalAbort();
+    }
+}
+
+function fetchJsonWithTimeout(url, options = {}, timeoutMs = 0, timeoutMessage = "请求超时，请稍后重试") {
+    return fetchBridgeApiWithTimeout(url, options, timeoutMs, timeoutMessage).then((r) => r.json());
 }
 
 async function loadBridgeData(options = {}) {
     const loraDetail = options.loraDetail === "basic" ? "basic" : "full";
     const loraTimeoutMs = options.loraTimeoutMs ?? (loraDetail === "basic" ? 8000 : 15000);
+    const refreshTimeoutMs = options.refreshTimeoutMs ?? WEBUI_REFRESH_TIMEOUT_MS;
+    const fetchOptions = { cache: "no-store", signal: options.signal };
     const fallbackLoras = Array.isArray(options.fallbackLoras) ? options.fallbackLoras : [];
     const loadLoras = async () => {
         if (loraDetail === "basic") {
-            const data = await fetchJsonWithTimeout("/webui_prompt_bridge/loras?detail=basic", { cache: "no-store" }, loraTimeoutMs);
+            const data = await fetchJsonWithTimeout("/webui_prompt_bridge/loras?detail=basic", fetchOptions, loraTimeoutMs, "LoRA 列表读取超时，已保留原列表");
             return { ...data, detail: "basic" };
         }
         try {
-            const data = await fetchJsonWithTimeout("/webui_prompt_bridge/loras", { cache: "no-store" }, loraTimeoutMs);
+            const data = await fetchJsonWithTimeout("/webui_prompt_bridge/loras", fetchOptions, loraTimeoutMs, "LoRA 元数据读取超时，已切换到基础列表");
             return { ...data, detail: "full" };
         } catch (error) {
             console.warn("[WebUI Prompt Bridge] Full LoRA metadata load failed; falling back to basic list", error);
-            const data = await fetchJsonWithTimeout("/webui_prompt_bridge/loras?detail=basic", { cache: "no-store" }, 8000);
+            const data = await fetchJsonWithTimeout("/webui_prompt_bridge/loras?detail=basic", fetchOptions, 8000, "LoRA 基础列表读取超时，已保留原列表");
             return { ...data, detail: "basic" };
         }
     };
     const [lorasRes, stylesRes, promptAllInOneRes, modelsRes, webuiRes, settingsRes] = await Promise.allSettled([
         loadLoras(),
-        api.fetchApi("/webui_prompt_bridge/styles", { cache: "no-store" }).then((r) => r.json()),
-        api.fetchApi("/webui_prompt_bridge/prompt_all_in_one?lang=zh_CN", { cache: "no-store" }).then((r) => r.json()),
-        api.fetchApi("/webui_prompt_bridge/models", { cache: "no-store" }).then((r) => r.json()),
-        api.fetchApi("/webui_prompt_bridge/webui_integration", { cache: "no-store" }).then((r) => r.json()),
-        api.fetchApi("/webui_prompt_bridge/settings", { cache: "no-store" }).then((r) => r.json()),
+        fetchJsonWithTimeout("/webui_prompt_bridge/styles", fetchOptions, refreshTimeoutMs, "样式读取超时"),
+        fetchJsonWithTimeout("/webui_prompt_bridge/prompt_all_in_one?lang=zh_CN", fetchOptions, refreshTimeoutMs, "Prompt All in One 数据读取超时"),
+        fetchJsonWithTimeout("/webui_prompt_bridge/models", fetchOptions, refreshTimeoutMs, "模型列表读取超时"),
+        fetchJsonWithTimeout("/webui_prompt_bridge/webui_integration", fetchOptions, WEBUI_STATUS_TIMEOUT_MS, "WebUI 接入状态读取超时"),
+        fetchJsonWithTimeout("/webui_prompt_bridge/settings", fetchOptions, refreshTimeoutMs, "设置读取超时"),
     ]);
+    if (options.signal?.aborted) throw bridgeAbortError();
     const lorasLoaded = lorasRes.status === "fulfilled";
     return {
         loras: lorasLoaded ? lorasRes.value.loras || [] : fallbackLoras,
@@ -3581,7 +3996,9 @@ function installWorkflowLoadSanitizer() {
         const originalLoadGraphData = app.loadGraphData.bind(app);
         app.loadGraphData = async function (graphData, ...args) {
             sanitizeComfyCorePackageMetadataInWorkflowData(graphData);
-            return originalLoadGraphData(graphData, ...args);
+            const result = await originalLoadGraphData(graphData, ...args);
+            scheduleBridgePanelLayoutRepairForGraph("loadGraphData");
+            return result;
         };
     }
     const installGraphConfigurePatch = () => {
@@ -3590,7 +4007,9 @@ function installWorkflowLoadSanitizer() {
         const originalConfigure = prototype.configure;
         prototype.configure = function (graphData, ...args) {
             sanitizeComfyCorePackageMetadataInWorkflowData(graphData);
-            return originalConfigure.call(this, graphData, ...args);
+            const result = originalConfigure.call(this, graphData, ...args);
+            scheduleBridgePanelLayoutRepairForGraph("LGraph.configure");
+            return result;
         };
         prototype.__webuiBridgeWorkflowLoadSanitizerInstalled = true;
     };
@@ -4849,8 +5268,13 @@ async function replaceLoraPreview(name, file) {
     return bridgeJson(response, "替换 LoRA 预览图失败");
 }
 
-async function fetchWebUIIntegration() {
-    const response = await api.fetchApi("/webui_prompt_bridge/webui_integration", { cache: "no-store" });
+async function fetchWebUIIntegration(options = {}) {
+    const response = await fetchBridgeApiWithTimeout(
+        "/webui_prompt_bridge/webui_integration",
+        { cache: "no-store", signal: options.signal },
+        options.timeoutMs ?? WEBUI_STATUS_TIMEOUT_MS,
+        "读取 WebUI 接入状态超时；如果电脑有断开的移动盘/网盘，请先断开或手动填写 WebUI 根目录后重试",
+    );
     if (!response.ok) {
         if (response.status === 404) throw new Error("后端接口未加载，请重启 ComfyUI 后再打开一键接入");
         const { message } = await readBridgeResponse(response, `读取 WebUI 接入状态失败 (${response.status})`);
@@ -4859,12 +5283,18 @@ async function fetchWebUIIntegration() {
     return response.json();
 }
 
-async function connectWebUIRoot(webuiRoot, autoDetect = false) {
-    const response = await api.fetchApi("/webui_prompt_bridge/webui_integration", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ webui_root: webuiRoot, auto_detect: autoDetect }),
-    });
+async function connectWebUIRoot(webuiRoot, autoDetect = false, options = {}) {
+    const response = await fetchBridgeApiWithTimeout(
+        "/webui_prompt_bridge/webui_integration",
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ webui_root: webuiRoot, auto_detect: autoDetect }),
+            signal: options.signal,
+        },
+        options.timeoutMs ?? WEBUI_CONNECT_TIMEOUT_MS,
+        "WebUI 接入超时；已停止等待，请确认根目录能访问后重新点击。8/9 通常只是缺少一个可选目录，不代表接入失败",
+    );
     const { data, message, text } = await readBridgeResponse(response, `WebUI 接入失败 (${response.status})，请确认选择的是 WebUI 根目录`);
     if (!response.ok) {
         if (response.status === 404) throw new Error("后端接口未加载，请重启 ComfyUI 后再点一键接入");
@@ -8120,7 +8550,26 @@ function buildPanel(node) {
             el("option", { value: "" }, "自动检测到的 WebUI 目录"),
         ]);
         let webuiAssetsButton = null;
-        const close = () => mask.remove();
+        let autoDetectButton = null;
+        let connectButton = null;
+        let dialogBusy = false;
+        let integrationOperationId = 0;
+        let activeIntegrationController = null;
+        const setDialogBusy = (busy, activeButton = null) => {
+            dialogBusy = busy;
+            rootInput.disabled = busy;
+            guessSelect.disabled = busy;
+            if (autoDetectButton) autoDetectButton.disabled = busy;
+            if (connectButton) connectButton.disabled = busy;
+            if (webuiAssetsButton) webuiAssetsButton.disabled = busy || Boolean(webuiAssetsButton.__webuiBridgeReady);
+            if (autoDetectButton) autoDetectButton.textContent = busy && activeButton === autoDetectButton ? "检测中..." : "自动检测";
+            if (connectButton) connectButton.textContent = busy && activeButton === connectButton ? "接入中..." : "接入并刷新";
+        };
+        const close = () => {
+            activeIntegrationController?.abort?.();
+            integrationOperationId += 1;
+            mask.remove();
+        };
         const renderInfo = (info) => {
             state.webuiIntegration = info;
             if (info?.assets) state.assets = info.assets;
@@ -8135,17 +8584,25 @@ function buildPanel(node) {
             const ready = webuiExtensionsReady(info, state.assets);
             statusLine.textContent = ready ? `${webuiStatusText(info)}；配套扩展已存在，直接接入即可` : webuiStatusText(info);
             if (webuiAssetsButton) {
-                webuiAssetsButton.disabled = ready;
+                webuiAssetsButton.__webuiBridgeReady = ready;
+                webuiAssetsButton.disabled = dialogBusy || ready;
                 webuiAssetsButton.textContent = ready ? "扩展已存在" : "补齐缺失扩展";
                 webuiAssetsButton.title = ready ? "Prompt All in One 和 TagComplete 已存在，不需要下载" : "只下载 WebUI 中缺失的配套扩展";
             }
         };
         const connect = async (autoDetect = false) => {
+            activeIntegrationController?.abort?.();
+            const controller = new AbortController();
+            activeIntegrationController = controller;
+            const operationId = ++integrationOperationId;
             let root = rootInput.value.trim();
             statusLine.textContent = autoDetect ? "正在自动检测并接入..." : "正在接入 WebUI...";
+            setDialogBusy(true, autoDetect ? autoDetectButton : connectButton);
+            const isStale = () => controller.signal.aborted || operationId !== integrationOperationId;
             try {
                 if (autoDetect && !root) {
-                    const latest = await fetchWebUIIntegration();
+                    const latest = await fetchWebUIIntegration({ signal: controller.signal });
+                    if (isStale()) return;
                     renderInfo(latest);
                     root = rootInput.value.trim() || latest?.guesses?.[0] || "";
                     if (!root) {
@@ -8153,23 +8610,43 @@ function buildPanel(node) {
                         return;
                     }
                 }
-                const info = await connectWebUIRoot(root, autoDetect);
+                const info = await connectWebUIRoot(root, autoDetect, { signal: controller.signal });
+                if (isStale()) return;
                 renderInfo(info);
-                const data = await refreshBridgeData({ loraDetail: "basic", loraTimeoutMs: 8000 });
+                const data = await refreshBridgeData({
+                    loraDetail: "basic",
+                    loraTimeoutMs: 8000,
+                    refreshTimeoutMs: WEBUI_REFRESH_TIMEOUT_MS,
+                    signal: controller.signal,
+                });
+                if (isStale()) return;
                 setStatus(`已接入 WebUI：${info.webui_root}`, { kind: "success" });
                 statusLine.textContent = data.lorasLoaded
                     ? `${webuiStatusText(info)}；已刷新提示词、样式、LoRA 和模型列表`
                     : `${webuiStatusText(info)}；已刷新提示词、样式和模型列表，LoRA 扫描较慢，已保留原列表`;
             } catch (error) {
+                if (isStale()) return;
                 statusLine.textContent = `接入失败: ${error?.message || error}`;
+            } finally {
+                if (operationId === integrationOperationId) {
+                    activeIntegrationController = null;
+                    setDialogBusy(false);
+                }
             }
         };
         const installWebUIAssets = async () => {
+            activeIntegrationController?.abort?.();
+            const controller = new AbortController();
+            activeIntegrationController = controller;
+            const operationId = ++integrationOperationId;
             let root = rootInput.value.trim();
             statusLine.textContent = "正在检测 WebUI 配套扩展...";
+            setDialogBusy(true, webuiAssetsButton);
+            const isStale = () => controller.signal.aborted || operationId !== integrationOperationId;
             try {
                 if (!root) {
-                    const latest = await fetchWebUIIntegration();
+                    const latest = await fetchWebUIIntegration({ signal: controller.signal });
+                    if (isStale()) return;
                     renderInfo(latest);
                     root = rootInput.value.trim() || latest?.guesses?.[0] || "";
                 }
@@ -8178,15 +8655,25 @@ function buildPanel(node) {
                     return;
                 }
                 const result = await installBridgeAssets("webui", root);
+                if (isStale()) return;
                 if (result.webui_root) rootInput.value = result.webui_root;
                 state.settings = normalizeBridgeSettings(result.settings);
                 state.customTagCount = result.custom_tag_count || state.customTagCount;
-                renderInfo(await fetchWebUIIntegration());
-                await refreshBridgeData();
+                const latestInfo = await fetchWebUIIntegration({ signal: controller.signal });
+                if (isStale()) return;
+                renderInfo(latestInfo);
+                await refreshBridgeData({ signal: controller.signal });
+                if (isStale()) return;
                 statusLine.textContent = `${assetInstallMessage(result)}；已存在的扩展不会重复下载`;
                 setStatus("WebUI 配套扩展检查完成", { kind: "success" });
             } catch (error) {
+                if (isStale()) return;
                 statusLine.textContent = `安装失败: ${error?.message || error}`;
+            } finally {
+                if (operationId === integrationOperationId) {
+                    activeIntegrationController = null;
+                    setDialogBusy(false);
+                }
             }
         };
         guessSelect.addEventListener("change", () => {
@@ -8206,16 +8693,22 @@ function buildPanel(node) {
                 statusLine,
             ]),
             el("div", { class: "webui-bridge-config-actions" }, [
-                el("button", { type: "button", onclick: () => connect(true) }, "自动检测"),
+                autoDetectButton = el("button", { type: "button", onclick: () => connect(true) }, "自动检测"),
                 webuiAssetsButton = el("button", { type: "button", onclick: installWebUIAssets }, "补齐缺失扩展"),
-                el("button", { type: "button", class: "primary", onclick: () => connect(false) }, "接入并刷新"),
+                connectButton = el("button", { type: "button", class: "primary", onclick: () => connect(false) }, "接入并刷新"),
             ]),
         ]));
         document.body.append(mask);
+        const initialOperationId = integrationOperationId;
         try {
-            renderInfo(await fetchWebUIIntegration());
+            const initialInfo = await fetchWebUIIntegration();
+            if (initialOperationId === integrationOperationId && !dialogBusy) {
+                renderInfo(initialInfo);
+            }
         } catch (error) {
-            statusLine.textContent = error?.message || "读取配置失败，请粘贴 WebUI 根目录后重试";
+            if (initialOperationId === integrationOperationId && !dialogBusy) {
+                statusLine.textContent = error?.message || "读取配置失败，请粘贴 WebUI 根目录后重试";
+            }
         }
         rootInput.focus();
         rootInput.select();
@@ -9540,7 +10033,7 @@ function buildPanel(node) {
             const children = [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
             const row = el("button", {
                 class: `webui-bridge-tree-row${selected ? " selected" : ""}`,
-                title: isRoot ? "All LoRA" : node.name,
+                title: loraTreeNodeTitle(node, isRoot),
                 style: { "--depth": String(depth) },
                 onclick: (event) => {
                     const hitChevron = event.target?.classList?.contains("webui-bridge-tree-chevron");
@@ -10080,8 +10573,19 @@ function buildPanel(node) {
     let promptLoraSplitManual = false;
     let promptInnerSplitManual = false;
     let manualResizeSettleTimer = 0;
+    let bottomFitReleaseTimer = 0;
+    const schedulePostSuppressionAdaptiveLayout = () => {
+        window.clearTimeout?.(bottomFitReleaseTimer);
+        const now = performance?.now?.() || Date.now();
+        const delay = Math.max(80, suppressNodeBottomFitUntil - now + 80);
+        bottomFitReleaseTimer = window.setTimeout?.(() => {
+            bottomFitReleaseTimer = 0;
+            scheduleAdaptiveLayout?.();
+        }, delay) || 0;
+    };
     const holdNodeBottomFit = () => {
         suppressNodeBottomFitUntil = (performance?.now?.() || Date.now()) + 1400;
+        schedulePostSuppressionAdaptiveLayout();
     };
     node.__webuiBridgeHoldNodeBottomFit = holdNodeBottomFit;
     const holdPromptSplitFit = () => {
@@ -10875,7 +11379,7 @@ function buildPanel(node) {
 
     const fitLoraSectionToVisibleRows = (rows = 1, { force = false, fillAvailable = false } = {}) => {
         if (extraCollapsed || loraOverlayOpen || !extraSection?.isConnected) return;
-        if (!force && (performance?.now?.() || Date.now()) < suppressNodeBottomFitUntil) return;
+        if (!force && !fillAvailable && (performance?.now?.() || Date.now()) < suppressNodeBottomFitUntil) return;
         const extraRect = extraSection.getBoundingClientRect();
         const headHeight = extraSection.querySelector(".webui-bridge-extra-head")?.offsetHeight || 44;
         const grid = extraSection.querySelector(".webui-bridge-card-grid");
@@ -10904,7 +11408,14 @@ function buildPanel(node) {
             const gapBeforeExtra = splitterRect ? Math.max(0, (extraRectForGap.top - splitterRect.bottom) / viewportScale) : 0;
             availableExtraHeight = panelHeight - paddingTop - resizeTargetLayoutHeight(topRow) - gapBeforeSplitter - splitterHeight - gapBeforeExtra - 12;
         }
-        const shouldFillAvailable = fillAvailable && !promptLoraSplitManual && !promptInnerSplitManual;
+        const panelBottomBlank = panelHeight && panel
+            ? panel.getBoundingClientRect().bottom - extraRect.bottom - 6 * (resizeTargetViewportScale(panel) || 1)
+            : 0;
+        const hasLargeBottomBlank = panelHeight && panel
+            ? panelBottomBlank > Math.max(96 * (resizeTargetViewportScale(panel) || 1), panel.getBoundingClientRect().height * 0.08)
+            : false;
+        const shouldFillAvailable = fillAvailable &&
+            ((!promptLoraSplitManual && !promptInnerSplitManual) || hasLargeBottomBlank);
         const cappedHeight = shouldFillAvailable
             ? Math.max(nextHeight, availableExtraHeight || nextHeight)
             : Math.min(nextHeight, Math.max(EXTRA_NETWORKS_MIN_HEIGHT, availableExtraHeight || nextHeight));
@@ -10927,6 +11438,7 @@ function buildPanel(node) {
 
     const fitNodeBottomToVisibleContent = () => {
         if (loraOverlayOpen || !panel?.isConnected || !extraSection?.isConnected) return;
+        if (bridgeConfiguredSizeLockActive(node)) return;
         if (nodeHasSavedUserBridgePanelSize(node)) return;
         if ((performance?.now?.() || Date.now()) < suppressNodeBottomFitUntil) return;
         const currentWidth = node.size?.[0] || node.__webuiBridgeDesiredSize?.[0] || DEFAULT_PANEL_WIDTH;
@@ -10984,7 +11496,8 @@ function buildPanel(node) {
         const scale = resizeTargetViewportScale(panel) || 1;
         const targetGap = 6 * scale;
         const blank = panelRect.bottom - extraRect.bottom - targetGap;
-        if (blank > Math.max(1, 2 * scale) && !canGrow) return;
+        const largeBottomBlank = blank > Math.max(96 * scale, panelRect.height * 0.08);
+        if (blank > Math.max(1, 2 * scale) && !canGrow && !largeBottomBlank) return;
         if (Math.abs(blank) <= Math.max(1, 2 * scale)) return;
         const currentHeight = resizeTargetLayoutHeight(extraSection) || EXTRA_NETWORKS_MIN_HEIGHT;
         const nextHeight = currentHeight + blank / scale;
@@ -11147,6 +11660,7 @@ function buildPanel(node) {
     });
 
     loadBridgeData().then((data) => {
+        panel.__webuiBridgeDataLoaded = true;
         state.loras = data.loras;
         state.styles = data.styles;
         state.models = data.models;
@@ -11182,6 +11696,7 @@ function buildPanel(node) {
         negativeTagPanel.__webuiBridgeRender?.();
         const showedNodeTutorial = maybeShowNodeTutorial();
         if (!showedNodeTutorial) maybeShowStartupWizard();
+        repairBridgePanelLayoutAfterWorkflow(node, "data-loaded");
     });
 
     renderModelSwitch();
@@ -11207,8 +11722,7 @@ function installWebUIPanel(node) {
         if (usablePanel) {
             repairBridgeNodeWidgetDefaults(node);
             node.__webuiBridgePanel.style.display = "";
-            const desired = resolveBridgePanelSize(node);
-            node.__webuiBridgeDesiredSize = desired;
+            const desired = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
             pinBridgeDomWidgetToTop(node, existingWidget);
             node.__webuiBridgeApplyDomWidgetSize?.(desired[0], desired[1]);
             if (Math.round(Number(node.size?.[0] || 0)) !== desired[0] ||
@@ -11219,6 +11733,7 @@ function installWebUIPanel(node) {
                 node.__webuiBridgePanel.__webuiBridgeResetNodeLayoutCache?.();
             }
             scheduleBridgeDomWidgetPin(node, existingWidget, node.__webuiBridgePanel);
+            repairBridgePanelLayoutAfterWorkflow(node, "reuse-panel");
             return;
         }
         node.__webuiBridgePanel.__webuiBridgeSidebarResizeObserver?.disconnect?.();
@@ -11243,7 +11758,10 @@ function installWebUIPanel(node) {
                     return node;
                 }
                 node.__webuiBridgeDesiredSize = clamped;
-                node.__webuiBridgeSavedPanelSize = [...clamped];
+                if (!node.__webuiBridgeApplyingConfiguredSize) {
+                    node.__webuiBridgeSavedPanelSize = [...clamped];
+                    node.__webuiBridgePreferConfiguredPanelSizeUntil = 0;
+                }
                 node.__webuiBridgeHoldNodeBottomFit?.();
                 const result = originalSetSize(clamped);
                 node.__webuiBridgeApplyDomWidgetSize?.(clamped[0], clamped[1]);
@@ -11273,8 +11791,7 @@ function installWebUIPanel(node) {
         chainCallback(node, "onSerialize", function (data) {
             if (!data || !Array.isArray(data.widgets_values)) return;
             repairBridgeNodeWidgetDefaults(node);
-            const desired = resolveBridgePanelSize(node);
-            node.__webuiBridgeDesiredSize = desired;
+            const desired = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
             data.size = [...desired];
             data.widgets_values = bridgePromptWidgetValuesFromNode(node);
         });
@@ -11334,9 +11851,10 @@ function installWebUIPanel(node) {
     applyDomWidgetSize(node.__webuiBridgeDesiredSize[0], node.__webuiBridgeDesiredSize[1]);
     node.__webuiBridgePanel = panel;
     scheduleBridgeDomWidgetPin(node, domWidget, panel);
+    repairBridgePanelLayoutAfterWorkflow(node, "install-panel");
     node.resizable = true;
     if (nodeHasSavedUserBridgePanelSize(node)) {
-        const savedSize = resolveBridgePanelSize(node);
+        const savedSize = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
         const currentWidth = Math.round(Number(node.size?.[0] || 0));
         const currentHeight = Math.round(Number(node.size?.[1] || 0));
         if (currentWidth !== savedSize[0] || currentHeight !== savedSize[1]) {
@@ -11366,7 +11884,7 @@ function installWebUIPanel(node) {
     } else if (looksLikeLegacyDefaultSize(node.size)) {
         node.__webuiBridgeDesiredSize = clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT);
         node.setSize(node.__webuiBridgeDesiredSize);
-    } else if (looksLikeAutoExtendedDefaultSize(node.size) || looksLikeAnomalousNarrowBridgePanelSize(node.size)) {
+    } else if (looksLikeAnomalousNarrowBridgePanelSize(node.size)) {
         node.__webuiBridgeDesiredSize = clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT);
         node.setSize(node.__webuiBridgeDesiredSize);
     } else if (!node.size || node.size[0] < PANEL_MIN_WIDTH || node.size[1] < PANEL_MIN_HEIGHT) {
@@ -11581,6 +12099,7 @@ function addStyles() {
             min-width: 0 !important;
             max-width: none !important;
             min-height: 0 !important;
+            overflow: hidden !important;
         }
         .lg-node-widgets.webui-bridge-dom-widget-shell {
             position: absolute !important;
@@ -15055,8 +15574,20 @@ app.registerExtension({
             if (looksLikeSavedUserBridgePanelSize(data?.size)) {
                 this.__webuiBridgeSavedPanelSize = normalizeBridgePanelSize(data.size);
                 this.__webuiBridgeDesiredSize = [...this.__webuiBridgeSavedPanelSize];
+                this.__webuiBridgePreferConfiguredPanelSizeUntil = (performance?.now?.() || Date.now()) + WORKFLOW_CONFIGURED_SIZE_LOCK_MS;
+                if (Math.round(Number(this.size?.[0] || 0)) !== this.__webuiBridgeSavedPanelSize[0] ||
+                    Math.round(Number(this.size?.[1] || 0)) !== this.__webuiBridgeSavedPanelSize[1]) {
+                    this.__webuiBridgeApplyingConfiguredSize = true;
+                    try {
+                        this.size = [...this.__webuiBridgeSavedPanelSize];
+                        this.setSize?.([...this.__webuiBridgeSavedPanelSize]);
+                    } finally {
+                        this.__webuiBridgeApplyingConfiguredSize = false;
+                    }
+                }
             } else {
                 this.__webuiBridgeSavedPanelSize = null;
+                this.__webuiBridgePreferConfiguredPanelSizeUntil = 0;
                 this.__webuiBridgeDesiredSize = clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT);
             }
             repairBridgeNodeWidgetDefaults(this);
@@ -15079,5 +15610,6 @@ app.registerExtension({
         filterComfyCoreMissingNodeWarnings(missingNodes);
         repairComfyCorePackageMetadata();
         scheduleStaleMissingNodeWarningClear("afterConfigureGraph");
+        scheduleBridgePanelLayoutRepairForGraph("afterConfigureGraph");
     },
 });

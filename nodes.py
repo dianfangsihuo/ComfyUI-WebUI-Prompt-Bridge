@@ -53,6 +53,11 @@ _IMAGE_SIGNATURES = {
     ".jpeg": (b"\xff\xd8\xff",),
     ".webp": (b"RIFF",),
 }
+_EMPTY_THUMBNAIL_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00\x01"
+    b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+)
 DEFAULT_BRIDGE_SETTINGS = {
     "data_source": "auto",
     "translation_source": "auto",
@@ -843,24 +848,93 @@ def _webui_integration_status(webui_root=None):
     }
 
 
-def _guess_webui_roots():
+_WEBUI_ROOT_GUESS_CACHE = {"time": 0.0, "roots": []}
+_WEBUI_ROOT_GUESS_TTL = 15.0
+_WEBUI_ROOT_DIR_NAMES = (
+    "sd-webui-aki-v4.11.1-cu128",
+    "sd-webui-aki-v4.11.1",
+    "sd-webui-aki-v4.10",
+    "sd-webui-aki-v4.9",
+    "stable-diffusion-webui",
+    "sd-webui",
+)
+
+
+def _local_drive_letters():
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        bitmask = int(kernel32.GetLogicalDrives())
+        letters = []
+        for index in range(26):
+            if not (bitmask & (1 << index)):
+                continue
+            letter = chr(ord("A") + index)
+            drive_type = int(kernel32.GetDriveTypeW(f"{letter}:\\"))
+            if drive_type in {2, 3, 6}:  # removable, fixed, RAM disk; skip network/CD drives.
+                letters.append(letter)
+        return letters
+    except Exception:
+        return [letter for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ" if Path(f"{letter}:/").exists()]
+
+
+def _dedupe_root_texts(values):
+    seen = set()
+    result = []
+    for value in values:
+        text = _path_text(value).strip() if isinstance(value, Path) else str(value or "").replace("\\", "/").strip()
+        if not text:
+            continue
+        key = text.rstrip("/").casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def _guess_webui_roots(preferred=None, use_cache=True):
+    now = time.monotonic()
+    preferred_values = _dedupe_root_texts([preferred])
+    if use_cache and not preferred_values and now - float(_WEBUI_ROOT_GUESS_CACHE.get("time") or 0) < _WEBUI_ROOT_GUESS_TTL:
+        return list(_WEBUI_ROOT_GUESS_CACHE.get("roots") or [])
+    if use_cache and preferred_values and now - float(_WEBUI_ROOT_GUESS_CACHE.get("time") or 0) < _WEBUI_ROOT_GUESS_TTL:
+        preferred_found = []
+        for value in preferred_values:
+            path = _existing_path(value)
+            if path and ((path / "webui.py").exists() or (path / "launch.py").exists() or (path / "models").exists()):
+                preferred_found.append(_path_text(path))
+        return _dedupe_root_texts([*preferred_found, *(_WEBUI_ROOT_GUESS_CACHE.get("roots") or [])])[:12]
     candidates = []
+    candidates.extend(preferred_values)
     for value in (
         LOCAL_CONFIG.get("webui_root"),
         os.environ.get("WEBUI_PROMPT_BRIDGE_WEBUI_ROOT"),
-        "H:/sd-webui-aki-v4.9",
+        "C:/sd-webui-aki-v4.11.1-cu128",
+        "D:/sd-webui-aki-v4.11.1-cu128",
+        "H:/sd-webui-aki-v4.11.1-cu128",
+        "C:/sd-webui-aki-v4.9",
         "D:/sd-webui-aki-v4.9",
+        "H:/sd-webui-aki-v4.9",
         "D:/stable-diffusion-webui",
         "H:/stable-diffusion-webui",
     ):
         if value:
             candidates.append(value)
-    for drive in "CDEFGHIJKLMNOPQRSTUVWXYZ":
-        for name in ("sd-webui-aki-v4.9", "stable-diffusion-webui", "sd-webui"):
+    for drive in _local_drive_letters():
+        for name in _WEBUI_ROOT_DIR_NAMES:
             candidates.append(f"{drive}:/{name}")
+        drive_root = Path(f"{drive}:/")
+        try:
+            for child in drive_root.glob("sd-webui-aki*"):
+                candidates.append(child)
+        except Exception:
+            pass
     seen = set()
     found = []
-    for candidate in candidates:
+    for candidate in _dedupe_root_texts(candidates):
         path = _existing_path(candidate)
         key = _path_text(path).lower() if path else ""
         if not path or key in seen:
@@ -868,7 +942,11 @@ def _guess_webui_roots():
         if (path / "webui.py").exists() or (path / "launch.py").exists() or (path / "models").exists():
             seen.add(key)
             found.append(_path_text(path))
-    return found[:12]
+    found = found[:12]
+    if use_cache and not preferred_values:
+        _WEBUI_ROOT_GUESS_CACHE["time"] = now
+        _WEBUI_ROOT_GUESS_CACHE["roots"] = list(found)
+    return found
 
 
 def _configured_path(config_key, env_key):
@@ -5224,13 +5302,13 @@ def _register_routes():
                 **_webui_integration_status(root),
                 "assets": _bridge_asset_status(root),
                 "added_model_paths": added_model_paths,
-                "guesses": _guess_webui_roots(),
+                "guesses": _guess_webui_roots(root),
             })
         except Exception as exc:
             return web.json_response({
                 "ok": False,
                 "error": str(exc),
-                "guesses": _guess_webui_roots(),
+                "guesses": _guess_webui_roots(root),
             }, status=400)
 
     @routes.get("/webui_prompt_bridge/models")
@@ -5358,7 +5436,11 @@ def _register_routes():
         except Exception:
             preview_path = None
         if not preview_path:
-            return web.Response(status=404)
+            return web.Response(
+                body=_EMPTY_THUMBNAIL_PNG,
+                content_type="image/png",
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
         return web.FileResponse(preview_path)
 
     @routes.get("/webui_prompt_bridge/lora_info")
