@@ -1099,6 +1099,75 @@ function syncBridgeDomWidgetWrapper(panel, width, height) {
     setImportant(panel, "height", `${wrapperHeight}px`);
 }
 
+function bridgeScrollableWheelTarget(target, deltaY = 0) {
+    let current = target instanceof Element ? target : target?.parentElement;
+    while (current && current !== document.body) {
+        if (current.classList?.contains("webui-bridge-panel")) return null;
+        const style = getComputedStyle(current);
+        const overflowY = `${style.overflowY} ${style.overflow}`.toLowerCase();
+        const canScrollY = /(auto|scroll|overlay)/.test(overflowY) && current.scrollHeight > current.clientHeight + 2;
+        if (canScrollY) {
+            const canScrollDown = current.scrollTop + current.clientHeight < current.scrollHeight - 1;
+            const canScrollUp = current.scrollTop > 0;
+            if ((deltaY > 0 && canScrollDown) || (deltaY < 0 && canScrollUp)) return current;
+        }
+        current = current.parentElement;
+    }
+    return null;
+}
+
+function installBridgePanelCanvasEventGuards(panel) {
+    if (!panel || panel.__webuiBridgeCanvasEventGuardsInstalled) return;
+    panel.__webuiBridgeCanvasEventGuardsInstalled = true;
+    const handleSelector = [
+        ".webui-bridge-resize-grip",
+        ".webui-bridge-section-resizer",
+        ".webui-bridge-panel-splitter",
+        ".webui-bridge-side-resizer",
+        ".webui-bridge-node-width-resizer",
+        ".webui-bridge-sidebar-width-button",
+    ].join(",");
+    const stopCanvasPointer = (event) => {
+        if (event.target?.closest?.(handleSelector)) return;
+        event.stopPropagation();
+    };
+    panel.addEventListener("pointerdown", stopCanvasPointer);
+    panel.addEventListener("mousedown", stopCanvasPointer);
+    panel.addEventListener("dblclick", stopCanvasPointer);
+    panel.addEventListener("contextmenu", stopCanvasPointer);
+    panel.addEventListener("wheel", (event) => {
+        if (event.defaultPrevented || bridgeScrollableWheelTarget(event.target, event.deltaY)) {
+            event.stopPropagation();
+            return;
+        }
+        const canvas = app?.canvas?.canvas || document.querySelector("canvas");
+        if (!canvas || event.__webuiBridgeForwardedWheel) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const forwarded = new WheelEvent(event.type, {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            deltaX: event.deltaX,
+            deltaY: event.deltaY,
+            deltaZ: event.deltaZ,
+            deltaMode: event.deltaMode,
+            clientX: event.clientX,
+            clientY: event.clientY,
+            screenX: event.screenX,
+            screenY: event.screenY,
+            ctrlKey: event.ctrlKey,
+            shiftKey: event.shiftKey,
+            altKey: event.altKey,
+            metaKey: event.metaKey,
+            button: event.button,
+            buttons: event.buttons,
+        });
+        Object.defineProperty(forwarded, "__webuiBridgeForwardedWheel", { value: true });
+        canvas.dispatchEvent(forwarded);
+    }, { passive: false });
+}
+
 function scheduleBridgeDomWidgetPin(node, widget, panel) {
     const pin = () => {
         pinBridgeDomWidgetToTop(node, widget);
@@ -5616,10 +5685,12 @@ function createToolButton(text, title, onclick) {
 
 function createPanelErrorView(error) {
     const message = error?.stack || error?.message || String(error || "Unknown error");
-    return el("div", { class: "webui-bridge-panel webui-bridge-panel-error" }, [
+    const panel = el("div", { class: "webui-bridge-panel webui-bridge-panel-error" }, [
         el("div", { class: "webui-bridge-error-title" }, "WebUI Prompt Bridge failed to render"),
         el("pre", {}, message),
     ]);
+    installBridgePanelCanvasEventGuards(panel);
+    return panel;
 }
 
 function promptContains(text, prompt) {
@@ -10779,6 +10850,7 @@ function buildPanel(node) {
         extraSection,
         resizeGrip,
     ]);
+    installBridgePanelCanvasEventGuards(panel);
     node.__webuiBridgeMinNodeHeight = () => {
         const splitter = panel.querySelector?.(".webui-bridge-panel-splitter");
         const splitterHeight = splitter?.offsetHeight || PANEL_SPLIT_GRIP_HEIGHT;
