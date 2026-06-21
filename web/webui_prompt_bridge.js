@@ -1,79 +1,82 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
-const BRIDGE_DEBUG = window.__webuiPromptBridgeDebug = window.__webuiPromptBridgeDebug || {};
-BRIDGE_DEBUG.app = app;
+const BRIDGE_DEBUG = {};
 
 const TARGET_NODE = "WebUIPromptBridge";
 const IMAGE_INPUT_NODE = "WebUIPromptBridgeImageInput";
-const PROMPT_WIDGETS = new Set([
-    "positive_prompt",
-    "negative_prompt",
-    "default_clip_strength",
-    "fail_on_missing_lora",
-    "regional_enabled",
-    "regional_mode",
-    "regional_split",
-    "regional_ratios",
-    "regional_base_enabled",
-    "regional_common_enabled",
-    "regional_base_ratio",
-    "regional_strength",
-    "regional_canvas_auto",
-    "regional_canvas_width",
-    "regional_canvas_height",
-    "module_table_enabled",
-    "module_mask_enabled",
-    "module_mask_strength",
-    "module_mask_set_area_to_bounds",
-    "module_negative_common_enabled",
-    "module_negative_common_prompt",
-    "module_flip_enabled",
-    "module_flip_axis",
-    "module_presets_enabled",
-    "module_adetailer_enabled",
-    "module_adetailer_model",
-    "module_adetailer_prompt",
-    "module_adetailer_negative_prompt",
-    "module_adetailer_confidence",
-    "module_adetailer_mask_blur",
-    "module_adetailer_denoise",
-    "module_adetailer_inpaint_only_masked",
-    "module_adetailer_cycles",
-    "module_controlnet_enabled",
-    "module_controlnet_preprocessor",
-    "module_controlnet_model",
-    "module_controlnet_weight",
-    "module_controlnet_start",
-    "module_controlnet_end",
-    "module_controlnet_resize_mode",
-    "module_controlnet_control_mode",
-    "module_controlnet_pixel_perfect",
-    "module_sam_enabled",
-    "module_sam_model",
-    "module_sam_prompt_mode",
-    "module_sam_confidence",
-    "module_sam_mask_blur",
-    "module_sam_dilate",
-    "module_sam_inpaint_denoise",
-    "module_sam_inpaint_area",
-    "module_sam_padding",
-    "module_upscale_enabled",
-    "module_upscale_mode",
-    "module_upscale_by",
-    "module_upscale_upscaler",
-    "module_upscale_steps",
-    "module_upscale_denoise",
-    "module_upscale_tile_width",
-    "module_upscale_tile_height",
-    "module_upscale_overlap",
-    "module_regional_lora_enabled",
-    "module_img2img_image",
-    "module_img2img_mask",
-    "module_img2img_mode",
-    "module_img2img_denoise",
-    "module_img2img_enabled",
-]);
+const BRIDGE_WIDGET_DEFINITIONS = [
+    ["positive_prompt", "string", "masterpiece, best quality, anime style, 1girl, <lora:anima-highres-aesthetic-boost:0.65>"],
+    ["negative_prompt", "string", "worst quality, low quality, blurry, bad anatomy, extra fingers"],
+    ["default_clip_strength", "number", 1],
+    ["fail_on_missing_lora", "boolean", true],
+    ["regional_enabled", "boolean", false],
+    ["regional_mode", "enum", "matrix", ["matrix"]],
+    ["regional_split", "enum", "vertical", ["vertical", "horizontal", "grid"]],
+    ["regional_ratios", "string", "1,1"],
+    ["regional_base_enabled", "boolean", false],
+    ["regional_common_enabled", "boolean", false],
+    ["regional_base_ratio", "number", 0.2],
+    ["regional_strength", "number", 1],
+    ["regional_canvas_auto", "boolean", true],
+    ["regional_canvas_width", "integer", 1024],
+    ["regional_canvas_height", "integer", 1024],
+    ["module_table_enabled", "boolean", false],
+    ["module_mask_enabled", "boolean", false],
+    ["module_mask_strength", "number", 1],
+    ["module_mask_set_area_to_bounds", "boolean", false],
+    ["module_negative_common_enabled", "boolean", false],
+    ["module_negative_common_prompt", "string", ""],
+    ["module_flip_enabled", "boolean", false],
+    ["module_flip_axis", "enum", "auto", ["auto", "horizontal", "vertical"]],
+    ["module_presets_enabled", "boolean", false],
+    ["module_adetailer_enabled", "boolean", false],
+    ["module_adetailer_model", "enum", "face_yolov8m.pt", ["face_yolov8m.pt", "face_yolov8n.pt", "face_yolov8s.pt", "hand_yolov8s.pt", "hand_yolov8n.pt", "person_yolov8m-seg.pt", "person_yolov8n-seg.pt", "mediapipe_face_full", "custom"]],
+    ["module_adetailer_prompt", "string", "detailed face, detailed eyes, detailed hands"],
+    ["module_adetailer_negative_prompt", "string", "bad anatomy, deformed, blurry, extra fingers"],
+    ["module_adetailer_confidence", "number", 0.3],
+    ["module_adetailer_mask_blur", "integer", 4],
+    ["module_adetailer_denoise", "number", 0.4],
+    ["module_adetailer_inpaint_only_masked", "boolean", true],
+    ["module_adetailer_cycles", "integer", 1],
+    ["module_controlnet_enabled", "boolean", false],
+    ["module_controlnet_preprocessor", "enum", "canny", ["none", "canny", "depth", "openpose", "lineart", "softedge", "normal", "tile", "reference", "ip-adapter"]],
+    ["module_controlnet_model", "string", ""],
+    ["module_controlnet_weight", "number", 1],
+    ["module_controlnet_start", "number", 0],
+    ["module_controlnet_end", "number", 1],
+    ["module_controlnet_resize_mode", "enum", "just_resize", ["just_resize", "crop_and_resize", "resize_and_fill"]],
+    ["module_controlnet_control_mode", "enum", "balanced", ["balanced", "prompt", "control"]],
+    ["module_controlnet_pixel_perfect", "boolean", true],
+    ["module_sam_enabled", "boolean", false],
+    ["module_sam_model", "enum", "sam_vit_b", ["sam_vit_b", "sam_vit_l", "sam_vit_h", "sam_hq_vit_h", "mobile_sam", "custom"]],
+    ["module_sam_prompt_mode", "enum", "auto", ["auto", "point", "box", "mask"]],
+    ["module_sam_confidence", "number", 0.5],
+    ["module_sam_mask_blur", "integer", 4],
+    ["module_sam_dilate", "integer", 0],
+    ["module_sam_inpaint_denoise", "number", 0.45],
+    ["module_sam_inpaint_area", "enum", "only_masked", ["whole_picture", "only_masked"]],
+    ["module_sam_padding", "integer", 32],
+    ["module_upscale_enabled", "boolean", false],
+    ["module_upscale_mode", "enum", "hires_fix", ["hires_fix", "ultimate_sd_upscale", "latent_upscale", "tile"]],
+    ["module_upscale_by", "number", 2],
+    ["module_upscale_upscaler", "string", "nearest-exact"],
+    ["module_upscale_steps", "integer", 18],
+    ["module_upscale_denoise", "number", 0.48],
+    ["module_upscale_tile_width", "integer", 768],
+    ["module_upscale_tile_height", "integer", 768],
+    ["module_upscale_overlap", "integer", 64],
+    ["module_regional_lora_enabled", "boolean", false],
+    ["module_img2img_image", "string", ""],
+    ["module_img2img_mask", "string", ""],
+    ["module_img2img_mode", "enum", "img2img", ["img2img", "inpaint"]],
+    ["module_img2img_denoise", "number", 0.55],
+    ["module_img2img_enabled", "boolean", false],
+];
+const PROMPT_WIDGET_NAMES = BRIDGE_WIDGET_DEFINITIONS.map(([name]) => name);
+const PROMPT_WIDGETS = new Set(PROMPT_WIDGET_NAMES);
+const BRIDGE_WIDGET_DEFAULTS = Object.fromEntries(BRIDGE_WIDGET_DEFINITIONS.map(([name, , fallback]) => [name, fallback]));
+const BRIDGE_WIDGET_DEFINITION_BY_NAME = Object.fromEntries(BRIDGE_WIDGET_DEFINITIONS.map((definition) => [definition[0], definition]));
 const EXTRA_SEPARATOR = ", ";
 const ATTENTION_STEP = 0.1;
 const EXTRA_STEP = 0.05;
@@ -1516,6 +1519,80 @@ function setWidgetValue(node, name, value) {
     markGraphChanged(node);
 }
 
+function sanitizeBridgeWidgetValue(name, value) {
+    const definition = BRIDGE_WIDGET_DEFINITION_BY_NAME[name];
+    if (!definition) return value;
+    const [, kind, fallback, choices = []] = definition;
+    if (value === undefined || value === null) return fallback;
+    if (kind !== "string" && typeof value === "string" && value.trim() === "") return fallback;
+    if (kind === "boolean") {
+        if (typeof value === "boolean") return value;
+        if (typeof value === "number") return value !== 0;
+        if (typeof value === "string") return !/^(false|0|off|no)$/i.test(value.trim());
+        return Boolean(value);
+    }
+    if (kind === "number" || kind === "integer") {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return fallback;
+        return kind === "integer" ? Math.round(numeric) : numeric;
+    }
+    if (kind === "enum") {
+        const text = String(value);
+        return choices.includes(text) ? text : fallback;
+    }
+    if (kind === "string") {
+        return value === undefined || value === null ? fallback : String(value);
+    }
+    return value;
+}
+
+function sameBridgeWidgetValue(a, b) {
+    return a === b || (Number.isNaN(a) && Number.isNaN(b));
+}
+
+function repairBridgeNodeWidgetDefaults(node) {
+    if (!node || !Array.isArray(node.widgets)) return 0;
+    let changed = 0;
+    for (const name of PROMPT_WIDGET_NAMES) {
+        const widget = getWidget(node, name);
+        if (!widget) continue;
+        const repaired = sanitizeBridgeWidgetValue(name, widget.value);
+        if (!sameBridgeWidgetValue(widget.value, repaired)) {
+            widget.value = repaired;
+            changed += 1;
+        }
+    }
+    return changed;
+}
+
+function bridgePromptWidgetValuesFromNode(node) {
+    repairBridgeNodeWidgetDefaults(node);
+    const knownValues = PROMPT_WIDGET_NAMES.map((name) => {
+        const widget = getWidget(node, name);
+        return sanitizeBridgeWidgetValue(name, widget?.value);
+    });
+    const unknownTail = Array.isArray(node?.__webuiBridgeUnknownWidgetValues)
+        ? node.__webuiBridgeUnknownWidgetValues
+        : [];
+    if (unknownTail.length) {
+        return [...knownValues, ...unknownTail];
+    }
+    return knownValues;
+}
+
+function sanitizeBridgeWidgetsValues(values) {
+    if (!Array.isArray(values)) return { values, changed: 0 };
+    const next = [...values];
+    let changed = values.length < PROMPT_WIDGET_NAMES.length;
+    for (let index = 0; index < PROMPT_WIDGET_NAMES.length; index += 1) {
+        const name = PROMPT_WIDGET_NAMES[index];
+        const repaired = sanitizeBridgeWidgetValue(name, values[index]);
+        next[index] = repaired;
+        if (!sameBridgeWidgetValue(values[index], repaired)) changed = true;
+    }
+    return { values: next, changed: changed ? 1 : 0 };
+}
+
 function normalizeClipStrength(value, fallback = DEFAULT_CLIP_STRENGTH) {
     if (value === undefined || value === null) return fallback;
     if (typeof value === "string" && value.trim() === "") return fallback;
@@ -1533,7 +1610,7 @@ function repairClipStrengthWidget(node) {
 
 function bridgeWidgetValue(node, name, fallback) {
     const value = getWidget(node, name)?.value;
-    return value === undefined || value === null || value === "" ? fallback : value;
+    return sanitizeBridgeWidgetValue(name, value === undefined ? fallback : value);
 }
 
 function bridgeBooleanWidgetValue(node, name, fallback = false) {
@@ -3341,9 +3418,18 @@ function sanitizeComfyCorePackageMetadataInWorkflowData(data) {
     const cleanNodes = (nodes) => {
         if (!Array.isArray(nodes)) return;
         for (const nodeData of nodes) {
-            if (nodeData?.type === TARGET_NODE && shouldRepairBridgePanelSize(nodeData.size)) {
-                nodeData.size = clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT);
-                changed += 1;
+            if (nodeData?.type === TARGET_NODE) {
+                if (shouldRepairBridgePanelSize(nodeData.size)) {
+                    nodeData.size = clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT);
+                    changed += 1;
+                }
+                if (Array.isArray(nodeData.widgets_values)) {
+                    const repaired = sanitizeBridgeWidgetsValues(nodeData.widgets_values);
+                    if (repaired.changed) {
+                        nodeData.widgets_values = repaired.values;
+                        changed += repaired.changed;
+                    }
+                }
             }
             const properties = nodeData?.properties;
             if (!properties || String(properties.cnr_id || "") !== "comfy-core") continue;
@@ -3383,6 +3469,40 @@ function scheduleComfyCorePackageMetadataRepair() {
     window.setTimeout(repairComfyCorePackageMetadataAndReload, 500);
     window.setTimeout(repairComfyCorePackageMetadataAndReload, 1500);
     window.setTimeout(repairComfyCorePackageMetadataAndReload, 3000);
+}
+
+function visitBridgeNodes(graph, visitor) {
+    const nodes = graph?._nodes || graph?.nodes || [];
+    if (!Array.isArray(nodes)) return;
+    for (const node of nodes) {
+        if (node?.type === TARGET_NODE) visitor(node);
+        if (node?.subgraph) visitBridgeNodes(node.subgraph, visitor);
+    }
+}
+
+function repairLiveBridgeWidgetDefaults() {
+    let changed = 0;
+    visitBridgeNodes(getAppGraphSafe(), (node) => {
+        changed += repairBridgeNodeWidgetDefaults(node);
+    });
+    return changed;
+}
+
+function installGraphToPromptWidgetRepair() {
+    if (app.__webuiBridgeGraphToPromptRepairInstalled || typeof app.graphToPrompt !== "function") return;
+    const originalGraphToPrompt = app.graphToPrompt.bind(app);
+    app.graphToPrompt = function (...args) {
+        repairLiveBridgeWidgetDefaults();
+        return originalGraphToPrompt(...args);
+    };
+    app.__webuiBridgeGraphToPromptRepairInstalled = true;
+}
+
+function scheduleGraphToPromptWidgetRepairInstall() {
+    installGraphToPromptWidgetRepair();
+    window.setTimeout(installGraphToPromptWidgetRepair, 0);
+    window.setTimeout(installGraphToPromptWidgetRepair, 500);
+    window.setTimeout(installGraphToPromptWidgetRepair, 1500);
 }
 
 function installWorkflowLoadSanitizer() {
@@ -6020,15 +6140,12 @@ function createPromptAllInOnePanel(kind, title, textarea, state, sync) {
 }
 
 function buildPanel(node) {
+    repairBridgeNodeWidgetDefaults(node);
     const positiveWidget = getWidget(node, "positive_prompt");
     const negativeWidget = getWidget(node, "negative_prompt");
     const clipStrengthWidget = getWidget(node, "default_clip_strength");
-    const failOnMissingWidget = getWidget(node, "fail_on_missing_lora");
-    const regionalEnabledWidget = getWidget(node, "regional_enabled");
     const regionalSplitWidget = getWidget(node, "regional_split");
     const regionalRatiosWidget = getWidget(node, "regional_ratios");
-    const regionalBaseEnabledWidget = getWidget(node, "regional_base_enabled");
-    const regionalCommonEnabledWidget = getWidget(node, "regional_common_enabled");
     const regionalBaseRatioWidget = getWidget(node, "regional_base_ratio");
     const regionalStrengthWidget = getWidget(node, "regional_strength");
     const regionalCanvasAutoWidget = getWidget(node, "regional_canvas_auto");
@@ -6281,10 +6398,10 @@ function buildPanel(node) {
         title: "Stop generation when a LoRA tag cannot be found",
         onchange: (event) => setWidgetValue(node, "fail_on_missing_lora", event.currentTarget.checked),
     });
-    failOnMissingInput.checked = Boolean(failOnMissingWidget?.value ?? true);
+    failOnMissingInput.checked = bridgeBooleanWidgetValue(node, "fail_on_missing_lora", true);
 
     const regionalEnabledInput = el("input", { type: "checkbox", title: "启用 WebUI Regional Prompter 风格区域控制" });
-    regionalEnabledInput.checked = Boolean(regionalEnabledWidget?.value ?? false);
+    regionalEnabledInput.checked = bridgeBooleanWidgetValue(node, "regional_enabled", false);
     const regionalSplitSelect = el("select", { class: "webui-bridge-regional-select", title: "区域切分方向" }, [
         el("option", { value: "vertical" }, "纵向"),
         el("option", { value: "horizontal" }, "横向"),
@@ -6298,9 +6415,9 @@ function buildPanel(node) {
         title: "区域比例；网格用分号分行",
     });
     const regionalBaseInput = el("input", { type: "checkbox", title: "第一段作为所有区域共享的 base prompt" });
-    regionalBaseInput.checked = Boolean(regionalBaseEnabledWidget?.value ?? false);
+    regionalBaseInput.checked = bridgeBooleanWidgetValue(node, "regional_base_enabled", false);
     const regionalCommonInput = el("input", { type: "checkbox", title: "第一段追加到每个区域 prompt" });
-    regionalCommonInput.checked = Boolean(regionalCommonEnabledWidget?.value ?? false);
+    regionalCommonInput.checked = bridgeBooleanWidgetValue(node, "regional_common_enabled", false);
     const regionalBaseRatioInput = el("input", {
         type: "number",
         min: "0",
@@ -6795,7 +6912,7 @@ function buildPanel(node) {
     const moduleControls = [];
     const moduleCheckbox = (widget, fallback = false) => {
         const input = el("input", { type: "checkbox" });
-        input.checked = Boolean(widget?.value ?? fallback);
+        input.checked = widget ? sanitizeBridgeWidgetValue(widget.name, widget.value) : Boolean(fallback);
         moduleControls.push(input);
         return input;
     };
@@ -8795,14 +8912,33 @@ function buildPanel(node) {
             for (const [key, input] of visibilityInputs) visibility[key] = input.checked;
             return visibility;
         };
+        const visibilityMatchesPreset = (presetKey, visibility) => {
+            const preset = UI_VISIBILITY_PRESETS[presetKey] || UI_VISIBILITY_PRESETS.minimal;
+            return Object.keys(UI_VISIBILITY_DEFAULTS).every((key) => (visibility?.[key] !== false) === (preset[key] !== false));
+        };
+        const presetButtons = new Map();
+        const updatePresetActiveStates = () => {
+            const visibility = collectVisibilitySettings();
+            for (const [presetKey, button] of presetButtons) {
+                button.classList.toggle("active", visibilityMatchesPreset(presetKey, visibility));
+            }
+        };
         const makePresetButton = (presetKey, title, text) => el("button", {
             type: "button",
-            class: "webui-bridge-settings-preset",
-            onclick: () => setVisibilityPreset(presetKey),
+            class: `webui-bridge-settings-preset${visibilityMatchesPreset(presetKey, current.ui_visibility) ? " active" : ""}`,
+            onclick: () => {
+                setVisibilityPreset(presetKey);
+                updatePresetActiveStates();
+            },
         }, [
             el("b", {}, title),
             el("span", {}, text),
         ]);
+        const registerPresetButton = (presetKey, title, text) => {
+            const button = makePresetButton(presetKey, title, text);
+            presetButtons.set(presetKey, button);
+            return button;
+        };
         const configSection = (title, subtitle, children) => el("section", { class: "webui-bridge-settings-section" }, [
             el("div", { class: "webui-bridge-settings-section-title" }, [
                 el("h3", {}, title),
@@ -8986,12 +9122,12 @@ function buildPanel(node) {
                 el("div", { class: "webui-bridge-settings-hero" }, [
                     el("div", {}, [
                         el("b", {}, "快速开始"),
-                        el("span", {}, "默认保留基础生成、布局预设和 LoRA 浏览；推荐模式展开常用区域和 Styles；全部模式用于深度调参。"),
+                        el("span", {}, "首次安装默认使用起步模式：保留基础生成、默认布局和 LoRA 浏览；推荐模式展开常用区域和 Styles；全部模式只显示面板，不会启用扩展执行。"),
                     ]),
                     el("div", { class: "webui-bridge-settings-preset-row" }, [
-                        makePresetButton("minimal", "最小", "只留起步必需"),
-                        makePresetButton("recommended", "推荐", "常用功能展开"),
-                        makePresetButton("all", "全部", "显示所有模块"),
+                        registerPresetButton("minimal", "起步", "首次安装默认"),
+                        registerPresetButton("recommended", "推荐", "常用功能展开"),
+                        registerPresetButton("all", "全部", "显示所有面板"),
                     ]),
                 ]),
                 el("div", { class: "webui-bridge-settings-grid" }, [
@@ -9030,7 +9166,7 @@ function buildPanel(node) {
                 configSection("主节点内置功能显示", "这些功能直接由 WebUI Prompt Bridge 主节点处理，不需要额外增加模块节点。", [
                     makeVisibilityGrid(MAIN_MODULE_VISIBILITY_OPTIONS),
                 ]),
-                configSection("高级扩展模块显示", "这些功能涉及图片、Mask、ControlNet 或二次处理链路；显示后可在侧栏配置，复杂工作流仍可接专用模块节点。", [
+                configSection("高级扩展模块显示", "这里只控制面板是否显示；真正启用执行要打开各模块标题里的复选框。", [
                     makeVisibilityGrid(ADVANCED_MODULE_VISIBILITY_OPTIONS),
                 ]),
                 configSection("扩展与资源下载", "按需逐项下载。已存在的项目会跳过；新节点包通常需要重启 ComfyUI 后生效。", [
@@ -10991,16 +11127,22 @@ function buildPanel(node) {
 
 function installWebUIPanel(node) {
     repairComfyCorePackageMetadata();
+    repairBridgeNodeWidgetDefaults(node);
     if (node.__webuiBridgePanel) {
         const existingWidget = node.widgets?.find((widget) => widget.name === "webui_prompt_frontend");
         const usablePanel = existingWidget?.element === node.__webuiBridgePanel &&
             node.__webuiBridgePanel.querySelector?.(".webui-bridge-toprow, .webui-bridge-panel-error");
         if (usablePanel) {
+            repairBridgeNodeWidgetDefaults(node);
             node.__webuiBridgePanel.style.display = "";
             const desired = resolveBridgePanelSize(node);
             node.__webuiBridgeDesiredSize = desired;
             pinBridgeDomWidgetToTop(node, existingWidget);
             node.__webuiBridgeApplyDomWidgetSize?.(desired[0], desired[1]);
+            if (Math.round(Number(node.size?.[0] || 0)) !== desired[0] ||
+                Math.round(Number(node.size?.[1] || 0)) !== desired[1]) {
+                node.setSize?.(desired);
+            }
             if (shouldRepairBridgePanelSize(node.size)) {
                 node.__webuiBridgePanel.__webuiBridgeResetNodeLayoutCache?.();
             }
@@ -11012,6 +11154,7 @@ function installWebUIPanel(node) {
         node.__webuiBridgePanel = null;
     }
     removeBridgeDomWidgets(node);
+    repairBridgeNodeWidgetDefaults(node);
     if (!node.__webuiBridgeSetSizeWrapped && typeof node.setSize === "function") {
         const originalSetSize = node.setSize.bind(node);
         node.setSize = function (size) {
@@ -11057,15 +11200,11 @@ function installWebUIPanel(node) {
     if (!node.__webuiBridgeSerializeWrapped) {
         chainCallback(node, "onSerialize", function (data) {
             if (!data || !Array.isArray(data.widgets_values)) return;
+            repairBridgeNodeWidgetDefaults(node);
             const desired = resolveBridgePanelSize(node);
             node.__webuiBridgeDesiredSize = desired;
             data.size = [...desired];
-            if (data.widgets_values.length > 2) {
-                data.widgets_values[2] = normalizeClipStrength(data.widgets_values[2]);
-            }
-            while (data.widgets_values.length > 4 && data.widgets_values[data.widgets_values.length - 1] == null) {
-                data.widgets_values.pop();
-            }
+            data.widgets_values = bridgePromptWidgetValuesFromNode(node);
         });
         node.__webuiBridgeSerializeWrapped = true;
     }
@@ -13890,6 +14029,11 @@ function addStyles() {
             border-color: #70a7ff;
             background: #172437;
         }
+        .webui-bridge-settings-preset.active {
+            border-color: #7fb4ff;
+            background: #1d2d43;
+            box-shadow: inset 0 0 0 1px rgba(127, 180, 255, 0.45);
+        }
         .webui-bridge-settings-preset b {
             font-size: 14px;
         }
@@ -14800,6 +14944,7 @@ app.registerExtension({
     name: "WebUI.PromptBridge.Frontend",
     init() {
         installWorkflowLoadSanitizer();
+        scheduleGraphToPromptWidgetRepairInstall();
         addStyles();
         scheduleComfyCorePackageMetadataRepair();
         scheduleStaleMissingNodeWarningClear("init");
@@ -14828,6 +14973,13 @@ app.registerExtension({
         });
         chainCallback(nodeType.prototype, "onConfigure", function (data) {
             this.__webuiBridgeWasConfigured = true;
+            if (Array.isArray(data?.widgets_values)) {
+                const repaired = sanitizeBridgeWidgetsValues(data.widgets_values);
+                if (repaired.changed) data.widgets_values = repaired.values;
+                this.__webuiBridgeUnknownWidgetValues = data.widgets_values.slice(PROMPT_WIDGET_NAMES.length);
+            } else {
+                this.__webuiBridgeUnknownWidgetValues = [];
+            }
             if (looksLikeSavedUserBridgePanelSize(data?.size)) {
                 this.__webuiBridgeSavedPanelSize = normalizeBridgePanelSize(data.size);
                 this.__webuiBridgeDesiredSize = [...this.__webuiBridgeSavedPanelSize];
@@ -14835,6 +14987,7 @@ app.registerExtension({
                 this.__webuiBridgeSavedPanelSize = null;
                 this.__webuiBridgeDesiredSize = clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT);
             }
+            repairBridgeNodeWidgetDefaults(this);
             repairShiftedBridgeWidgets(this);
             scheduleBridgePanelInstall(this);
         });
