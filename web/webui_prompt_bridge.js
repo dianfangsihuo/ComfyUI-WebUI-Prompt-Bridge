@@ -10710,11 +10710,14 @@ function buildPanel(node) {
             node.__webuiBridgeFreshLayoutStabilizeUntil = 0;
         }
     };
-    const panelAutoFitLocked = () => manualNodeResizeActive ||
+    const nodeSizeAutoFitLocked = () => manualNodeResizeActive ||
         freshInitialLayoutStabilizing() ||
         (performance?.now?.() || Date.now()) < suppressPanelAutoFitUntil ||
         nodeHasSavedUserBridgePanelSize(node) ||
         bridgeConfiguredSizeLockActive(node);
+    const sectionAutoFitSuspended = () => manualNodeResizeActive ||
+        freshInitialLayoutStabilizing() ||
+        (performance?.now?.() || Date.now()) < suppressPanelAutoFitUntil;
     const layoutSuppressionUntil = () => Math.max(suppressNodeBottomFitUntil, suppressPanelAutoFitUntil);
     const schedulePostSuppressionAdaptiveLayout = () => {
         window.clearTimeout?.(bottomFitReleaseTimer);
@@ -11707,16 +11710,16 @@ function buildPanel(node) {
 
     const fitLoraSectionToVisibleRows = (rows = 1, { force = false, fillAvailable = false } = {}) => {
         if (extraCollapsed || loraOverlayOpen || !extraSection?.isConnected) return;
-        if (!force && panelAutoFitLocked()) return;
+        if (!force && sectionAutoFitSuspended()) return;
         if (!force && !fillAvailable && (performance?.now?.() || Date.now()) < suppressNodeBottomFitUntil) return;
         const extraRect = extraSection.getBoundingClientRect();
         const headHeight = extraSection.querySelector(".webui-bridge-extra-head")?.offsetHeight || 44;
         const grid = extraSection.querySelector(".webui-bridge-card-grid");
         const gridStyle = grid ? getComputedStyle(grid) : null;
         const firstCard = grid?.querySelector(".webui-bridge-card, .webui-bridge-empty");
-        const scale = extraRect.height && extraSection.offsetHeight ? extraRect.height / extraSection.offsetHeight : 1;
+        const cardScale = extraRect.height && extraSection.offsetHeight ? extraRect.height / extraSection.offsetHeight : 1;
         const cardRect = firstCard?.getBoundingClientRect?.();
-        const visibleCardHeight = cardRect?.height && scale ? cardRect.height / scale : 0;
+        const visibleCardHeight = cardRect?.height && cardScale ? cardRect.height / cardScale : 0;
         const cardHeight = visibleCardHeight || firstCard?.offsetHeight || Number.parseFloat(gridStyle?.gridAutoRows) || 142;
         const rowGap = Number.parseFloat(gridStyle?.rowGap || gridStyle?.gap) || 8;
         const paddingY = gridStyle ? (Number.parseFloat(gridStyle.paddingTop) || 0) + (Number.parseFloat(gridStyle.paddingBottom) || 0) : 16;
@@ -11725,24 +11728,20 @@ function buildPanel(node) {
         const panelHeight = panel ? resizeTargetLayoutHeight(panel) : 0;
         const splitter = panel?.querySelector?.(".webui-bridge-panel-splitter");
         const splitterHeight = splitter && !resizeTargetHidden(splitter) ? resizeTargetLayoutHeight(splitter) : 0;
+        const bottomGap = getExtraSectionBottomGapMetrics();
         let availableExtraHeight = nextHeight;
         if (panelHeight) {
-            const viewportScale = resizeTargetViewportScale(panel) || 1;
             const panelRect = panel.getBoundingClientRect();
             const topRect = topRow.getBoundingClientRect();
             const splitterRect = splitter?.getBoundingClientRect?.();
             const extraRectForGap = extraSection.getBoundingClientRect();
+            const viewportScale = bottomGap.viewportScale || 1;
             const paddingTop = Math.max(0, (topRect.top - panelRect.top) / viewportScale) || (Number.parseFloat(getComputedStyle(panel).paddingTop) || 0);
             const gapBeforeSplitter = splitterRect ? Math.max(0, (splitterRect.top - topRect.bottom) / viewportScale) : 0;
             const gapBeforeExtra = splitterRect ? Math.max(0, (extraRectForGap.top - splitterRect.bottom) / viewportScale) : 0;
-            availableExtraHeight = panelHeight - paddingTop - resizeTargetLayoutHeight(topRow) - gapBeforeSplitter - splitterHeight - gapBeforeExtra - 12;
+            availableExtraHeight = panelHeight - paddingTop - resizeTargetLayoutHeight(topRow) - gapBeforeSplitter - splitterHeight - gapBeforeExtra - bottomGap.targetGapLayout;
         }
-        const panelBottomBlank = panelHeight && panel
-            ? panel.getBoundingClientRect().bottom - extraRect.bottom - 6 * (resizeTargetViewportScale(panel) || 1)
-            : 0;
-        const hasLargeBottomBlank = panelHeight && panel
-            ? panelBottomBlank > Math.max(96 * (resizeTargetViewportScale(panel) || 1), panel.getBoundingClientRect().height * 0.08)
-            : false;
+        const hasLargeBottomBlank = panelHeight && panel ? bottomGap.largeBottomBlank : false;
         const shouldFillAvailable = fillAvailable &&
             ((!promptLoraSplitManual && !promptInnerSplitManual) || hasLargeBottomBlank);
         const cappedHeight = shouldFillAvailable
@@ -11767,9 +11766,7 @@ function buildPanel(node) {
 
     const fitNodeBottomToVisibleContent = () => {
         if (loraOverlayOpen || !panel?.isConnected || !extraSection?.isConnected) return;
-        if (freshInitialLayoutStabilizing()) return;
-        if (bridgeConfiguredSizeLockActive(node)) return;
-        if (nodeHasSavedUserBridgePanelSize(node)) return;
+        if (nodeSizeAutoFitLocked()) return;
         if ((performance?.now?.() || Date.now()) < suppressNodeBottomFitUntil) return;
         const currentWidth = node.size?.[0] || node.__webuiBridgeDesiredSize?.[0] || DEFAULT_PANEL_WIDTH;
         const currentHeight = node.size?.[1] || node.__webuiBridgeDesiredSize?.[1] || DEFAULT_PANEL_HEIGHT;
@@ -11809,22 +11806,43 @@ function buildPanel(node) {
         }
     };
 
-    const fillExtraSectionToPanelBottom = () => {
-        if (extraCollapsed || loraOverlayOpen || !panel?.isConnected || !extraSection?.isConnected) return;
-        if (panelAutoFitLocked()) return;
-        const activePreset = state.settings?.layout_preset || "default";
-        const canGrow = !promptLoraSplitManual && (activePreset === "default" || activePreset === "roomy");
+    const getExtraSectionBottomGapMetrics = () => {
+        if (!panel?.isConnected || !extraSection?.isConnected) {
+            return {
+                viewportScale: 1,
+                targetGapLayout: 8,
+                blank: 0,
+                settleTolerance: 0,
+                largeBottomBlank: false,
+            };
+        }
         const panelRect = panel.getBoundingClientRect();
         const extraRect = extraSection.getBoundingClientRect();
-        const scale = resizeTargetViewportScale(panel) || 1;
-        const targetGap = 6 * scale;
+        const viewportScale = resizeTargetViewportScale(panel) || 1;
+        const targetGapLayout = 8;
+        const targetGap = targetGapLayout * viewportScale;
         const blank = panelRect.bottom - extraRect.bottom - targetGap;
-        const settleTolerance = Math.max(24 * scale, panelRect.height * 0.015);
-        const largeBottomBlank = blank > Math.max(96 * scale, panelRect.height * 0.08);
-        if (blank > settleTolerance && !canGrow && !largeBottomBlank) return;
-        if (Math.abs(blank) <= settleTolerance && !largeBottomBlank) return;
+        const settleTolerance = Math.max(24 * viewportScale, panelRect.height * 0.015);
+        const largeBottomBlankThreshold = Math.max(96 * viewportScale, panelRect.height * 0.08);
+        return {
+            viewportScale,
+            targetGapLayout,
+            blank,
+            settleTolerance,
+            largeBottomBlank: blank > largeBottomBlankThreshold,
+        };
+    };
+
+    const fillExtraSectionToPanelBottom = () => {
+        if (extraCollapsed || loraOverlayOpen || !panel?.isConnected || !extraSection?.isConnected) return;
+        if (sectionAutoFitSuspended()) return;
+        const activePreset = state.settings?.layout_preset || "default";
+        const canGrow = !promptLoraSplitManual && (activePreset === "default" || activePreset === "roomy");
+        const bottomGap = getExtraSectionBottomGapMetrics();
+        if (bottomGap.blank > bottomGap.settleTolerance && !canGrow && !bottomGap.largeBottomBlank) return;
+        if (Math.abs(bottomGap.blank) <= bottomGap.settleTolerance && !bottomGap.largeBottomBlank) return;
         const currentHeight = resizeTargetLayoutHeight(extraSection) || EXTRA_NETWORKS_MIN_HEIGHT;
-        const nextHeight = currentHeight + blank / scale;
+        const nextHeight = currentHeight + bottomGap.blank / bottomGap.viewportScale;
         setResizeTargetHeight(extraSection, extraHeightKey, nextHeight, {
             min: EXTRA_NETWORKS_MIN_HEIGHT,
             max: extraSection.__webuiBridgeMaxHeight || EXTRA_NETWORKS_MAX_HEIGHT,
