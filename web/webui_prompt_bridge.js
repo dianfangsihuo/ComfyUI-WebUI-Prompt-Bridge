@@ -198,6 +198,9 @@ const BRIDGE_LAYOUT_STORAGE_KEYS = Object.freeze({
     negative_tag_height: "webui-bridge-aio-panel-height-negative",
     lora_scroll_top: "webui-bridge-lora-scroll-top",
 });
+const BRIDGE_LAYOUT_STORAGE_KEY_SET = new Set(Object.values(BRIDGE_LAYOUT_STORAGE_KEYS));
+const BRIDGE_LAYOUT_LOCAL_UPDATED_PREFIX = "webui-bridge-layout-local-updated:";
+const BRIDGE_LAYOUT_STATE_APPLIED_KEY = "webui-bridge-layout-state-applied";
 const BRIDGE_LAYOUT_STATE_NUMBER_SPECS = Object.freeze({
     top_row_height: [64, PANEL_MAX_HEIGHT],
     extra_height: [42, EXTRA_NETWORKS_MAX_HEIGHT],
@@ -600,9 +603,37 @@ function readLocalBoolean(key, fallback = false) {
     }
 }
 
-function writeLocalBoolean(key, value) {
+function layoutLocalUpdatedKey(key) {
+    return `${BRIDGE_LAYOUT_LOCAL_UPDATED_PREFIX}${key}`;
+}
+
+function markLayoutLocalWrite(key, options = {}) {
+    if (!key || !BRIDGE_LAYOUT_STORAGE_KEY_SET.has(key)) return;
+    try {
+        const updatedKey = layoutLocalUpdatedKey(key);
+        if (options.source === "workflow") {
+            localStorage.removeItem(updatedKey);
+            return;
+        }
+        localStorage.setItem(updatedKey, String(Date.now()));
+    } catch {
+        // Ignore private-mode or quota failures; layout still works for this session.
+    }
+}
+
+function readLayoutLocalWriteTime(key) {
+    try {
+        const value = Number(localStorage.getItem(layoutLocalUpdatedKey(key)) || 0);
+        return Number.isFinite(value) ? value : 0;
+    } catch {
+        return 0;
+    }
+}
+
+function writeLocalBoolean(key, value, options = {}) {
     try {
         localStorage.setItem(key, value ? "1" : "0");
+        markLayoutLocalWrite(key, options);
     } catch {
         // Ignore private-mode or quota failures; UI state can be ephemeral.
     }
@@ -635,11 +666,15 @@ function readLocalNumber(key, fallback = null) {
     }
 }
 
-function writeLocalNumber(key, value) {
+function writeLocalNumber(key, value, options = {}) {
     try {
         const nextValue = String(Math.round(value));
-        if (localStorage.getItem(key) === nextValue) return;
+        if (localStorage.getItem(key) === nextValue) {
+            markLayoutLocalWrite(key, options);
+            return;
+        }
         localStorage.setItem(key, nextValue);
+        markLayoutLocalWrite(key, options);
     } catch {
         // Ignore private-mode or quota failures; UI state can be ephemeral.
     }
@@ -661,6 +696,9 @@ function writeLoraPageSizePreference(value) {
 function clearLocalValue(key) {
     try {
         localStorage.removeItem(key);
+        if (key && BRIDGE_LAYOUT_STORAGE_KEY_SET.has(key)) {
+            localStorage.removeItem(layoutLocalUpdatedKey(key));
+        }
     } catch {
         // Ignore private-mode or quota failures; UI state can be ephemeral.
     }
@@ -1072,6 +1110,33 @@ function normalizeBridgeLayoutState(source) {
     return Object.keys(state).length > 1 ? state : null;
 }
 
+function bridgeLayoutStateSignature(state) {
+    return JSON.stringify(normalizeBridgeLayoutState(state) || {});
+}
+
+function readBridgeLayoutStateAppliedRecord() {
+    try {
+        const record = JSON.parse(localStorage.getItem(BRIDGE_LAYOUT_STATE_APPLIED_KEY) || "{}");
+        return {
+            signature: typeof record.signature === "string" ? record.signature : "",
+            appliedAt: Number.isFinite(Number(record.appliedAt)) ? Number(record.appliedAt) : 0,
+        };
+    } catch {
+        return { signature: "", appliedAt: 0 };
+    }
+}
+
+function writeBridgeLayoutStateAppliedRecord(signature, appliedAt = Date.now()) {
+    try {
+        localStorage.setItem(BRIDGE_LAYOUT_STATE_APPLIED_KEY, JSON.stringify({
+            signature,
+            appliedAt,
+        }));
+    } catch {
+        // Ignore private-mode or quota failures; workflow state can still seed the live UI.
+    }
+}
+
 function hasLocalValue(key) {
     try {
         return key ? localStorage.getItem(key) !== null : false;
@@ -1083,15 +1148,26 @@ function hasLocalValue(key) {
 function writeBridgeLayoutStateToStorage(source, options = {}) {
     const state = normalizeBridgeLayoutState(source);
     if (!state) return null;
+    const signature = bridgeLayoutStateSignature(state);
+    const appliedRecord = readBridgeLayoutStateAppliedRecord();
+    const preserveNewerLocalPreferences = options.preserveNewerLocalPreferences !== false;
+    const localPreferenceBaseline = appliedRecord.signature === signature ? appliedRecord.appliedAt : 0;
+    let preservedLocalPreference = false;
     for (const [stateKey, storageKey] of Object.entries(BRIDGE_LAYOUT_STORAGE_KEYS)) {
         if (!Object.prototype.hasOwnProperty.call(state, stateKey)) continue;
+        if (preserveNewerLocalPreferences &&
+            hasLocalValue(storageKey) &&
+            readLayoutLocalWriteTime(storageKey) > localPreferenceBaseline) {
+            preservedLocalPreference = true;
+            continue;
+        }
         const value = state[stateKey];
         if (typeof value === "boolean") {
-            if (options.preserveExistingBooleanPreferences && hasLocalValue(storageKey)) continue;
-            writeLocalBoolean(storageKey, value);
+            writeLocalBoolean(storageKey, value, { source: "workflow" });
         }
-        else if (Number.isFinite(value)) writeLocalNumber(storageKey, value);
+        else if (Number.isFinite(value)) writeLocalNumber(storageKey, value, { source: "workflow" });
     }
+    writeBridgeLayoutStateAppliedRecord(signature, preservedLocalPreference ? localPreferenceBaseline : Date.now());
     return state;
 }
 
@@ -7742,7 +7818,7 @@ function buildPanel(node) {
     let markPromptInnerManualResize = () => {};
     const seedConfiguredLayoutState = () => {
         if (!configuredLayoutState || node.__webuiBridgeConfiguredLayoutStateApplied) return;
-        writeBridgeLayoutStateToStorage(configuredLayoutState, { preserveExistingBooleanPreferences: true });
+        writeBridgeLayoutStateToStorage(configuredLayoutState);
         node.__webuiBridgeConfiguredLayoutStateApplied = true;
     };
     migrateLayoutStorage(BRIDGE_LAYOUT_MIGRATED_STORAGE_KEYS);
@@ -11903,6 +11979,7 @@ function buildPanel(node) {
         inputmode: "numeric",
         title: "输入节点宽度",
     });
+    let restoreDefaultNodeLayout = () => {};
     const nodeHeightInput = el("input", {
         type: "number",
         min: PANEL_MIN_HEIGHT,
@@ -11947,13 +12024,7 @@ function buildPanel(node) {
         el("button", { title: "Compact size", onclick: () => setNodeSize(840, 620, { user: true }) }, "S"),
         el("button", { title: "Smaller node", onclick: () => resizeNode(-120, -90) }, "-"),
         el("button", { title: "Larger node", onclick: () => resizeNode(120, 90) }, "+"),
-        el("button", {
-            title: "恢复节点默认尺寸并清理异常布局缓存",
-            onclick: () => {
-                resetNodeLayoutCache();
-                setNodeSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT, { user: true });
-            },
-        }, "默认尺寸"),
+        el("button", { title: "恢复节点默认尺寸并清理异常布局缓存", onclick: () => restoreDefaultNodeLayout() }, "默认尺寸"),
     ]);
     let layoutPresetControls = null;
     const updateLayoutPresetControls = () => {
@@ -12181,6 +12252,14 @@ function buildPanel(node) {
         applyActionCollapsedState();
         markGraphChanged(node);
         window.requestAnimationFrame?.(() => panel?.__webuiBridgeScheduleAdaptiveLayout?.());
+    };
+    restoreDefaultNodeLayout = () => {
+        resetNodeLayoutCache();
+        setNodeSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT, { user: true });
+        applyLayoutPreset(state.settings?.layout_preset || "default", {
+            preserveNodeSize: true,
+            forcePromptHeights: true,
+        });
     };
     const extraBody = el("div", { class: "webui-bridge-extra-body" }, [
         networkTree,
@@ -12490,10 +12569,7 @@ function buildPanel(node) {
         actionToggle,
         settingsButton,
         tutorialButton,
-        topControlButton("恢复尺寸", "恢复节点默认宽高并清理异常布局缓存，避免误点后缩成窄条", () => {
-            resetNodeLayoutCache();
-            setNodeSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT, { user: true });
-        }),
+        topControlButton("恢复尺寸", "恢复节点默认宽高并清理异常布局缓存，避免误点后缩成窄条", () => restoreDefaultNodeLayout()),
         nodeWidthGrip,
         webuiButton,
         quickLoraOverlayButton,
@@ -17109,7 +17185,7 @@ app.registerExtension({
                 data?.[BRIDGE_LAYOUT_STATE_PROPERTY],
             );
             this.__webuiBridgeConfiguredLayoutStateApplied = false;
-            writeBridgeLayoutStateToStorage(this.__webuiBridgeConfiguredLayoutState, { preserveExistingBooleanPreferences: true });
+            writeBridgeLayoutStateToStorage(this.__webuiBridgeConfiguredLayoutState);
             if (Array.isArray(data?.widgets_values)) {
                 const repaired = sanitizeBridgeWidgetsValues(data.widgets_values);
                 if (repaired.changed) data.widgets_values = repaired.values;

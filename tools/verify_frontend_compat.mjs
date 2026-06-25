@@ -2313,6 +2313,156 @@ async function verifySerializedBridgeLayoutStateRestoresWithoutLocalStorage(brow
     }
 }
 
+async function verifySerializedBridgeLayoutStateOverridesStaleLocalBooleans(browser, baseUrl, workflow) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(
+        browser,
+        baseUrl,
+        consoleMessages,
+        { width: 1600, height: 1300 },
+        async (setupPage) => {
+            const mockLoras = mockLoraItems(160);
+            await setupPage.route("**/webui_prompt_bridge/loras*", async (route) => {
+                await route.fulfill({
+                    status: 200,
+                    contentType: "application/json",
+                    body: JSON.stringify({ loras: mockLoras }),
+                });
+            });
+        },
+    );
+    try {
+        const savedWorkflow = JSON.parse(JSON.stringify(workflow));
+        const bridgeData = savedWorkflow.nodes?.find((node) => node.type === "WebUIPromptBridge");
+        assert(bridgeData, "Saved-layout workflow is missing the WebUIPromptBridge node");
+        bridgeData.size = [1180, 1040];
+        bridgeData.properties = {
+            ...(bridgeData.properties || {}),
+            webui_prompt_bridge_layout: {
+                version: 1,
+                top_row_height: 820,
+                extra_height: 202,
+                sidebar_width: 400,
+                positive_textarea_height: 112,
+                negative_textarea_height: 220,
+                positive_chip_height: 132,
+                negative_chip_height: 104,
+                positive_tag_height: 238,
+                negative_tag_height: 240,
+                lora_scroll_top: 420,
+                extra_collapsed: false,
+                sidebar_collapsed: false,
+                negative_collapsed: false,
+            },
+        };
+        const layoutKeys = [
+            "webui-bridge-layout-storage-version",
+            "webui-bridge-toprow-height",
+            "webui-bridge-extra-height",
+            "webui-bridge-extra-collapsed",
+            "webui-bridge-action-column-width",
+            "webui-bridge-action-column-collapsed",
+            "webui-bridge-negative-collapsed",
+            "webui-bridge-textarea-height-prompt",
+            "webui-bridge-textarea-height-negative-prompt",
+            "webui-bridge-chip-size-positive",
+            "webui-bridge-chip-size-negative",
+            "webui-bridge-aio-panel-height-positive",
+            "webui-bridge-aio-panel-height-negative",
+            "webui-bridge-lora-scroll-top",
+        ];
+        const report = await page.evaluate(async ({ graphData, keys }) => {
+            const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const loadGraph = async (filename) => {
+                await window.app.loadGraphData(JSON.parse(JSON.stringify(graphData)), true, true, undefined, {
+                    filename,
+                });
+                window.app.canvas.ds.offset = [55, 35];
+                window.app.canvas.ds.scale = 1;
+                window.app.canvas.setDirty(true, true);
+            };
+            const snapshot = (label) => {
+                const rect = (selector) => {
+                    const element = document.querySelector(selector);
+                    if (!element) return null;
+                    const box = element.getBoundingClientRect();
+                    return {
+                        top: Math.round(box.top),
+                        bottom: Math.round(box.bottom),
+                        height: Math.round(box.height),
+                    };
+                };
+                const bridge = window.app.graph._nodes.find((node) => node.type === "WebUIPromptBridge");
+                const negativeRow = [...document.querySelectorAll(".webui-bridge-prompt-row")]
+                    .find((row) => !row.classList.contains("webui-bridge-positive-prompt-row"));
+                const extra = document.querySelector(".webui-bridge-extra");
+                const action = document.querySelector(".webui-bridge-action-column");
+                return {
+                    label,
+                    nodeSize: bridge?.size ? Array.from(bridge.size).map((value) => Math.round(value)) : null,
+                    topRow: rect(".webui-bridge-toprow"),
+                    extra: rect(".webui-bridge-extra"),
+                    grid: rect(".webui-bridge-card-grid"),
+                    negativeCollapsed: Boolean(negativeRow?.classList.contains("collapsed")),
+                    extraCollapsed: Boolean(extra?.classList.contains("collapsed")),
+                    sidebarCollapsed: Boolean(action?.classList.contains("collapsed")),
+                    local: {
+                        top: localStorage.getItem("webui-bridge-toprow-height"),
+                        extra: localStorage.getItem("webui-bridge-extra-height"),
+                        negativeCollapsed: localStorage.getItem("webui-bridge-negative-collapsed"),
+                        extraCollapsed: localStorage.getItem("webui-bridge-extra-collapsed"),
+                        sidebarCollapsed: localStorage.getItem("webui-bridge-action-column-collapsed"),
+                    },
+                    state: bridge?.__webuiBridgePanel?.__webuiBridgeGetLayoutState?.() || null,
+                };
+            };
+            for (const key of keys) localStorage.removeItem(key);
+            localStorage.setItem("webui-bridge-lora-page-size", "0");
+            localStorage.setItem("webui-bridge-lora-page-size-user-set", "1");
+            await loadGraph("serialized-layout-state-stale-bool-prime.json");
+            await wait(3500);
+            const primed = snapshot("primed");
+            localStorage.setItem("webui-bridge-negative-collapsed", "1");
+            localStorage.setItem("webui-bridge-extra-collapsed", "1");
+            localStorage.setItem("webui-bridge-action-column-collapsed", "1");
+            await loadGraph("serialized-layout-state-stale-bool-restore.json");
+            await wait(4500);
+            return {
+                primed,
+                restored: snapshot("restored"),
+            };
+        }, { graphData: savedWorkflow, keys: layoutKeys });
+        await screenshot(page, "compat-serialized-layout-state-overrides-stale-local-booleans.png");
+        assert(!report.restored.negativeCollapsed,
+            "Serialized negative prompt expanded state was overridden by stale localStorage", report);
+        assert(!report.restored.extraCollapsed,
+            "Serialized LoRA expanded state was overridden by stale localStorage", report);
+        assert(!report.restored.sidebarCollapsed,
+            "Serialized sidebar expanded state was overridden by stale localStorage", report);
+        assert(report.restored.local.negativeCollapsed === "0",
+            "Serialized negative collapse state was not written back to localStorage", report);
+        assert(report.restored.local.extraCollapsed === "0",
+            "Serialized LoRA collapse state was not written back to localStorage", report);
+        assert(report.restored.local.sidebarCollapsed === "0",
+            "Serialized sidebar collapse state was not written back to localStorage", report);
+        assert(report.restored.topRow?.height >= 760,
+            "Serialized tall prompt layout was not restored over stale localStorage", report);
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(bridgeConsoleErrors.length === 0, "WebUIPromptBridge reported console errors during stale-local-boolean restore check", bridgeConsoleErrors);
+        return {
+            restoredTopRowHeight: report.restored.topRow.height,
+            restoredExtraHeight: report.restored.extra.height,
+            local: report.restored.local,
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
+        };
+    } finally {
+        await context.close();
+    }
+}
+
 async function verifyOldWorkflowCompatibility(browser, baseUrl, workflow) {
     const consoleMessages = [];
     const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages);
@@ -2457,6 +2607,7 @@ async function main() {
             bridgeSettingsRoundTrip: await verifyBridgeSettingsRoundTrip(browser, options.baseUrl, workflow),
             bridgeLayoutPreferencePersistence: await verifyBridgeLayoutPreferencePersistence(browser, options.baseUrl, workflow),
             serializedBridgeLayoutState: await verifySerializedBridgeLayoutStateRestoresWithoutLocalStorage(browser, options.baseUrl, workflow),
+            serializedBridgeLayoutStateOverridesStaleLocalBooleans: await verifySerializedBridgeLayoutStateOverridesStaleLocalBooleans(browser, options.baseUrl, workflow),
             oldWorkflowCompatibility: await verifyOldWorkflowCompatibility(browser, options.baseUrl, workflow),
         };
         if (options.queue) {
