@@ -127,6 +127,39 @@ function changedPositions(before, after, ids) {
     return changes;
 }
 
+function mockLoraItems(count = 160) {
+    return Array.from({ length: count }, (_, index) => {
+        const name = `mock-folder/mock-lora-${String(index + 1).padStart(3, "0")}.safetensors`;
+        const alias = name.replace(/\.[^.]+$/, "");
+        return {
+            name,
+            alias,
+            folder: "mock-folder",
+            file_name: name.split("/").pop(),
+            base_name: alias.split("/").pop(),
+            aliases: [],
+            metadata_title: "",
+            metadata_output_name: "",
+            thumbnail: "",
+            thumbnail_unknown: true,
+            description: "",
+            user_metadata: {},
+            manual_category: "",
+            category: "",
+            activation_text: "",
+            negative_text: "",
+            preferred_weight: 0,
+            sd_version: "",
+            notes: "",
+            training_tags: [],
+            search_terms: name,
+            created: 0,
+            modified: 0,
+            prompt: `<lora:${alias}:1>`,
+        };
+    });
+}
+
 async function graphPositions(page, ids) {
     return await page.evaluate((nodeIds) => {
         const positions = {};
@@ -138,7 +171,7 @@ async function graphPositions(page, ids) {
     }, ids);
 }
 
-async function dragElementCenter(page, selector, deltaY, nth = 0) {
+async function dragElementCenterBy(page, selector, deltaX = 0, deltaY = 0, nth = 0) {
     const box = await page.evaluate(({ selector, nth }) => {
         const element = [...document.querySelectorAll(selector)][nth];
         if (!element) return null;
@@ -154,10 +187,14 @@ async function dragElementCenter(page, selector, deltaY, nth = 0) {
     assert(box, `Could not find draggable element ${selector}`, { selector, nth });
     await page.mouse.move(box.x, box.y);
     await page.mouse.down();
-    await page.mouse.move(box.x, box.y + deltaY, { steps: 14 });
+    await page.mouse.move(box.x + deltaX, box.y + deltaY, { steps: 14 });
     await page.mouse.up();
     await page.waitForTimeout(900);
     return box;
+}
+
+async function dragElementCenter(page, selector, deltaY, nth = 0) {
+    return await dragElementCenterBy(page, selector, 0, deltaY, nth);
 }
 
 async function bridgeBottomBlankMetrics(page, label = "metrics") {
@@ -183,6 +220,117 @@ async function bridgeBottomBlankMetrics(page, label = "metrics") {
             splitter: rect(splitter),
             extra: rect(extra),
             nodeSize: Array.from(window.app.graph._nodes.find((node) => node.type === "WebUIPromptBridge")?.size || []),
+        };
+    }, label);
+}
+
+async function bridgeLayoutStabilitySnapshot(page, label = "metrics") {
+    return await page.evaluate((metricLabel) => {
+        const bridge = window.app.graph._nodes.find((node) => node.type === "WebUIPromptBridge");
+        const panel = document.querySelector(".webui-bridge-panel");
+        const topRow = document.querySelector(".webui-bridge-toprow");
+        const action = document.querySelector(".webui-bridge-action-column");
+        const extra = document.querySelector(".webui-bridge-extra");
+        const regionalInputs = [...document.querySelectorAll(".webui-bridge-regional-canvas-size")];
+        const widgetValue = (name) => bridge?.widgets?.find((widget) => widget.name === name)?.value ?? null;
+        const rect = (element) => {
+            if (!element) return null;
+            const item = element.getBoundingClientRect();
+            return {
+                left: Math.round(item.left),
+                top: Math.round(item.top),
+                width: Math.round(item.width),
+                height: Math.round(item.height),
+                bottom: Math.round(item.bottom),
+            };
+        };
+        const style = topRow ? getComputedStyle(topRow) : null;
+        return {
+            label: metricLabel,
+            nodeSize: bridge?.size ? Array.from(bridge.size).map((value) => Math.round(value)) : null,
+            desiredSize: bridge?.__webuiBridgeDesiredSize ? Array.from(bridge.__webuiBridgeDesiredSize).map((value) => Math.round(value)) : null,
+            savedSize: bridge?.__webuiBridgeSavedPanelSize ? Array.from(bridge.__webuiBridgeSavedPanelSize).map((value) => Math.round(value)) : null,
+            canvasOffset: window.app.canvas.ds.offset ? Array.from(window.app.canvas.ds.offset).map((value) => Math.round(value)) : null,
+            panel: rect(panel),
+            topRow: rect(topRow),
+            action: rect(action),
+            extra: rect(extra),
+            sidebarWidthVar: style?.getPropertyValue("--webui-bridge-sidebar-width")?.trim() || null,
+            gridTemplate: style?.gridTemplateColumns || null,
+            localTopHeight: localStorage.getItem("webui-bridge-toprow-height"),
+            localExtraHeight: localStorage.getItem("webui-bridge-extra-height"),
+            localActionWidth: localStorage.getItem("webui-bridge-action-column-width"),
+            regional: {
+                inputValues: regionalInputs.slice(0, 2).map((input) => input.value),
+                widgetWidth: widgetValue("regional_canvas_width"),
+                widgetHeight: widgetValue("regional_canvas_height"),
+                auto: widgetValue("regional_canvas_auto"),
+            },
+        };
+    }, label);
+}
+
+function assertRoundedArrayEqual(actual, expected, message, details = null) {
+    const same = Array.isArray(actual) &&
+        Array.isArray(expected) &&
+        actual.length === expected.length &&
+        actual.every((value, index) => Math.abs(value - expected[index]) <= 1);
+    assert(same, message, details || { actual, expected });
+}
+
+function assertBridgeLayoutStable(before, after, message) {
+    for (const key of ["nodeSize", "desiredSize", "savedSize"]) {
+        assertRoundedArrayEqual(after[key], before[key], `${message}: ${key} changed`, { before, after });
+    }
+    for (const key of ["panel", "topRow", "action", "extra"]) {
+        for (const dim of ["width", "height"]) {
+            const from = before[key]?.[dim];
+            const to = after[key]?.[dim];
+            assert(Number.isFinite(from) && Number.isFinite(to) && Math.abs(from - to) <= 2,
+                `${message}: ${key}.${dim} changed`, { before, after });
+        }
+    }
+    assert(before.sidebarWidthVar === after.sidebarWidthVar, `${message}: sidebar CSS width changed`, { before, after });
+    assert(before.gridTemplate === after.gridTemplate, `${message}: top row grid changed`, { before, after });
+    assert(before.localActionWidth === after.localActionWidth, `${message}: sidebar width preference changed`, { before, after });
+}
+
+async function promptInnerLayoutSnapshot(page, label = "metrics") {
+    return await page.evaluate((metricLabel) => {
+        const rect = (selector) => {
+            const element = document.querySelector(selector);
+            if (!element) return null;
+            const box = element.getBoundingClientRect();
+            return {
+                top: Math.round(box.top),
+                height: Math.round(box.height),
+                bottom: Math.round(box.bottom),
+            };
+        };
+        const bridge = window.app.graph._nodes.find((node) => node.type === "WebUIPromptBridge");
+        const grid = document.querySelector(".webui-bridge-card-grid");
+        return {
+            label: metricLabel,
+            nodeSize: bridge?.size ? Array.from(bridge.size).map((value) => Math.round(value)) : null,
+            topRow: rect(".webui-bridge-toprow"),
+            extra: rect(".webui-bridge-extra"),
+            positiveTextarea: rect(".webui-bridge-positive-prompt-row textarea"),
+            positiveChips: rect(".webui-bridge-positive-prompt-row .webui-bridge-prompt-chips"),
+            negativeTextarea: rect(".webui-bridge-prompt-row:not(.webui-bridge-positive-prompt-row) textarea"),
+            grid: grid ? {
+                top: Math.round(grid.getBoundingClientRect().top),
+                height: Math.round(grid.getBoundingClientRect().height),
+                scrollTop: Math.round(grid.scrollTop || 0),
+            } : null,
+            local: {
+                loraScroll: localStorage.getItem("webui-bridge-lora-scroll-top"),
+                positiveText: localStorage.getItem("webui-bridge-textarea-height-prompt"),
+                negativeText: localStorage.getItem("webui-bridge-textarea-height-negative-prompt"),
+                positiveChip: localStorage.getItem("webui-bridge-chip-size-positive"),
+                negativeChip: localStorage.getItem("webui-bridge-chip-size-negative"),
+                positiveTag: localStorage.getItem("webui-bridge-aio-panel-height-positive"),
+                negativeTag: localStorage.getItem("webui-bridge-aio-panel-height-negative"),
+            },
         };
     }, label);
 }
@@ -789,6 +937,141 @@ async function verifyRestoreSizeStability(browser, baseUrl, workflow) {
             finalBlankBelowExtra: final.blankBelowExtra,
             settledExtraSpan,
             largeTransitions,
+        };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifyCanvasPanDoesNotMutateBridgeLayout(browser, baseUrl, workflow) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1600, height: 1300 });
+    try {
+        await page.evaluate(async (graphData) => {
+            await window.app.loadGraphData(graphData, true, true, undefined, {
+                filename: "canvas-pan-layout-stability.json",
+            });
+            window.app.canvas.ds.offset = [55, 35];
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.setDirty(true, true);
+        }, workflow);
+        await page.waitForTimeout(3500);
+        const before = await bridgeLayoutStabilitySnapshot(page, "before pan");
+        await page.mouse.move(1500, 1180);
+        await page.mouse.down({ button: "middle" });
+        await page.mouse.move(1350, 1050, { steps: 10 });
+        await page.mouse.up({ button: "middle" });
+        await page.waitForTimeout(1200);
+        const after = await bridgeLayoutStabilitySnapshot(page, "after pan");
+        const moved = Math.abs((after.canvasOffset?.[0] || 0) - (before.canvasOffset?.[0] || 0)) > 20 ||
+            Math.abs((after.canvasOffset?.[1] || 0) - (before.canvasOffset?.[1] || 0)) > 20;
+        assert(moved, "Canvas pan did not move the ComfyUI canvas offset", { before, after });
+        assertBridgeLayoutStable(before, after, "Canvas pan mutated Bridge layout");
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(bridgeConsoleErrors.length === 0, "WebUIPromptBridge reported console errors during canvas pan layout check", bridgeConsoleErrors);
+        return {
+            beforeOffset: before.canvasOffset,
+            afterOffset: after.canvasOffset,
+            nodeSize: after.nodeSize,
+            sidebarWidth: after.sidebarWidthVar,
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
+        };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifyRegionalCanvasSizeDoesNotMutateLayout(browser, baseUrl, workflow) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1600, height: 1300 });
+    try {
+        await page.evaluate(async (graphData) => {
+            await window.app.loadGraphData(graphData, true, true, undefined, {
+                filename: "regional-canvas-size-layout-stability.json",
+            });
+            window.app.canvas.ds.offset = [55, 35];
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.setDirty(true, true);
+        }, workflow);
+        await page.waitForTimeout(3500);
+        const before = await bridgeLayoutStabilitySnapshot(page, "before regional size");
+        const editResult = await page.evaluate(() => {
+            const inputs = [...document.querySelectorAll(".webui-bridge-regional-canvas-size")];
+            if (inputs.length < 2) return { missing: true, count: inputs.length };
+            inputs[0].value = "896";
+            inputs[1].value = "1152";
+            for (const input of inputs.slice(0, 2)) {
+                input.dispatchEvent(new Event("input", { bubbles: true }));
+                input.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            return { missing: false, values: inputs.slice(0, 2).map((input) => input.value) };
+        });
+        assert(!editResult.missing, "Regional canvas size inputs were not rendered", editResult);
+        await page.waitForTimeout(1200);
+        const after = await bridgeLayoutStabilitySnapshot(page, "after regional size");
+        assertBridgeLayoutStable(before, after, "Regional canvas size edit mutated Bridge layout");
+        assert(Number(after.regional.widgetWidth) === 896 && Number(after.regional.widgetHeight) === 1152,
+            "Regional canvas size widgets did not receive manual values", { editResult, before, after });
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(bridgeConsoleErrors.length === 0, "WebUIPromptBridge reported console errors during regional size layout check", bridgeConsoleErrors);
+        return {
+            regional: after.regional,
+            nodeSize: after.nodeSize,
+            sidebarWidth: after.sidebarWidthVar,
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
+        };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifyNodeSizeInputIsUserAuthority(browser, baseUrl, workflow) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1600, height: 1300 });
+    try {
+        await page.evaluate(async (graphData) => {
+            await window.app.loadGraphData(graphData, true, true, undefined, {
+                filename: "node-size-input-authority.json",
+            });
+            window.app.canvas.ds.offset = [55, 35];
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.setDirty(true, true);
+        }, workflow);
+        await page.waitForTimeout(3500);
+        const editResult = await page.evaluate(() => {
+            const inputs = [...document.querySelectorAll(".webui-bridge-size-field input")];
+            if (inputs.length < 2) return { missing: true, count: inputs.length };
+            inputs[0].value = "980";
+            inputs[1].value = "920";
+            for (const input of inputs.slice(0, 2)) {
+                input.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            return { missing: false, values: inputs.slice(0, 2).map((input) => input.value) };
+        });
+        assert(!editResult.missing, "Node size inputs were not rendered", editResult);
+        await page.waitForTimeout(2600);
+        const after = await bridgeLayoutStabilitySnapshot(page, "after node size input");
+        assertRoundedArrayEqual(after.nodeSize, [980, 920], "Node size input was overwritten by layout repair", { editResult, after });
+        assertRoundedArrayEqual(after.desiredSize, [980, 920], "Desired node size did not track the user input", { editResult, after });
+        assertRoundedArrayEqual(after.savedSize, [980, 920], "Saved node size did not track the user input", { editResult, after });
+        assert(after.localActionWidth === null, "Node size input unexpectedly persisted sidebar width", after);
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(bridgeConsoleErrors.length === 0, "WebUIPromptBridge reported console errors during node size authority check", bridgeConsoleErrors);
+        return {
+            nodeSize: after.nodeSize,
+            desiredSize: after.desiredSize,
+            savedSize: after.savedSize,
+            sidebarWidth: after.sidebarWidthVar,
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
         };
     } finally {
         await context.close();
@@ -1441,36 +1724,7 @@ async function verifyLoraDefaultPagingAndBasicLoad(browser, baseUrl, workflow) {
     const detailRequests = [];
     const infoRequests = [];
     try {
-        const mockLoras = Array.from({ length: 160 }, (_, index) => {
-            const name = `mock-folder/mock-lora-${String(index + 1).padStart(3, "0")}.safetensors`;
-            const alias = name.replace(/\.[^.]+$/, "");
-            return {
-                name,
-                alias,
-                folder: "mock-folder",
-                file_name: name.split("/").pop(),
-                base_name: alias.split("/").pop(),
-                aliases: [],
-                metadata_title: "",
-                metadata_output_name: "",
-                thumbnail: "",
-                thumbnail_unknown: true,
-                description: "",
-                user_metadata: {},
-                manual_category: "",
-                category: "",
-                activation_text: "",
-                negative_text: "",
-                preferred_weight: 0,
-                sd_version: "",
-                notes: "",
-                training_tags: [],
-                search_terms: name,
-                created: 0,
-                modified: 0,
-                prompt: `<lora:${alias}:1>`,
-            };
-        });
+        const mockLoras = mockLoraItems(160);
         await page.route("**/webui_prompt_bridge/loras*", async (route) => {
             loraRequests.push(route.request().url());
             await route.fulfill({
@@ -1570,6 +1824,185 @@ async function verifyLoraDefaultPagingAndBasicLoad(browser, baseUrl, workflow) {
             infoRequests: clickedInfoRequests.length,
             cardCount: report.cardCount,
             pageInfo: report.pageInfo,
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
+        };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifyLoraCardListScrollStatePersists(browser, baseUrl, workflow) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1600, height: 1300 });
+    try {
+        const mockLoras = mockLoraItems(160);
+        await page.route("**/webui_prompt_bridge/loras*", async (route) => {
+            await route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({ loras: mockLoras }),
+            });
+        });
+        const firstPass = await page.evaluate(async (graphData) => {
+            const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            for (const key of [
+                "webui-bridge-lora-page-size",
+                "webui-bridge-lora-page-size-user-set",
+                "webui-bridge-lora-scroll-top",
+            ]) localStorage.removeItem(key);
+            localStorage.setItem("webui-bridge-lora-page-size", "0");
+            localStorage.setItem("webui-bridge-lora-page-size-user-set", "1");
+            await window.app.loadGraphData(graphData, true, true, undefined, {
+                filename: "lora-scroll-state.json",
+            });
+            window.app.canvas.ds.offset = [55, 35];
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.setDirty(true, true);
+            await wait(3200);
+            const grid = document.querySelector(".webui-bridge-card-grid");
+            if (!grid) return { missingGrid: true };
+            grid.scrollTop = 520;
+            grid.dispatchEvent(new Event("scroll", { bubbles: true }));
+            await wait(320);
+            const beforeRender = Math.round(grid.scrollTop || 0);
+            const checkbox = grid.querySelector("input[type='checkbox']");
+            checkbox?.click();
+            await wait(900);
+            const afterRender = Math.round(grid.scrollTop || 0);
+            const serialized = window.app.graph.serialize();
+            const bridgeData = serialized.nodes?.find((node) => node.type === "WebUIPromptBridge");
+            return {
+                missingGrid: false,
+                beforeRender,
+                afterRender,
+                stored: localStorage.getItem("webui-bridge-lora-scroll-top"),
+                serialized,
+                serializedState: bridgeData?.properties?.webui_prompt_bridge_layout || null,
+                scrollHeight: grid.scrollHeight,
+                clientHeight: grid.clientHeight,
+            };
+        }, workflow);
+        assert(!firstPass.missingGrid, "LoRA card grid did not render", firstPass);
+        assert(firstPass.beforeRender > 80, "LoRA card grid was not scrollable enough for the stability check", firstPass);
+        assert(Math.abs(firstPass.afterRender - firstPass.beforeRender) <= 8,
+            "LoRA card list jumped after card re-render", firstPass);
+        assert(Number(firstPass.stored) > 80, "LoRA scroll position was not persisted locally", firstPass);
+        assert(Number(firstPass.serializedState?.lora_scroll_top) > 80,
+            "LoRA scroll position was not serialized into workflow layout state", firstPass);
+
+        const secondPass = await page.evaluate(async ({ serialized }) => {
+            const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            for (const key of [
+                "webui-bridge-layout-storage-version",
+                "webui-bridge-lora-scroll-top",
+            ]) localStorage.removeItem(key);
+            await window.app.loadGraphData(serialized, true, true, undefined, {
+                filename: "lora-scroll-state-reload.json",
+            });
+            window.app.canvas.ds.offset = [55, 35];
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.setDirty(true, true);
+            await wait(3200);
+            const grid = document.querySelector(".webui-bridge-card-grid");
+            return {
+                scrollTop: Math.round(grid?.scrollTop || 0),
+                stored: localStorage.getItem("webui-bridge-lora-scroll-top"),
+            };
+        }, { serialized: firstPass.serialized });
+        await screenshot(page, "compat-lora-scroll-state-persistence.png");
+        assert(Math.abs(secondPass.scrollTop - Number(firstPass.serializedState.lora_scroll_top)) <= 8,
+            "Serialized LoRA scroll position did not restore after clearing localStorage", { firstPass, secondPass });
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(bridgeConsoleErrors.length === 0, "WebUIPromptBridge reported console errors during LoRA scroll-state check", bridgeConsoleErrors);
+        return {
+            beforeRender: firstPass.beforeRender,
+            afterRender: firstPass.afterRender,
+            afterReload: secondPass.scrollTop,
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
+        };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifyPromptInnerDragDoesNotDrift(browser, baseUrl, workflow) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1600, height: 1300 });
+    try {
+        const mockLoras = mockLoraItems(160);
+        await page.route("**/webui_prompt_bridge/loras*", async (route) => {
+            await route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({ loras: mockLoras }),
+            });
+        });
+        await page.evaluate(async (graphData) => {
+            for (const key of [
+                "webui-bridge-layout-storage-version",
+                "webui-bridge-lora-scroll-top",
+                "webui-bridge-textarea-height-prompt",
+                "webui-bridge-textarea-height-negative-prompt",
+                "webui-bridge-chip-size-positive",
+                "webui-bridge-chip-size-negative",
+                "webui-bridge-aio-panel-height-positive",
+                "webui-bridge-aio-panel-height-negative",
+            ]) localStorage.removeItem(key);
+            localStorage.setItem("webui-bridge-lora-page-size", "0");
+            localStorage.setItem("webui-bridge-lora-page-size-user-set", "1");
+            await window.app.loadGraphData(graphData, true, true, undefined, {
+                filename: "prompt-inner-drag-stability.json",
+            });
+            window.app.canvas.ds.offset = [55, 35];
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.setDirty(true, true);
+        }, workflow);
+        await page.waitForTimeout(3500);
+        await page.evaluate(() => {
+            const grid = document.querySelector(".webui-bridge-card-grid");
+            if (grid) {
+                grid.scrollTop = 620;
+                grid.dispatchEvent(new Event("scroll", { bubbles: true }));
+            }
+        });
+        await page.waitForTimeout(350);
+        await dragElementCenter(page, ".webui-bridge-negative-main-resizer", 95);
+        await dragElementCenter(page, ".webui-bridge-negative-detail-resizer", -70);
+        const samples = [];
+        for (let index = 0; index < 8; index += 1) {
+            await page.waitForTimeout(500);
+            samples.push(await promptInnerLayoutSnapshot(page, `sample-${index}`));
+        }
+        await screenshot(page, "compat-prompt-inner-drag-stability.png");
+        const first = samples[0];
+        const last = samples[samples.length - 1];
+        for (const key of ["topRow", "extra", "negativeTextarea", "grid"]) {
+            for (const dim of key === "grid" ? ["top", "height", "scrollTop"] : ["top", "height"]) {
+                const from = first[key]?.[dim];
+                const to = last[key]?.[dim];
+                assert(Number.isFinite(from) && Number.isFinite(to) && Math.abs(from - to) <= 4,
+                    `Prompt inner drag drifted after settle: ${key}.${dim}`, { samples });
+            }
+        }
+        const serialized = await page.evaluate(() => window.app.graph.serialize());
+        const bridgeData = serialized.nodes?.find((node) => node.type === "WebUIPromptBridge");
+        const state = bridgeData?.properties?.webui_prompt_bridge_layout || null;
+        assert(state, "Prompt inner drag did not serialize bridge layout state", { state, samples });
+        assert(Number(state.lora_scroll_top) >= 80, "LoRA scroll was not serialized after prompt drag", { state, samples });
+        assert(Number(state.negative_textarea_height) > 0 || Number(state.positive_tag_height) > 0,
+            "Prompt inner drag heights were not serialized", { state, samples });
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(bridgeConsoleErrors.length === 0, "WebUIPromptBridge reported console errors during prompt inner drag check", bridgeConsoleErrors);
+        return {
+            first,
+            last,
+            serializedState: state,
             bridgeConsoleErrors: bridgeConsoleErrors.length,
         };
     } finally {
@@ -1783,6 +2216,103 @@ async function verifyBridgeLayoutPreferencePersistence(browser, baseUrl, workflo
     }
 }
 
+async function verifySerializedBridgeLayoutStateRestoresWithoutLocalStorage(browser, baseUrl, workflow) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1600, height: 1300 });
+    try {
+        const clearLayoutKeys = [
+            "webui-bridge-layout-storage-version",
+            "webui-bridge-toprow-height",
+            "webui-bridge-extra-height",
+            "webui-bridge-extra-collapsed",
+            "webui-bridge-action-column-collapsed",
+            "webui-bridge-action-column-width",
+            "webui-bridge-negative-collapsed",
+            "webui-bridge-textarea-height-prompt",
+            "webui-bridge-textarea-height-negative-prompt",
+            "webui-bridge-chip-size-positive",
+            "webui-bridge-chip-size-negative",
+            "webui-bridge-aio-panel-height-positive",
+            "webui-bridge-aio-panel-height-negative",
+        ];
+        await page.evaluate(async ({ graphData, keys }) => {
+            for (const key of keys) localStorage.removeItem(key);
+            await window.app.loadGraphData(graphData, true, true, undefined, {
+                filename: "serialized-layout-state-before.json",
+            });
+            window.app.canvas.ds.offset = [55, 35];
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.setDirty(true, true);
+        }, { graphData: workflow, keys: clearLayoutKeys });
+        await page.waitForTimeout(3500);
+        await dragElementCenterBy(page, ".webui-bridge-side-resizer", -90, 0);
+        await dragElementCenter(page, ".webui-bridge-panel-splitter", -70);
+        await page.waitForTimeout(1500);
+        const saved = await page.evaluate(() => {
+            const serialized = window.app.graph.serialize();
+            const bridgeData = serialized.nodes?.find((node) => node.type === "WebUIPromptBridge");
+            const state = bridgeData?.properties?.webui_prompt_bridge_layout || null;
+            const topRow = document.querySelector(".webui-bridge-toprow");
+            const style = topRow ? getComputedStyle(topRow) : null;
+            return {
+                serialized,
+                state,
+                sidebarWidthVar: style?.getPropertyValue("--webui-bridge-sidebar-width")?.trim() || "",
+                topRowHeight: Math.round(topRow?.getBoundingClientRect?.().height || 0),
+                localSidebarWidth: localStorage.getItem("webui-bridge-action-column-width"),
+            };
+        });
+        assert(saved.state, "Bridge layout state was not serialized into node properties", saved);
+        assert(Number(saved.state.sidebar_width) >= 450, "Dragged sidebar width was not captured in serialized layout state", saved);
+        assert(Number(saved.localSidebarWidth) >= 450, "Dragged sidebar width was not persisted locally", saved);
+
+        await page.evaluate(async ({ serialized, keys }) => {
+            for (const key of keys) localStorage.removeItem(key);
+            await window.app.loadGraphData(serialized, true, true, undefined, {
+                filename: "serialized-layout-state-after-clear-local.json",
+            });
+            window.app.canvas.ds.offset = [55, 35];
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.setDirty(true, true);
+        }, { serialized: saved.serialized, keys: clearLayoutKeys });
+        await page.waitForTimeout(3500);
+        const restored = await page.evaluate(() => {
+            const topRow = document.querySelector(".webui-bridge-toprow");
+            const extra = document.querySelector(".webui-bridge-extra");
+            const style = topRow ? getComputedStyle(topRow) : null;
+            const bridge = window.app.graph._nodes.find((node) => node.type === "WebUIPromptBridge");
+            return {
+                state: bridge?.__webuiBridgeConfiguredLayoutState || null,
+                sidebarWidthVar: style?.getPropertyValue("--webui-bridge-sidebar-width")?.trim() || "",
+                sidebarWidth: Number.parseFloat(style?.getPropertyValue("--webui-bridge-sidebar-width") || "0"),
+                topRowHeight: Math.round(topRow?.getBoundingClientRect?.().height || 0),
+                extraHeight: Math.round(extra?.getBoundingClientRect?.().height || 0),
+                localSidebarWidth: localStorage.getItem("webui-bridge-action-column-width"),
+            };
+        });
+        await screenshot(page, "compat-serialized-layout-state-restored.png");
+        assert(Math.abs(restored.sidebarWidth - Number(saved.state.sidebar_width)) <= 2,
+            "Serialized sidebar width did not restore after clearing localStorage", { saved, restored });
+        assert(Math.abs(restored.topRowHeight - Number(saved.state.top_row_height)) <= 4,
+            "Serialized top-row height did not restore after clearing localStorage", { saved, restored });
+        assert(Number(restored.localSidebarWidth) >= 450,
+            "Serialized sidebar width was not reseeded into localStorage after reload", { saved, restored });
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(bridgeConsoleErrors.length === 0, "WebUIPromptBridge reported console errors during serialized layout-state check", bridgeConsoleErrors);
+        return {
+            sidebarWidth: restored.sidebarWidthVar,
+            topRowHeight: restored.topRowHeight,
+            extraHeight: restored.extraHeight,
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
+        };
+    } finally {
+        await context.close();
+    }
+}
+
 async function verifyOldWorkflowCompatibility(browser, baseUrl, workflow) {
     const consoleMessages = [];
     const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages);
@@ -1911,6 +2441,9 @@ async function main() {
             bridgeUiErgonomics: await verifyBridgeUiErgonomics(browser, options.baseUrl, workflow),
             sectionResizeBlankRecovery: await verifySectionResizeBlankRecovery(browser, options.baseUrl, workflow),
             restoreSizeStability: await verifyRestoreSizeStability(browser, options.baseUrl, workflow),
+            canvasPanDoesNotMutateBridgeLayout: await verifyCanvasPanDoesNotMutateBridgeLayout(browser, options.baseUrl, workflow),
+            regionalCanvasSizeDoesNotMutateLayout: await verifyRegionalCanvasSizeDoesNotMutateLayout(browser, options.baseUrl, workflow),
+            nodeSizeInputIsUserAuthority: await verifyNodeSizeInputIsUserAuthority(browser, options.baseUrl, workflow),
             flatSavedBridgeSizeRepair: await verifyFlatSavedBridgeSizeRepair(browser, options.baseUrl, workflow),
             oversizedSavedBridgeSizeRepairAndPortGutters: await verifyOversizedSavedBridgeSizeRepairAndPortGutters(browser, options.baseUrl, workflow),
             sidebarCollapsePersistenceAndSlotLabelCleanup: await verifySidebarCollapsePersistenceAndSlotLabelCleanup(browser, options.baseUrl, workflow),
@@ -1918,9 +2451,12 @@ async function main() {
             quickLoraDefaultVisibility: await verifyQuickLoraDefaultVisibility(browser, options.baseUrl, workflow),
             visibilitySettingsPersistAcrossReload: await verifyVisibilitySettingsPersistAcrossReload(browser, options.baseUrl, workflow),
             loraDefaultPagingAndBasicLoad: await verifyLoraDefaultPagingAndBasicLoad(browser, options.baseUrl, workflow),
+            loraCardListScrollStatePersists: await verifyLoraCardListScrollStatePersists(browser, options.baseUrl, workflow),
+            promptInnerDragDoesNotDrift: await verifyPromptInnerDragDoesNotDrift(browser, options.baseUrl, workflow),
             loraBrowserFlow: await verifyLoraBrowserFlow(browser, options.baseUrl, workflow),
             bridgeSettingsRoundTrip: await verifyBridgeSettingsRoundTrip(browser, options.baseUrl, workflow),
             bridgeLayoutPreferencePersistence: await verifyBridgeLayoutPreferencePersistence(browser, options.baseUrl, workflow),
+            serializedBridgeLayoutState: await verifySerializedBridgeLayoutStateRestoresWithoutLocalStorage(browser, options.baseUrl, workflow),
             oldWorkflowCompatibility: await verifyOldWorkflowCompatibility(browser, options.baseUrl, workflow),
         };
         if (options.queue) {

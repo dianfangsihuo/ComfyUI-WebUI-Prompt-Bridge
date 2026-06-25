@@ -171,7 +171,9 @@ const REGIONAL_HEIGHT_ALIASES = [
     "resize_height",
     "crop_height",
 ];
-const LAYOUT_STORAGE_VERSION = "2026-06-25-nodes2-layout-lora-basic-v2";
+const LAYOUT_STORAGE_VERSION = "2026-06-25-layout-authority-v1";
+const BRIDGE_LAYOUT_STATE_PROPERTY = "webui_prompt_bridge_layout";
+const BRIDGE_LAYOUT_STATE_VERSION = 1;
 const PANEL_UNUSABLE_MIN_WIDTH = PANEL_MIN_WIDTH;
 const PANEL_UNUSABLE_MIN_HEIGHT = 520;
 const PANEL_UNUSABLE_MAX_SAVED_HEIGHT = 1600;
@@ -181,6 +183,49 @@ const DEFAULT_LORA_PAGE_SIZE = 32;
 const LORA_PAGE_SIZE_OPTIONS = new Set([0, 32, 48, 72, 96]);
 const AIO_POSITIVE_MIN_HEIGHT = 180;
 const AIO_NEGATIVE_MIN_HEIGHT = 220;
+const BRIDGE_LAYOUT_STORAGE_KEYS = Object.freeze({
+    top_row_height: "webui-bridge-toprow-height",
+    extra_height: "webui-bridge-extra-height",
+    extra_collapsed: "webui-bridge-extra-collapsed",
+    sidebar_width: "webui-bridge-action-column-width",
+    sidebar_collapsed: "webui-bridge-action-column-collapsed",
+    negative_collapsed: "webui-bridge-negative-collapsed",
+    positive_textarea_height: "webui-bridge-textarea-height-prompt",
+    negative_textarea_height: "webui-bridge-textarea-height-negative-prompt",
+    positive_chip_height: "webui-bridge-chip-size-positive",
+    negative_chip_height: "webui-bridge-chip-size-negative",
+    positive_tag_height: "webui-bridge-aio-panel-height-positive",
+    negative_tag_height: "webui-bridge-aio-panel-height-negative",
+    lora_scroll_top: "webui-bridge-lora-scroll-top",
+});
+const BRIDGE_LAYOUT_STATE_NUMBER_SPECS = Object.freeze({
+    top_row_height: [64, PANEL_MAX_HEIGHT],
+    extra_height: [42, EXTRA_NETWORKS_MAX_HEIGHT],
+    sidebar_width: [ACTION_SIDEBAR_MIN_WIDTH, ACTION_SIDEBAR_MAX_WIDTH],
+    positive_textarea_height: [48, 520],
+    negative_textarea_height: [48, 520],
+    positive_chip_height: [PROMPT_CHIPS_MIN_HEIGHT, 520],
+    negative_chip_height: [PROMPT_CHIPS_MIN_HEIGHT, 520],
+    positive_tag_height: [AIO_POSITIVE_MIN_HEIGHT, 680],
+    negative_tag_height: [AIO_NEGATIVE_MIN_HEIGHT, 680],
+    lora_scroll_top: [0, 100000],
+});
+const BRIDGE_LAYOUT_STATE_BOOLEAN_KEYS = Object.freeze([
+    "extra_collapsed",
+    "sidebar_collapsed",
+    "negative_collapsed",
+]);
+const BRIDGE_LAYOUT_MIGRATED_STORAGE_KEYS = Object.freeze([
+    BRIDGE_LAYOUT_STORAGE_KEYS.top_row_height,
+    BRIDGE_LAYOUT_STORAGE_KEYS.extra_height,
+    BRIDGE_LAYOUT_STORAGE_KEYS.extra_collapsed,
+    BRIDGE_LAYOUT_STORAGE_KEYS.negative_collapsed,
+    BRIDGE_LAYOUT_STORAGE_KEYS.positive_chip_height,
+    BRIDGE_LAYOUT_STORAGE_KEYS.negative_chip_height,
+    BRIDGE_LAYOUT_STORAGE_KEYS.positive_tag_height,
+    BRIDGE_LAYOUT_STORAGE_KEYS.negative_tag_height,
+    BRIDGE_LAYOUT_STORAGE_KEYS.lora_scroll_top,
+]);
 const NODE_TUTORIAL_SEEN_KEY = "webui-bridge-node-tutorial-seen-v2";
 const DEFAULT_BRIDGE_SETTINGS = {
     data_source: "auto",
@@ -246,7 +291,7 @@ const SIDEBAR_VISIBILITY_OPTIONS = [
     ["top_clip", "CLIP 强度"],
     ["top_fail_on_missing", "缺 LoRA 停止"],
     ["model_switch", "模型切换"],
-    ["regional_control", "区域控制"],
+    ["regional_control", "画布尺寸 / 区域控制"],
     ["size_controls", "尺寸快捷"],
     ["layout_presets", "布局预设"],
     ["prompt_tools", "Prompt 工具"],
@@ -754,7 +799,7 @@ function applyTopRowCollapsedState(topRow, collapsed) {
     });
 }
 
-function createHeightResizeGrip(target, storageKey, { min = 48, max = 640, title = "拖动调整高度，双击恢复" } = {}) {
+function createHeightResizeGrip(target, storageKey, { min = 48, max = 640, title = "拖动调整高度，双击恢复", onDragStart = null, onDragMove = null, onDragEnd = null } = {}) {
     const grip = el("div", {
         class: "webui-bridge-section-resizer",
         role: "separator",
@@ -769,6 +814,7 @@ function createHeightResizeGrip(target, storageKey, { min = 48, max = 640, title
         onpointerdown: (event) => {
             event.preventDefault();
             event.stopPropagation();
+            onDragStart?.(event, { target });
             const startY = event.clientY;
             const startHeight = resizeTargetLayoutHeight(target);
             const viewportScale = resizeTargetViewportScale(target);
@@ -776,10 +822,12 @@ function createHeightResizeGrip(target, storageKey, { min = 48, max = 640, title
             grip.classList.add("dragging");
             const onMove = (moveEvent) => {
                 const delta = (moveEvent.clientY - startY) / viewportScale;
+                onDragMove?.(moveEvent, { target, delta, startHeight });
                 setResizeTargetHeight(target, storageKey, startHeight + delta, { min, max });
             };
             const onUp = () => {
                 grip.classList.remove("dragging");
+                onDragEnd?.({ target, grip });
                 const ownerPanel = target?.closest?.(".webui-bridge-panel") || grip.closest?.(".webui-bridge-panel");
                 ownerPanel?.__webuiBridgeHandleSectionResizeEnd?.({ target, grip });
                 document.removeEventListener("pointermove", onMove, true);
@@ -889,23 +937,25 @@ function sidebarWidthMax(topRow, { min = ACTION_SIDEBAR_MIN_WIDTH, max = ACTION_
 }
 
 function setSidebarWidth(topRow, storageKey, width, options = {}) {
-    if (!topRow) return;
+    if (!topRow) return null;
     const min = options.min ?? ACTION_SIDEBAR_MIN_WIDTH;
     const max = sidebarWidthMax(topRow, options);
     const nextWidth = clampNumber(width, min, max);
     topRow.style.setProperty("--webui-bridge-sidebar-width", `${nextWidth}px`);
-    if (storageKey) writeLocalNumber(storageKey, nextWidth);
+    if (storageKey && options.persist !== false) writeLocalNumber(storageKey, nextWidth);
+    return nextWidth;
 }
 
 function applyStoredSidebarWidth(topRow, storageKey, options = {}) {
     const width = readLocalNumber(storageKey, options.defaultWidth ?? ACTION_SIDEBAR_DEFAULT_WIDTH);
-    setSidebarWidth(topRow, storageKey, width, options);
+    setSidebarWidth(topRow, storageKey, width, { ...options, persist: false });
 }
 
 function resetSidebarWidth(topRow, storageKey, options = {}) {
     if (!topRow) return;
     if (storageKey) clearLocalValue(storageKey);
-    setSidebarWidth(topRow, "", options.defaultWidth ?? ACTION_SIDEBAR_DEFAULT_WIDTH, options);
+    const width = setSidebarWidth(topRow, "", options.defaultWidth ?? ACTION_SIDEBAR_DEFAULT_WIDTH, options);
+    options.onCommit?.(width);
 }
 
 function startSidebarWidthDrag(handle, topRowRef, storageKey, options, event) {
@@ -917,6 +967,7 @@ function startSidebarWidthDrag(handle, topRowRef, storageKey, options, event) {
     const startWidth = readLocalNumber(storageKey, Number.parseFloat(getComputedStyle(topRow).getPropertyValue("--webui-bridge-sidebar-width")) || options.defaultWidth || ACTION_SIDEBAR_DEFAULT_WIDTH);
     const viewportScale = resizeTargetViewportXScale(topRow);
     let moved = false;
+    let committedWidth = startWidth;
     handle.classList.add("dragging");
     document.body?.classList?.add("webui-bridge-resizing-sidebar");
     handle.setPointerCapture?.(event.pointerId);
@@ -924,7 +975,7 @@ function startSidebarWidthDrag(handle, topRowRef, storageKey, options, event) {
         const delta = (moveEvent.clientX - startX) / viewportScale;
         if (!moved && Math.abs(delta) < 3) return;
         moved = true;
-        setSidebarWidth(topRow, storageKey, startWidth - delta, options);
+        committedWidth = setSidebarWidth(topRow, storageKey, startWidth - delta, options) ?? committedWidth;
     };
     const onUp = () => {
         handle.classList.remove("dragging");
@@ -932,6 +983,7 @@ function startSidebarWidthDrag(handle, topRowRef, storageKey, options, event) {
         document.removeEventListener("pointermove", onMove, true);
         document.removeEventListener("pointerup", onUp, true);
         document.removeEventListener("pointercancel", onUp, true);
+        if (moved) options.onCommit?.(committedWidth);
     };
     document.addEventListener("pointermove", onMove, true);
     document.addEventListener("pointerup", onUp, true);
@@ -989,6 +1041,62 @@ function migrateLayoutStorage(keys = []) {
     if (readLocalString(versionKey, "") === LAYOUT_STORAGE_VERSION) return;
     for (const key of keys) clearLocalValue(key);
     writeLocalString(versionKey, LAYOUT_STORAGE_VERSION);
+}
+
+function bridgeLayoutStateNumber(source, key, min, max) {
+    const value = Number(source?.[key]);
+    if (!Number.isFinite(value)) return null;
+    return clampNumber(Math.round(value), min, max);
+}
+
+function bridgeLayoutStateBoolean(source, key) {
+    if (!source || !Object.prototype.hasOwnProperty.call(source, key)) return null;
+    const value = source[key];
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value !== 0;
+    if (typeof value === "string") return value === "1" || value.toLowerCase() === "true";
+    return Boolean(value);
+}
+
+function normalizeBridgeLayoutState(source) {
+    if (!source || typeof source !== "object") return null;
+    const state = { version: BRIDGE_LAYOUT_STATE_VERSION };
+    for (const [key, [min, max]] of Object.entries(BRIDGE_LAYOUT_STATE_NUMBER_SPECS)) {
+        const value = bridgeLayoutStateNumber(source, key, min, max);
+        if (value !== null) state[key] = value;
+    }
+    for (const key of BRIDGE_LAYOUT_STATE_BOOLEAN_KEYS) {
+        const value = bridgeLayoutStateBoolean(source, key);
+        if (value !== null) state[key] = value;
+    }
+    return Object.keys(state).length > 1 ? state : null;
+}
+
+function hasLocalValue(key) {
+    try {
+        return key ? localStorage.getItem(key) !== null : false;
+    } catch {
+        return false;
+    }
+}
+
+function writeBridgeLayoutStateToStorage(source, options = {}) {
+    const state = normalizeBridgeLayoutState(source);
+    if (!state) return null;
+    for (const [stateKey, storageKey] of Object.entries(BRIDGE_LAYOUT_STORAGE_KEYS)) {
+        if (!Object.prototype.hasOwnProperty.call(state, stateKey)) continue;
+        const value = state[stateKey];
+        if (typeof value === "boolean") {
+            if (options.preserveExistingBooleanPreferences && hasLocalValue(storageKey)) continue;
+            writeLocalBoolean(storageKey, value);
+        }
+        else if (Number.isFinite(value)) writeLocalNumber(storageKey, value);
+    }
+    return state;
+}
+
+function hasBridgeLayoutState(source) {
+    return Boolean(normalizeBridgeLayoutState(source));
 }
 
 function bridgePanelSizeValues(size) {
@@ -6916,6 +7024,7 @@ function createPromptRow(label, value, placeholder, onFocus, onInput, options = 
     let row = null;
     let textChipGrip = null;
     let chipBottomGrip = null;
+    const markManualResize = (detail = {}) => options.onManualResize?.({ row, textarea, chips, ...detail });
     const applyCollapsedState = (nextCollapsed) => {
         collapsed = Boolean(nextCollapsed);
         row?.classList.toggle("collapsed", collapsed);
@@ -6948,8 +7057,18 @@ function createPromptRow(label, value, placeholder, onFocus, onInput, options = 
         afterMin: PROMPT_CHIPS_MIN_HEIGHT,
         afterMax: 520,
         title: "上下拖动分配文本框和已输入 tag 区高度，双击恢复",
+        onDragStart: () => markManualResize({ phase: "start" }),
+        onDragMove: () => markManualResize({ phase: "move" }),
+        onDragEnd: () => markManualResize({ phase: "end", commit: true }),
     });
-    chipBottomGrip = createHeightResizeGrip(chips, chipHeightKey, { min: PROMPT_CHIPS_MIN_HEIGHT, max: 520, title: "拖动调整已输入 tag 区底边高度，双击恢复" });
+    chipBottomGrip = createHeightResizeGrip(chips, chipHeightKey, {
+        min: PROMPT_CHIPS_MIN_HEIGHT,
+        max: 520,
+        title: "拖动调整已输入 tag 区底边高度，双击恢复",
+        onDragStart: () => markManualResize({ phase: "start" }),
+        onDragMove: () => markManualResize({ phase: "move" }),
+        onDragEnd: () => markManualResize({ phase: "end", commit: true }),
+    });
     row = el("div", { class: "webui-bridge-prompt-row" }, [
         el("div", { class: "webui-bridge-prompt-label" }, [
             el("span", {}, label),
@@ -7604,6 +7723,30 @@ function buildPanel(node) {
     let statusTimer = null;
     let syncRegionalWidgets = () => {};
     let renderModuleAssetStatuses = () => {};
+    const {
+        top_row_height: topRowHeightKey,
+        extra_height: extraHeightKey,
+        extra_collapsed: extraCollapsedKey,
+        sidebar_collapsed: actionCollapsedKey,
+        sidebar_width: actionWidthKey,
+        negative_collapsed: negativeCollapsedKey,
+        positive_textarea_height: positiveTextareaHeightKey,
+        negative_textarea_height: negativeTextareaHeightKey,
+        positive_chip_height: positiveChipHeightKey,
+        negative_chip_height: negativeChipHeightKey,
+        positive_tag_height: positiveTagHeightKey,
+        negative_tag_height: negativeTagHeightKey,
+        lora_scroll_top: loraScrollTopKey,
+    } = BRIDGE_LAYOUT_STORAGE_KEYS;
+    const configuredLayoutState = normalizeBridgeLayoutState(node.__webuiBridgeConfiguredLayoutState);
+    let markPromptInnerManualResize = () => {};
+    const seedConfiguredLayoutState = () => {
+        if (!configuredLayoutState || node.__webuiBridgeConfiguredLayoutStateApplied) return;
+        writeBridgeLayoutStateToStorage(configuredLayoutState, { preserveExistingBooleanPreferences: true });
+        node.__webuiBridgeConfiguredLayoutStateApplied = true;
+    };
+    migrateLayoutStorage(BRIDGE_LAYOUT_MIGRATED_STORAGE_KEYS);
+    seedConfiguredLayoutState();
 
     const sync = () => {
         setWidgetValue(node, "positive_prompt", positive.textarea.value);
@@ -7689,7 +7832,11 @@ function buildPanel(node) {
         "Prompt\nCtrl+Up/Down edits attention, Alt+Left/Right moves comma tags",
         onFocus,
         onInput,
-        { sizeKey: "webui-bridge-chip-size-positive" },
+        {
+            textareaHeightKey: positiveTextareaHeightKey,
+            sizeKey: positiveChipHeightKey,
+            onManualResize: (detail) => markPromptInnerManualResize(detail),
+        },
     );
     positive.textarea.__webuiBridgeKind = "positive";
     const negative = createPromptRow(
@@ -7698,7 +7845,13 @@ function buildPanel(node) {
         "Negative prompt",
         onFocus,
         onInput,
-        { sizeKey: "webui-bridge-chip-size-negative", collapseKey: "webui-bridge-negative-collapsed", collapsible: true },
+        {
+            textareaHeightKey: negativeTextareaHeightKey,
+            sizeKey: negativeChipHeightKey,
+            collapseKey: negativeCollapsedKey,
+            collapsible: true,
+            onManualResize: (detail) => markPromptInnerManualResize(detail),
+        },
     );
     negative.textarea.__webuiBridgeKind = "negative";
     state.activeTextarea = positive.textarea;
@@ -7812,7 +7965,7 @@ function buildPanel(node) {
     });
     const regionalCanvasAutoInput = el("input", {
         type: "checkbox",
-        title: "自动跟随 KSampler 的 latent/image 画布尺寸；编辑宽高会退出自动跟随",
+        title: "自动跟随当前工作流的生成图片/latent 画布尺寸；编辑宽高会退出自动跟随",
     });
     regionalCanvasAutoInput.checked = bridgeBooleanWidgetValue(node, "regional_canvas_auto", true);
     const regionalCanvasWidthInput = el("input", {
@@ -7822,7 +7975,7 @@ function buildPanel(node) {
         max: "16384",
         step: "8",
         value: bridgeWidgetValue(node, "regional_canvas_width", DEFAULT_REGIONAL_CANVAS_WIDTH),
-        title: "输入后同步到实际 Image Size / Resize 节点；编辑时会退出自动跟随",
+        title: "画布宽；输入后同步到实际 Image Size / Resize 节点，编辑时会退出自动跟随",
     });
     const regionalCanvasHeightInput = el("input", {
         class: "webui-bridge-regional-canvas-size",
@@ -7831,13 +7984,13 @@ function buildPanel(node) {
         max: "16384",
         step: "8",
         value: bridgeWidgetValue(node, "regional_canvas_height", DEFAULT_REGIONAL_CANVAS_HEIGHT),
-        title: "输入后同步到实际 Image Size / Resize 节点；编辑时会退出自动跟随",
+        title: "画布高；输入后同步到实际 Image Size / Resize 节点，编辑时会退出自动跟随",
     });
     const regionalCanvasSource = el("span", { class: "webui-bridge-regional-canvas-source" });
     const regionalDetectButton = el("button", {
         class: "webui-bridge-regional-detect",
         type: "button",
-        title: "重新检测工作流里的画布尺寸，并回到自动读取",
+        title: "检测当前工作流的生成图片/latent 画布尺寸，并回到自动读取",
         onclick: () => {
             const detected = detectRegionalCanvasSizeFromGraph(node);
             if (detected) {
@@ -9677,58 +9830,6 @@ function buildPanel(node) {
                 }
             });
         };
-        const fitNodeToVisibleContent = (width, minimumHeight) => {
-            requestAnimationFrame(() => requestAnimationFrame(() => {
-                if (nodeHasSavedUserBridgePanelSize(node) || bridgeConfiguredSizeLockActive(node)) return;
-                const splitter = panel?.querySelector?.(".webui-bridge-panel-splitter");
-                const panelStyle = panel ? getComputedStyle(panel) : null;
-                const paddingY = panelStyle ? (Number.parseFloat(panelStyle.paddingTop) || 0) + (Number.parseFloat(panelStyle.paddingBottom) || 0) : 0;
-                const rowGap = panelStyle ? Number.parseFloat(panelStyle.rowGap || panelStyle.gap) || 0 : 0;
-                const visibleBlocks = [topControls, topRow, splitter, extraSection].filter((item) => item && !resizeTargetHidden(item));
-                const contentHeight = visibleBlocks.reduce((sum, item) => sum + resizeTargetLayoutHeight(item), paddingY + rowGap * Math.max(0, visibleBlocks.length - 1));
-                const nextHeight = Math.max(minimumHeight || PANEL_MIN_HEIGHT, Math.ceil(contentHeight + DOM_WIDGET_LAYOUT_PAD));
-                setNodeSize(width, nextHeight, { remember: false });
-            }));
-        };
-        const fitLoraToCardRows = (rows = 1) => {
-            requestAnimationFrame(() => requestAnimationFrame(() => {
-                if (extraCollapsed || !extraSection?.isConnected) return;
-                const extraRect = extraSection.getBoundingClientRect();
-                const headHeight = extraSection.querySelector(".webui-bridge-extra-head")?.offsetHeight || 44;
-                const grid = extraSection.querySelector(".webui-bridge-card-grid");
-                const gridStyle = grid ? getComputedStyle(grid) : null;
-                const firstCard = grid?.querySelector(".webui-bridge-card, .webui-bridge-empty");
-                const scale = extraRect.height && extraSection.offsetHeight ? extraRect.height / extraSection.offsetHeight : 1;
-                const cardRect = firstCard?.getBoundingClientRect?.();
-                const visibleCardHeight = cardRect?.height && scale ? cardRect.height / scale : 0;
-                const cardHeight = visibleCardHeight || firstCard?.offsetHeight || Number.parseFloat(gridStyle?.gridAutoRows) || 142;
-                const rowGap = Number.parseFloat(gridStyle?.rowGap || gridStyle?.gap) || 8;
-                const paddingY = gridStyle ? (Number.parseFloat(gridStyle.paddingTop) || 0) + (Number.parseFloat(gridStyle.paddingBottom) || 0) : 16;
-                const borderY = 4;
-                const nextHeight = Math.ceil(headHeight + paddingY + cardHeight * rows + rowGap * Math.max(0, rows - 1) + borderY);
-                const panelHeight = panel ? resizeTargetLayoutHeight(panel) : 0;
-                const splitter = panel?.querySelector?.(".webui-bridge-panel-splitter");
-                const splitterHeight = splitter && !resizeTargetHidden(splitter) ? resizeTargetLayoutHeight(splitter) : 0;
-                let availableExtraHeight = nextHeight;
-                if (panelHeight) {
-                    const viewportScale = resizeTargetViewportScale(panel) || 1;
-                    const panelRect = panel.getBoundingClientRect();
-                    const topRect = topRow.getBoundingClientRect();
-                    const splitterRect = splitter?.getBoundingClientRect?.();
-                    const extraRectForGap = extraSection.getBoundingClientRect();
-                    const paddingTop = Math.max(0, (topRect.top - panelRect.top) / viewportScale) || (Number.parseFloat(getComputedStyle(panel).paddingTop) || 0);
-                    const gapBeforeSplitter = splitterRect ? Math.max(0, (splitterRect.top - topRect.bottom) / viewportScale) : 0;
-                    const gapBeforeExtra = splitterRect ? Math.max(0, (extraRectForGap.top - splitterRect.bottom) / viewportScale) : 0;
-                    availableExtraHeight = panelHeight - paddingTop - resizeTargetLayoutHeight(topRow) - gapBeforeSplitter - splitterHeight - gapBeforeExtra - 12;
-                }
-                const cappedHeight = Math.min(nextHeight, Math.max(EXTRA_NETWORKS_MIN_HEIGHT, availableExtraHeight || nextHeight));
-                setResizeTargetHeight(extraSection, extraHeightKey, Math.max(EXTRA_NETWORKS_CARD_ROW_MIN_HEIGHT, cappedHeight), {
-                    min: EXTRA_NETWORKS_CARD_ROW_MIN_HEIGHT,
-                    max: extraSection.__webuiBridgeMaxHeight,
-                });
-                extraSection.style.flex = "0 0 auto";
-            }));
-        };
         if (normalizedPreset === "compact") {
             if (!preserveNodeSize) setNodeSize(920, 680, { user: true });
             collapseNegative(false);
@@ -9736,8 +9837,6 @@ function buildPanel(node) {
             writeLocalBoolean(extraCollapsedKey, false);
             applyExtraCollapsedState?.({ preserveExpandedHeight: preserveFreshHeights });
             setPanelHeights({ top: 420, lora: EXTRA_NETWORKS_MIN_HEIGHT, positiveText: 88, positiveTags: 150 });
-            if (!preserveNodeSize) fitLoraToCardRows(1);
-            if (!preserveNodeSize) fitNodeToVisibleContent(920, 620);
         } else if (normalizedPreset === "roomy") {
             if (!preserveNodeSize) setNodeSize(1380, 1180, { user: true });
             collapseNegative(false);
@@ -9745,8 +9844,6 @@ function buildPanel(node) {
             writeLocalBoolean(extraCollapsedKey, false);
             applyExtraCollapsedState?.({ preserveExpandedHeight: preserveFreshHeights });
             setPanelHeights({ top: 840, lora: EXTRA_NETWORKS_MIN_HEIGHT, positiveText: 138, positiveTags: 360 });
-            if (!preserveNodeSize) fitLoraToCardRows(1);
-            if (!preserveNodeSize) fitNodeToVisibleContent(1380, 1080);
         } else if (normalizedPreset === "positive_focus") {
             if (!preserveNodeSize) setNodeSize(1180, 760, { user: true });
             collapseNegative(true);
@@ -9754,8 +9851,6 @@ function buildPanel(node) {
             writeLocalBoolean(extraCollapsedKey, false);
             applyExtraCollapsedState?.({ preserveExpandedHeight: preserveFreshHeights });
             setPanelHeights({ top: 500, lora: EXTRA_NETWORKS_MIN_HEIGHT, positiveText: 150, positiveTags: 240 });
-            if (!preserveNodeSize) fitLoraToCardRows(1);
-            if (!preserveNodeSize) fitNodeToVisibleContent(1180, 680);
         } else if (normalizedPreset === "minimal_lora") {
             if (!preserveNodeSize) setNodeSize(940, 560, { user: true });
             collapseNegative(true);
@@ -9763,7 +9858,6 @@ function buildPanel(node) {
             writeLocalBoolean(extraCollapsedKey, true);
             applyExtraCollapsedState?.({ preserveExpandedHeight: preserveFreshHeights });
             setPanelHeights({ top: 460, positiveText: 130, positiveTags: 220 });
-            if (!preserveNodeSize) fitNodeToVisibleContent(940, 500);
         } else {
             if (!preserveNodeSize) setNodeSize(DEFAULT_PANEL_WIDTH, 1060, { user: true });
             collapseNegative(false);
@@ -9771,8 +9865,6 @@ function buildPanel(node) {
             writeLocalBoolean(extraCollapsedKey, false);
             applyExtraCollapsedState?.({ preserveExpandedHeight: preserveFreshHeights });
             setPanelHeights({ top: 620, lora: preserveNodeSize ? undefined : EXTRA_NETWORKS_MIN_HEIGHT, positiveText: 110, positiveTags: 190 });
-            if (!preserveNodeSize) fitLoraToCardRows(2);
-            if (!preserveNodeSize) fitNodeToVisibleContent(DEFAULT_PANEL_WIDTH, 980);
         }
         scheduleAdaptiveLayout();
         requestAnimationFrame(() => applyUiVisibility?.());
@@ -11032,6 +11124,19 @@ function buildPanel(node) {
     const renderCards = () => {
         const q = networkSearch.value.trim().toLowerCase();
         const filter = state.loraFolder || "__all";
+        const listSignature = [
+            q,
+            filter,
+            state.loraSort,
+            state.loraSortDescending ? "desc" : "asc",
+            state.loraPageSize,
+            state.loraPage,
+        ].join("|");
+        const shouldRestoreScroll = state.__webuiBridgeLoraListSignature === undefined ||
+            state.__webuiBridgeLoraListSignature === listSignature;
+        const preservedScrollTop = shouldRestoreScroll
+            ? (cards.scrollTop || readLocalNumber(loraScrollTopKey, 0))
+            : 0;
         cards.classList.toggle("compact", state.settings?.lora_card_size === "compact");
         cards.classList.toggle("large", state.settings?.lora_card_size === "large");
         const filtered = sortLoras(state.loras.filter((item) => (
@@ -11045,6 +11150,7 @@ function buildPanel(node) {
         const start = state.loraPage * Math.max(1, pageSize);
         const visible = showAll ? filtered : filtered.slice(start, start + pageSize);
         cards.innerHTML = "";
+        state.__webuiBridgeLoraListSignature = listSignature;
         networkCount.textContent = `${filtered.length} 个 LoRA`;
         loraPageInfo.textContent = showAll ? "全部" : `${state.loraPage + 1}/${totalPages}`;
         loraPagePrev.disabled = showAll || state.loraPage <= 0;
@@ -11052,6 +11158,7 @@ function buildPanel(node) {
         updateSelectedLoraCount();
         if (!visible.length) {
             cards.append(el("div", { class: "webui-bridge-empty" }, "No LoRA matched"));
+            cards.scrollTop = 0;
             scheduleAdaptiveLayout();
             return;
         }
@@ -11155,6 +11262,14 @@ function buildPanel(node) {
             ]);
             cards.append(card);
         }
+        window.requestAnimationFrame?.(() => {
+            if (!cards.isConnected) return;
+            cards.__webuiBridgeRestoringScroll = true;
+            cards.scrollTop = Math.max(0, preservedScrollTop || 0);
+            window.setTimeout?.(() => {
+                cards.__webuiBridgeRestoringScroll = false;
+            }, 0);
+        });
         scheduleAdaptiveLayout();
     };
 
@@ -11532,7 +11647,8 @@ function buildPanel(node) {
             node.__webuiBridgeSetSizeIsUser = false;
         }
         syncNodeSizeInputs();
-        app.graph?.setDirtyCanvas(true, true);
+        if (rememberSize || userSize) markGraphChanged(node);
+        else app.graph?.setDirtyCanvas(true, true);
     };
 
     let resizeExtraWithNode = () => {};
@@ -11544,10 +11660,16 @@ function buildPanel(node) {
     let suppressPromptInnerFitUntil = 0;
     let manualNodeResizeActive = false;
     let promptLoraSplitManual = false;
-    let promptInnerSplitManual = false;
+    let promptInnerSplitManual = [
+        positiveTextareaHeightKey,
+        negativeTextareaHeightKey,
+        positiveChipHeightKey,
+        negativeChipHeightKey,
+        positiveTagHeightKey,
+        negativeTagHeightKey,
+    ].some((key) => readLocalNumber(key, null) !== null);
     let manualResizeSettleTimer = 0;
     let bottomFitReleaseTimer = 0;
-    let settleBottomBlankAfterSectionResize = () => {};
     const freshInitialLayoutStabilizing = () => node.__webuiBridgeFreshNode &&
         !node.__webuiBridgeWasConfigured &&
         !node.__webuiBridgeUserSized &&
@@ -11562,11 +11684,6 @@ function buildPanel(node) {
             node.__webuiBridgeFreshLayoutStabilizeUntil = 0;
         }
     };
-    const nodeSizeAutoFitLocked = () => manualNodeResizeActive ||
-        freshInitialLayoutStabilizing() ||
-        (performance?.now?.() || Date.now()) < suppressPanelAutoFitUntil ||
-        nodeHasSavedUserBridgePanelSize(node) ||
-        bridgeConfiguredSizeLockActive(node);
     const sectionAutoFitSuspended = () => manualNodeResizeActive ||
         freshInitialLayoutStabilizing() ||
         (performance?.now?.() || Date.now()) < suppressPanelAutoFitUntil;
@@ -11590,6 +11707,12 @@ function buildPanel(node) {
     };
     const holdPromptInnerFit = () => {
         suppressPromptInnerFitUntil = (performance?.now?.() || Date.now()) + 1400;
+    };
+    markPromptInnerManualResize = ({ commit = false } = {}) => {
+        promptInnerSplitManual = true;
+        holdPromptInnerFit();
+        holdPromptSplitFit();
+        if (commit) markGraphChanged(node);
     };
     const holdPanelAutoFit = (duration = 2600) => {
         const now = performance?.now?.() || Date.now();
@@ -11619,7 +11742,6 @@ function buildPanel(node) {
         manualResizeSettleTimer = window.setTimeout?.(() => {
             manualResizeSettleTimer = 0;
             settleManualResizeLayout?.();
-            settleBottomBlankAfterSectionResize?.({ force: true, shrinkNode: true });
         }, 120) || 0;
     };
     const resizeNode = (deltaWidth, deltaHeight) => {
@@ -11820,8 +11942,8 @@ function buildPanel(node) {
     }
     syncNodeSizeInputs();
     const sizeControls = el("div", { class: "webui-bridge-size-controls" }, [
-        nodeSizeField("宽", nodeWidthInput),
-        nodeSizeField("高", nodeHeightInput),
+        nodeSizeField("节点宽", nodeWidthInput),
+        nodeSizeField("节点高", nodeHeightInput),
         el("button", { title: "Compact size", onclick: () => setNodeSize(840, 620, { user: true }) }, "S"),
         el("button", { title: "Smaller node", onclick: () => resizeNode(-120, -90) }, "-"),
         el("button", { title: "Larger node", onclick: () => resizeNode(120, 90) }, "+"),
@@ -11929,6 +12051,9 @@ function buildPanel(node) {
                 afterMax: () => positiveTagPanel.__webuiBridgeMaxHeight,
                 label: "Prompt / 标签",
                 title: "上下拖动分配提示词区和标签列表高度，双击恢复",
+                onDragStart: () => markPromptInnerManualResize(),
+                onDragMove: () => markPromptInnerManualResize(),
+                onDragEnd: () => markPromptInnerManualResize({ commit: true }),
             },
         ),
         positiveTagPanel,
@@ -11946,11 +12071,13 @@ function buildPanel(node) {
                 label: "标签 / 反向词",
                 title: "上下拖动分配标签列表和反向词文本框高度，双击恢复",
                 onDragStart: () => {
+                    markPromptInnerManualResize();
                     holdPromptInnerFit();
                     negativeMainStartTopHeight = resizeTargetLayoutHeight(topRow);
                     negativeMainStartExtraHeight = resizeTargetLayoutHeight(extraSection);
                 },
                 onDragMove: (_event, detail) => {
+                    markPromptInnerManualResize();
                     promptInnerSplitManual = true;
                     holdPromptInnerFit();
                     if (!negative.row.classList.contains("collapsed") || !topRow || !extraSection || !detail) return;
@@ -11970,6 +12097,7 @@ function buildPanel(node) {
                     }
                 },
                 onDragEnd: () => {
+                    markPromptInnerManualResize({ commit: true });
                     holdPromptInnerFit();
                     holdPromptSplitFit();
                 },
@@ -11989,36 +12117,24 @@ function buildPanel(node) {
                 afterMax: () => negativeTagPanel.__webuiBridgeMaxHeight,
                 label: "反向词 / 标签",
                 title: "上下拖动分配反向词区和反向标签列表高度，双击恢复",
+                onDragStart: () => markPromptInnerManualResize(),
+                onDragMove: () => markPromptInnerManualResize(),
+                onDragEnd: () => markPromptInnerManualResize({ commit: true }),
             },
         ),
         negativeTagPanel,
     ]);
     positive.row.classList.add("webui-bridge-positive-prompt-row");
     promptsColumn.classList.toggle("negative-collapsed", negative.row.classList.contains("collapsed"));
-    const topRowHeightKey = "webui-bridge-toprow-height";
-    const extraHeightKey = "webui-bridge-extra-height";
-    const extraCollapsedKey = "webui-bridge-extra-collapsed";
-    const actionCollapsedKey = "webui-bridge-action-column-collapsed";
-    const actionWidthKey = "webui-bridge-action-column-width";
     const actionWidthOptions = {
         defaultWidth: ACTION_SIDEBAR_DEFAULT_WIDTH,
         min: ACTION_SIDEBAR_MIN_WIDTH,
         max: ACTION_SIDEBAR_MAX_WIDTH,
         promptMin: ACTION_SIDEBAR_PROMPT_MIN_WIDTH,
+        onCommit: () => markGraphChanged(node),
     };
-    migrateLayoutStorage([
-        topRowHeightKey,
-        extraHeightKey,
-        extraCollapsedKey,
-        actionCollapsedKey,
-        actionWidthKey,
-        "webui-bridge-negative-collapsed",
-        positive.row?.chips?.__webuiBridgeHeightKey,
-        negative.row?.chips?.__webuiBridgeHeightKey,
-        positiveTagPanel?.__webuiBridgeHeightKey,
-        negativeTagPanel?.__webuiBridgeHeightKey,
-    ]);
-    promptLoraSplitManual = readLocalNumber(topRowHeightKey, null) !== null;
+    promptLoraSplitManual = readLocalNumber(topRowHeightKey, null) !== null ||
+        readLocalNumber(extraHeightKey, null) !== null;
     let extraCollapsed = readLocalBoolean(extraCollapsedKey, false);
     let actionCollapsed = readLocalBoolean(actionCollapsedKey, false);
     let loraOverlayOpen = false;
@@ -12028,15 +12144,15 @@ function buildPanel(node) {
             topRowHeightKey,
             extraHeightKey,
             extraCollapsedKey,
-            actionWidthKey,
             positive.row?.chips?.__webuiBridgeHeightKey,
             negative.row?.chips?.__webuiBridgeHeightKey,
             positiveTagPanel?.__webuiBridgeHeightKey,
             negativeTagPanel?.__webuiBridgeHeightKey,
+            loraScrollTopKey,
         ];
         if (!preservePromptTextHeights) {
             keys.push(
-                "webui-bridge-negative-collapsed",
+                negativeCollapsedKey,
                 positive.textarea.__webuiBridgeHeightKey,
                 negative.textarea.__webuiBridgeHeightKey,
             );
@@ -12060,10 +12176,10 @@ function buildPanel(node) {
         resetResizeTargetHeight(negative.row?.chips, negative.row?.chips?.__webuiBridgeHeightKey);
         resetResizeTargetHeight(positiveTagPanel, positiveTagPanel?.__webuiBridgeHeightKey);
         resetResizeTargetHeight(negativeTagPanel, negativeTagPanel?.__webuiBridgeHeightKey);
-        resetSidebarWidth(topRow, actionWidthKey, actionWidthOptions);
         applyTopRowCollapsedState(topRow, false);
         applyExtraCollapsedState();
         applyActionCollapsedState();
+        markGraphChanged(node);
         window.requestAnimationFrame?.(() => panel?.__webuiBridgeScheduleAdaptiveLayout?.());
     };
     const extraBody = el("div", { class: "webui-bridge-extra-body" }, [
@@ -12072,6 +12188,7 @@ function buildPanel(node) {
     ]);
     const ensureUsableExtraHeight = (preferredHeight = EXTRA_NETWORKS_USABLE_MIN_HEIGHT) => {
         if (extraCollapsed || loraOverlayOpen) return;
+        if (promptLoraSplitManual) return;
         if (!extraSection?.isConnected || resizeTargetHidden(extraSection)) return;
         const height = extraSection?.getBoundingClientRect?.().height || 0;
         const maxExtraHeight = extraSection.__webuiBridgeMaxHeight || EXTRA_NETWORKS_MAX_HEIGHT;
@@ -12107,6 +12224,7 @@ function buildPanel(node) {
             extraCollapsed = !extraCollapsed;
             writeLocalBoolean(extraCollapsedKey, extraCollapsed);
             applyExtraCollapsedState();
+            markGraphChanged(node);
         },
     }, extraCollapsed ? "显示 LoRA" : "隐藏 LoRA");
     networkControls.prepend(extraToggle);
@@ -12230,7 +12348,7 @@ function buildPanel(node) {
     applyExtraCollapsedState();
     const regionalSection = el("details", { class: "webui-bridge-regional-section", open: Boolean(regionalEnabledInput.checked) }, [
         el("summary", {}, [
-            el("span", {}, "区域控制"),
+            el("span", {}, "画布尺寸 / 区域控制"),
             regionalEnabledInput,
         ]),
         el("div", { class: "webui-bridge-regional-grid" }, [
@@ -12241,12 +12359,12 @@ function buildPanel(node) {
             el("label", {}, [el("span", {}, "Base比例"), regionalBaseRatioInput]),
             el("label", {}, [el("span", {}, "强度"), regionalStrengthInput]),
             el("label", { class: "webui-bridge-regional-canvas-row" }, [
-                el("span", {}, "画布"),
+                el("span", {}, "画布宽"),
+                regionalCanvasWidthInput,
+                el("span", {}, "画布高"),
+                regionalCanvasHeightInput,
                 regionalCanvasAutoInput,
                 el("span", {}, "自动"),
-                regionalCanvasWidthInput,
-                el("span", { class: "webui-bridge-regional-canvas-times" }, "x"),
-                regionalCanvasHeightInput,
                 regionalDetectButton,
             ]),
         ]),
@@ -12318,6 +12436,7 @@ function buildPanel(node) {
             actionCollapsed = !actionCollapsed;
             writeLocalBoolean(actionCollapsedKey, actionCollapsed);
             applyActionCollapsedState();
+            markGraphChanged(node);
         },
     });
     function applyActionCollapsedState({ resizeNode = false } = {}) {
@@ -12548,11 +12667,50 @@ function buildPanel(node) {
         extraSection,
         resizeGrip,
     ]);
-    panel.__webuiBridgeHandleSectionResizeEnd = () => {
+    const layoutHeightForState = (target, storageKey = "") => {
+        const height = resizeTargetLayoutHeight(target) || Math.round(target?.getBoundingClientRect?.().height || 0);
+        if (height) return height;
+        return storageKey ? readLocalNumber(storageKey, null) : null;
+    };
+    const collectBridgeLayoutState = () => {
+        const sidebarWidth = topRow
+            ? Number.parseFloat(getComputedStyle(topRow).getPropertyValue("--webui-bridge-sidebar-width"))
+            : null;
+        return normalizeBridgeLayoutState({
+            top_row_height: layoutHeightForState(topRow, topRowHeightKey),
+            extra_height: extraCollapsed
+                ? (readLocalNumber(extraHeightKey, null) || layoutHeightForState(extraSection, extraHeightKey))
+                : layoutHeightForState(extraSection, extraHeightKey),
+            extra_collapsed: Boolean(extraCollapsed),
+            sidebar_width: Number.isFinite(sidebarWidth) ? sidebarWidth : readLocalNumber(actionWidthKey, null),
+            sidebar_collapsed: Boolean(actionCollapsed),
+            negative_collapsed: Boolean(negative.row?.classList?.contains("collapsed")),
+            positive_textarea_height: layoutHeightForState(positive.textarea, positiveTextareaHeightKey),
+            negative_textarea_height: layoutHeightForState(negative.textarea, negativeTextareaHeightKey),
+            positive_chip_height: layoutHeightForState(positive.row?.chips, positiveChipHeightKey),
+            negative_chip_height: layoutHeightForState(negative.row?.chips, negativeChipHeightKey),
+            positive_tag_height: layoutHeightForState(positiveTagPanel, positiveTagHeightKey),
+            negative_tag_height: layoutHeightForState(negativeTagPanel, negativeTagHeightKey),
+            lora_scroll_top: cards?.isConnected ? Math.max(0, Math.round(cards.scrollTop || 0)) : readLocalNumber(loraScrollTopKey, null),
+        });
+    };
+    panel.__webuiBridgeGetLayoutState = collectBridgeLayoutState;
+    panel.__webuiBridgeMarkPromptInnerManualResize = markPromptInnerManualResize;
+    panel.__webuiBridgeHandleSectionResizeEnd = ({ target, before, after, grip } = {}) => {
+        const promptResize = Boolean(
+            target?.closest?.(".webui-bridge-prompts") ||
+            before?.closest?.(".webui-bridge-prompts") ||
+            after?.closest?.(".webui-bridge-prompts") ||
+            grip?.closest?.(".webui-bridge-prompts")
+        );
+        if (promptResize) {
+            markPromptInnerManualResize({ commit: true });
+            return;
+        }
+        markGraphChanged(node);
         holdPromptInnerFit();
         holdPromptSplitFit();
         scheduleManualResizeSettle();
-        settleBottomBlankAfterSectionResize?.({ force: true, shrinkNode: true });
     };
     node.__webuiBridgeHandleExternalNodeResize = ({ previousHeight, height } = {}) => {
         if (!panel?.isConnected) return;
@@ -12596,6 +12754,16 @@ function buildPanel(node) {
     }
     window.requestAnimationFrame?.(refreshSidebarWidth);
     networkPane.append(cards);
+    let loraScrollSaveTimer = 0;
+    cards.addEventListener("scroll", () => {
+        if (!cards.isConnected) return;
+        if (cards.__webuiBridgeRestoringScroll) return;
+        window.clearTimeout?.(loraScrollSaveTimer);
+        loraScrollSaveTimer = window.setTimeout?.(() => {
+            writeLocalNumber(loraScrollTopKey, Math.max(0, Math.round(cards.scrollTop || 0)));
+            markGraphChanged(node);
+        }, 160) || 0;
+    }, { passive: true });
 
     const fitLoraSectionToVisibleRows = (rows = 1, { force = false, fillAvailable = false } = {}) => {
         if (extraCollapsed || loraOverlayOpen || !extraSection?.isConnected) return;
@@ -12652,50 +12820,9 @@ function buildPanel(node) {
         setResizeTargetHeight(extraSection, extraHeightKey, nextExtraHeight, {
             min: EXTRA_NETWORKS_CARD_ROW_MIN_HEIGHT,
             max: extraSection.__webuiBridgeMaxHeight,
+            persist: false,
         });
         extraSection.style.flex = "0 0 auto";
-    };
-
-    const fitNodeBottomToVisibleContent = () => {
-        if (loraOverlayOpen || !panel?.isConnected || !extraSection?.isConnected) return;
-        if (nodeSizeAutoFitLocked()) return;
-        if ((performance?.now?.() || Date.now()) < suppressNodeBottomFitUntil) return;
-        const currentWidth = node.size?.[0] || node.__webuiBridgeDesiredSize?.[0] || DEFAULT_PANEL_WIDTH;
-        const currentHeight = node.size?.[1] || node.__webuiBridgeDesiredSize?.[1] || DEFAULT_PANEL_HEIGHT;
-        const activePreset = state.settings?.layout_preset || "default";
-        let shrinkFloor = Math.max(node.__webuiBridgeMinNodeHeight?.() || PANEL_MIN_HEIGHT, PANEL_MIN_HEIGHT);
-        if (!extraCollapsed) {
-            const targetRows = activePreset === "default" ? 2 : 1;
-            const extraRect = extraSection.getBoundingClientRect();
-            const headHeight = extraSection.querySelector(".webui-bridge-extra-head")?.offsetHeight || 44;
-            const grid = extraSection.querySelector(".webui-bridge-card-grid");
-            const gridStyle = grid ? getComputedStyle(grid) : null;
-            const firstCard = grid?.querySelector(".webui-bridge-card, .webui-bridge-empty");
-            const scale = extraRect.height && extraSection.offsetHeight ? extraRect.height / extraSection.offsetHeight : 1;
-            const cardRect = firstCard?.getBoundingClientRect?.();
-            const visibleCardHeight = cardRect?.height && scale ? cardRect.height / scale : 0;
-            const cardHeight = visibleCardHeight || firstCard?.offsetHeight || Number.parseFloat(gridStyle?.gridAutoRows) || 142;
-            const rowGap = Number.parseFloat(gridStyle?.rowGap || gridStyle?.gap) || 8;
-            const paddingY = gridStyle ? (Number.parseFloat(gridStyle.paddingTop) || 0) + (Number.parseFloat(gridStyle.paddingBottom) || 0) : 16;
-            const desiredExtraHeight = Math.ceil(headHeight + paddingY + cardHeight * targetRows + rowGap * Math.max(0, targetRows - 1) + 4);
-            const splitter = panel.querySelector?.(".webui-bridge-panel-splitter");
-            const splitterHeight = splitter && !resizeTargetHidden(splitter) ? resizeTargetLayoutHeight(splitter) : 0;
-            const viewportScale = resizeTargetViewportScale(panel) || 1;
-            const panelRect = panel.getBoundingClientRect();
-            const topRect = topRow.getBoundingClientRect();
-            const splitterRect = splitter?.getBoundingClientRect?.();
-            const extraRectForGap = extraSection.getBoundingClientRect();
-            const paddingTop = Math.max(0, (topRect.top - panelRect.top) / viewportScale) || (Number.parseFloat(getComputedStyle(panel).paddingTop) || 0);
-            const gapBeforeSplitter = splitterRect ? Math.max(0, (splitterRect.top - topRect.bottom) / viewportScale) : 0;
-            const gapBeforeExtra = splitterRect ? Math.max(0, (extraRectForGap.top - splitterRect.bottom) / viewportScale) : 0;
-            const panelChrome = Math.max(0, currentHeight - resizeTargetLayoutHeight(panel));
-            const requiredHeight = paddingTop + resizeTargetLayoutHeight(topRow) + gapBeforeSplitter + splitterHeight + gapBeforeExtra + desiredExtraHeight + 12 + panelChrome;
-            shrinkFloor = Math.max(shrinkFloor, Math.ceil(requiredHeight));
-        }
-        if (currentHeight < shrinkFloor - 2) {
-            setNodeSize(currentWidth, shrinkFloor, { remember: false });
-            return;
-        }
     };
 
     const getExtraSectionBottomGapMetrics = () => {
@@ -12725,63 +12852,11 @@ function buildPanel(node) {
         };
     };
 
-    const reclaimNodeBottomBlank = ({ force = false } = {}) => {
-        if (loraOverlayOpen || !panel?.isConnected || !extraSection?.isConnected) return;
-        const run = () => {
-            if (loraOverlayOpen || !panel?.isConnected || !extraSection?.isConnected) return;
-            const bottomGap = getExtraSectionBottomGapMetrics();
-            const blankLayout = bottomGap.blank / (bottomGap.viewportScale || 1);
-            const panelHeight = resizeTargetLayoutHeight(panel) || 0;
-            const shrinkThreshold = Math.max(32, panelHeight * 0.04);
-            if (!force && blankLayout <= shrinkThreshold) return;
-            if (blankLayout <= 2) return;
-            const currentWidth = node.size?.[0] || node.__webuiBridgeDesiredSize?.[0] || DEFAULT_PANEL_WIDTH;
-            const currentHeight = node.size?.[1] || node.__webuiBridgeDesiredSize?.[1] || DEFAULT_PANEL_HEIGHT;
-            const minimumHeight = Math.max(node.__webuiBridgeMinNodeHeight?.() || PANEL_MIN_HEIGHT, PANEL_MIN_HEIGHT);
-            const nextHeight = Math.max(minimumHeight, Math.floor(currentHeight - blankLayout));
-            if (currentHeight - nextHeight < 2) return;
-            setNodeSize(currentWidth, nextHeight, { user: true });
-            window.requestAnimationFrame?.(scheduleAdaptiveLayout);
-        };
-        window.requestAnimationFrame?.(() => window.requestAnimationFrame?.(run));
-    };
-
     panel.__webuiBridgeHandlePromptCollapseChange = () => {
+        markGraphChanged(node);
         scheduleAdaptiveLayout();
         window.requestAnimationFrame?.(() => ensureUsableExtraHeight());
-        reclaimNodeBottomBlank({ force: true });
-    };
-
-    const fillExtraSectionToPanelBottom = ({ force = false } = {}) => {
-        if (extraCollapsed || loraOverlayOpen || !panel?.isConnected || !extraSection?.isConnected) return;
-        if (!force && sectionAutoFitSuspended()) return;
-        const activePreset = state.settings?.layout_preset || "default";
-        const canGrow = !promptLoraSplitManual && (activePreset === "default" || activePreset === "roomy");
-        const bottomGap = getExtraSectionBottomGapMetrics();
-        if (!force && bottomGap.blank > bottomGap.settleTolerance && !canGrow && !bottomGap.largeBottomBlank) return;
-        if (!force && Math.abs(bottomGap.blank) <= bottomGap.settleTolerance && !bottomGap.largeBottomBlank) return;
-        if (force && bottomGap.blank <= 2 && !bottomGap.largeBottomBlank) return;
-        const currentHeight = resizeTargetLayoutHeight(extraSection) || EXTRA_NETWORKS_MIN_HEIGHT;
-        const nextHeight = currentHeight + bottomGap.blank / bottomGap.viewportScale;
-        setResizeTargetHeight(extraSection, extraHeightKey, nextHeight, {
-            min: EXTRA_NETWORKS_MIN_HEIGHT,
-            max: extraSection.__webuiBridgeMaxHeight || EXTRA_NETWORKS_MAX_HEIGHT,
-        });
-        extraSection.style.flex = "0 0 auto";
-    };
-
-    settleBottomBlankAfterSectionResize = ({ force = false, shrinkNode = false } = {}) => {
-        if (extraCollapsed || loraOverlayOpen || !panel?.isConnected || !extraSection?.isConnected) return;
-        const run = () => {
-            if (extraCollapsed || loraOverlayOpen || !panel?.isConnected || !extraSection?.isConnected) return;
-            fillExtraSectionToPanelBottom({ force });
-            window.requestAnimationFrame?.(() => {
-                if (extraCollapsed || loraOverlayOpen || !panel?.isConnected || !extraSection?.isConnected) return;
-                fillExtraSectionToPanelBottom({ force });
-                if (shrinkNode) reclaimNodeBottomBlank({ force });
-            });
-        };
-        window.requestAnimationFrame?.(() => window.requestAnimationFrame?.(run));
+        scheduleManualResizeSettle();
     };
 
     const ensurePanelSplitterVisible = () => {
@@ -12793,6 +12868,7 @@ function buildPanel(node) {
             setResizeTargetHeight(topRow, topRowHeightKey, clampNumber(currentTop || topMin, topMin, topMax), {
                 min: topMin,
                 max: topMax,
+                persist: false,
             });
         }
         const extraFloor = getExtraVisibleFloor();
@@ -12801,6 +12877,7 @@ function buildPanel(node) {
             setResizeTargetHeight(extraSection, extraHeightKey, extraFloor, {
                 min: extraFloor,
                 max: extraSection.__webuiBridgeMaxHeight || EXTRA_NETWORKS_MAX_HEIGHT,
+                persist: false,
             });
             extraSection.style.flex = "0 0 auto";
         }
@@ -12812,10 +12889,11 @@ function buildPanel(node) {
         const positiveFocus = activePreset === "positive_focus";
         const minimal = activePreset === "minimal_lora";
         const negativeCollapsed = negative.row?.classList?.contains("collapsed");
+        const promptInnerManualActive = promptInnerSplitManual || (performance?.now?.() || Date.now()) < suppressPromptInnerFitUntil;
         const textareaTarget = positive.textarea;
         if (textareaTarget && !resizeTargetHidden(textareaTarget)) {
             const hasManualTextHeight = readLocalNumber(textareaTarget.__webuiBridgeHeightKey, null) !== null;
-            if (!hasManualTextHeight) {
+            if (!hasManualTextHeight && !promptInnerManualActive) {
                 if (textareaTarget.__webuiBridgeUserResizing) return;
                 const nextTextHeight = clampNumber(
                     textareaTarget.scrollHeight + 4,
@@ -12839,19 +12917,22 @@ function buildPanel(node) {
             }
         }
         const chipTarget = positive.row?.chips;
-        if (chipTarget && !resizeTargetHidden(chipTarget) && !chipTarget.classList.contains("empty")) {
+        if (chipTarget && !resizeTargetHidden(chipTarget) && !chipTarget.classList.contains("empty") &&
+            !promptInnerManualActive &&
+            readLocalNumber(chipTarget.__webuiBridgeHeightKey, null) === null) {
             const nextChipHeight = clampNumber(chipTarget.scrollHeight + 4, PROMPT_CHIPS_MIN_HEIGHT, positiveFocus ? 150 : 132);
             setResizeTargetHeight(chipTarget, chipTarget.__webuiBridgeHeightKey, nextChipHeight, {
                 min: PROMPT_CHIPS_MIN_HEIGHT,
                 max: chipTarget.__webuiBridgeMaxHeight,
+                persist: false,
             });
         }
-        const promptInnerManualActive = promptInnerSplitManual || (performance?.now?.() || Date.now()) < suppressPromptInnerFitUntil;
         if (positiveTagPanel && !resizeTargetHidden(positiveTagPanel) && !promptInnerManualActive) {
             const nextTagHeight = minimal ? 190 : (positiveFocus ? 240 : (activePreset === "roomy" ? 360 : (activePreset === "compact" ? 150 : 190)));
             setResizeTargetHeight(positiveTagPanel, positiveTagPanel.__webuiBridgeHeightKey, nextTagHeight, {
                 min: positiveTagPanel.__webuiBridgeMinHeight,
                 max: positiveTagPanel.__webuiBridgeMaxHeight,
+                persist: false,
             });
         }
         window.requestAnimationFrame?.(() => {
@@ -12883,6 +12964,7 @@ function buildPanel(node) {
             setResizeTargetHeight(topRow, topRowHeightKey, nextTopHeight, {
                 min: topMin,
                 max: topRow.__webuiBridgeMaxHeight,
+                persist: false,
             });
         });
     };
@@ -12902,10 +12984,6 @@ function buildPanel(node) {
                     fillAvailable: activePreset === "default" || activePreset === "roomy",
                 });
                 ensureUsableExtraHeight();
-                window.requestAnimationFrame?.(() => {
-                    fitNodeBottomToVisibleContent();
-                    window.requestAnimationFrame?.(fillExtraSectionToPanelBottom);
-                });
             });
         });
     };
@@ -13014,7 +13092,9 @@ function installWebUIPanel(node) {
         const existingWidget = node.widgets?.find((widget) => widget.name === "webui_prompt_frontend");
         const usablePanel = existingWidget?.element === node.__webuiBridgePanel &&
             node.__webuiBridgePanel.querySelector?.(".webui-bridge-toprow, .webui-bridge-panel-error");
-        if (usablePanel) {
+        const needsConfiguredLayoutRebuild = hasBridgeLayoutState(node.__webuiBridgeConfiguredLayoutState) &&
+            !node.__webuiBridgeConfiguredLayoutStateApplied;
+        if (usablePanel && !needsConfiguredLayoutRebuild) {
             repairBridgeNodeWidgetDefaults(node);
             node.__webuiBridgePanel.style.display = "";
             const desired = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
@@ -13024,7 +13104,7 @@ function installWebUIPanel(node) {
                 Math.round(Number(node.size?.[1] || 0)) !== desired[1]) {
                 node.setSize?.(desired);
             }
-            if (shouldRepairBridgePanelSize(node.size)) {
+            if (shouldRepairBridgePanelSize(node.size) && !hasBridgeLayoutState(node.__webuiBridgeConfiguredLayoutState)) {
                 node.__webuiBridgePanel.__webuiBridgeResetNodeLayoutCache?.({ preservePromptTextHeights: true });
             }
             installBridgeSlotLabelOverlay(node);
@@ -13137,7 +13217,16 @@ function installWebUIPanel(node) {
             if (!data || !Array.isArray(data.widgets_values)) return;
             repairBridgeNodeWidgetDefaults(node);
             const desired = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
+            const layoutState = normalizeBridgeLayoutState(
+                node.__webuiBridgePanel?.__webuiBridgeGetLayoutState?.() ||
+                node.__webuiBridgeConfiguredLayoutState,
+            );
             data.size = [...desired];
+            if (layoutState) {
+                data.properties = data.properties && typeof data.properties === "object" ? { ...data.properties } : {};
+                data.properties[BRIDGE_LAYOUT_STATE_PROPERTY] = layoutState;
+                node.__webuiBridgeConfiguredLayoutState = layoutState;
+            }
             data.widgets_values = bridgePromptWidgetValuesFromNode(node);
         });
         node.__webuiBridgeSerializeWrapped = true;
@@ -13213,7 +13302,8 @@ function installWebUIPanel(node) {
             applyDomWidgetSize(savedSize[0], savedSize[1]);
         }
     }
-    if (hadRepairablePanelSize || node.__webuiBridgeRepairedPanelSize) {
+    if ((hadRepairablePanelSize || node.__webuiBridgeRepairedPanelSize) &&
+        !hasBridgeLayoutState(node.__webuiBridgeConfiguredLayoutState)) {
         window.requestAnimationFrame?.(() => {
             panel.__webuiBridgeResetNodeLayoutCache?.({ preservePromptTextHeights: true });
             node.__webuiBridgeRepairedPanelSize = false;
@@ -13684,7 +13774,7 @@ function addStyles() {
         }
         .webui-bridge-size-controls {
             display: grid;
-            grid-template-columns: repeat(2, minmax(72px, 1fr)) 32px 32px 32px minmax(56px, 1fr);
+            grid-template-columns: repeat(2, minmax(92px, 1fr)) 32px 32px 32px minmax(56px, 1fr);
             gap: 5px;
         }
         .webui-bridge-size-field {
@@ -14899,7 +14989,7 @@ function addStyles() {
         .webui-bridge-regional-canvas-row {
             grid-column: 1 / -1;
             display: grid !important;
-            grid-template-columns: auto auto auto minmax(0, 1fr) auto minmax(0, 1fr) 28px;
+            grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr) auto auto 28px;
             align-items: center;
             gap: 5px;
         }
@@ -17004,6 +17094,8 @@ app.registerExtension({
             this.__webuiBridgeFreshLayoutStabilizeUntil = (performance?.now?.() || Date.now()) + 2200;
             this.__webuiBridgeDesiredSize = clampPanelSize(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT);
             this.__webuiBridgeSavedPanelSize = null;
+            this.__webuiBridgeConfiguredLayoutState = null;
+            this.__webuiBridgeConfiguredLayoutStateApplied = false;
             this.size = [...this.__webuiBridgeDesiredSize];
             this.setSize?.([...this.__webuiBridgeDesiredSize]);
             scheduleBridgePanelInstall(this);
@@ -17011,6 +17103,13 @@ app.registerExtension({
         chainCallback(nodeType.prototype, "onConfigure", function (data) {
             this.__webuiBridgeWasConfigured = true;
             this.__webuiBridgeFreshLayoutStabilizeUntil = 0;
+            migrateLayoutStorage(BRIDGE_LAYOUT_MIGRATED_STORAGE_KEYS);
+            this.__webuiBridgeConfiguredLayoutState = normalizeBridgeLayoutState(
+                data?.properties?.[BRIDGE_LAYOUT_STATE_PROPERTY] ||
+                data?.[BRIDGE_LAYOUT_STATE_PROPERTY],
+            );
+            this.__webuiBridgeConfiguredLayoutStateApplied = false;
+            writeBridgeLayoutStateToStorage(this.__webuiBridgeConfiguredLayoutState, { preserveExistingBooleanPreferences: true });
             if (Array.isArray(data?.widgets_values)) {
                 const repaired = sanitizeBridgeWidgetsValues(data.widgets_values);
                 if (repaired.changed) data.widgets_values = repaired.values;
