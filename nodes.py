@@ -1,11 +1,17 @@
+import asyncio
+import base64
 import csv
 import datetime
+import functools
 import hashlib
 import html
+import io
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -35,6 +41,13 @@ MAX_PROMPT_TEXT_LENGTH = 50000
 MAX_SHORT_TEXT_LENGTH = 2000
 MAX_STYLE_NAME_LENGTH = 120
 MAX_WEBUI_ROOT_LENGTH = 500
+MAX_IMAGE_UPLOAD_BYTES = 40 * 1024 * 1024
+MAX_LORA_PREVIEW_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_FRAME_PIXELS = 40_000_000
+MAX_IMAGE_TOTAL_PIXELS = 80_000_000
+MAX_IMAGE_FRAMES = 32
+MAX_AI_RESPONSE_BYTES = 4 * 1024 * 1024
+_DPAPI_SECRET_PREFIX = "dpapi:"
 _TAG_AUTOCOMPLETE_CACHE = None
 _LORA_METADATA_CACHE = {}
 _LORA_RAW_METADATA_CACHE = {}
@@ -63,7 +76,7 @@ DEFAULT_BRIDGE_SETTINGS = {
     "translation_source": "auto",
     "tag_translation_source": "auto",
     "show_startup_wizard": True,
-    "layout_preset": "default",
+    "layout_preset": "compact",
     "tag_display": "local_first",
     "lora_card_size": "normal",
     "node_tutorial_popup": "first_time",
@@ -83,7 +96,7 @@ UI_VISIBILITY_DEFAULTS = {
     "prompt_tools": True,
     "styles": False,
     "lora_browser": True,
-    "module_img2img": False,
+    "module_img2img": True,
     "module_mask": False,
     "module_table": False,
     "module_negative_common": False,
@@ -525,17 +538,173 @@ BUILTIN_GROUP_TAGS = [
 ]
 
 
+_LOCAL_CONFIG_SECRET_MIGRATION_NEEDED = False
+_LOCAL_CONFIG_OPAQUE_API_KEY = ""
+
+
+def _windows_dpapi_transform(data, protect):
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [
+            ("cbData", wintypes.DWORD),
+            ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
+        ]
+
+    source = ctypes.create_string_buffer(data)
+    input_blob = DATA_BLOB(len(data), ctypes.cast(source, ctypes.POINTER(ctypes.c_ubyte)))
+    output_blob = DATA_BLOB()
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    blob_pointer = ctypes.POINTER(DATA_BLOB)
+    crypt32.CryptProtectData.argtypes = [
+        blob_pointer,
+        wintypes.LPCWSTR,
+        blob_pointer,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        blob_pointer,
+    ]
+    crypt32.CryptProtectData.restype = wintypes.BOOL
+    crypt32.CryptUnprotectData.argtypes = [
+        blob_pointer,
+        ctypes.POINTER(wintypes.LPWSTR),
+        blob_pointer,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        blob_pointer,
+    ]
+    crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    if protect:
+        ok = crypt32.CryptProtectData(
+            ctypes.byref(input_blob),
+            "WebUIPromptBridge AI API key",
+            None,
+            None,
+            None,
+            0,
+            ctypes.byref(output_blob),
+        )
+    else:
+        ok = crypt32.CryptUnprotectData(
+            ctypes.byref(input_blob),
+            None,
+            None,
+            None,
+            None,
+            0,
+            ctypes.byref(output_blob),
+        )
+    if not ok:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return ctypes.string_at(output_blob.pbData, output_blob.cbData)
+    finally:
+        kernel32.LocalFree(output_blob.pbData)
+
+
+def _protect_local_secret(value):
+    secret = str(value or "")
+    if not secret or os.name != "nt":
+        return secret
+    protected = _windows_dpapi_transform(secret.encode("utf-8"), True)
+    return _DPAPI_SECRET_PREFIX + base64.urlsafe_b64encode(protected).decode("ascii")
+
+
+def _unprotect_local_secret(value):
+    secret = str(value or "")
+    if not secret.startswith(_DPAPI_SECRET_PREFIX):
+        return secret
+    if os.name != "nt":
+        raise ValueError("This API key is protected by Windows DPAPI")
+    payload = base64.urlsafe_b64decode(secret[len(_DPAPI_SECRET_PREFIX):].encode("ascii"))
+    return _windows_dpapi_transform(payload, False).decode("utf-8")
+
+
+def _windows_current_user_sid():
+    try:
+        result = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+        row = next(csv.reader([result.stdout.strip()])) if result.returncode == 0 and result.stdout.strip() else []
+        return row[1].strip() if len(row) > 1 else ""
+    except Exception:
+        return ""
+
+
+def _harden_private_file_permissions(path):
+    path = Path(path)
+    if not path.exists():
+        return False
+    if os.name != "nt":
+        try:
+            path.chmod(0o600)
+            return True
+        except OSError:
+            return False
+    icacls = shutil.which("icacls")
+    current_sid = _windows_current_user_sid()
+    if not icacls or not current_sid:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                icacls,
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                f"*{current_sid}:(F)",
+                "*S-1-5-18:(F)",
+                "*S-1-5-32-544:(F)",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def _load_local_config():
+    global _LOCAL_CONFIG_SECRET_MIGRATION_NEEDED, _LOCAL_CONFIG_OPAQUE_API_KEY
+    _LOCAL_CONFIG_SECRET_MIGRATION_NEEDED = False
+    _LOCAL_CONFIG_OPAQUE_API_KEY = ""
     try:
         if LOCAL_CONFIG_PATH.exists():
             data = json.loads(LOCAL_CONFIG_PATH.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                return {}
+            ai_config = data.get("ai_api")
+            if isinstance(ai_config, dict) and ai_config.get("api_key"):
+                stored = str(ai_config.get("api_key") or "")
+                try:
+                    ai_config = dict(ai_config)
+                    ai_config["api_key"] = _unprotect_local_secret(stored)
+                    data["ai_api"] = ai_config
+                    _LOCAL_CONFIG_SECRET_MIGRATION_NEEDED = os.name == "nt" and not stored.startswith(_DPAPI_SECRET_PREFIX)
+                except Exception as exc:
+                    print(f"[WebUI Prompt Bridge] Could not decrypt the saved AI API key: {exc}")
+                    _LOCAL_CONFIG_OPAQUE_API_KEY = stored
+                    ai_config = dict(ai_config)
+                    ai_config["api_key"] = ""
+                    data["ai_api"] = ai_config
+            return data
     except Exception:
         pass
     return {}
-
-
-LOCAL_CONFIG = _load_local_config()
 
 
 def _bridge_settings():
@@ -563,8 +732,56 @@ def _bridge_settings():
     return settings
 
 
-def _write_local_config(config):
-    LOCAL_CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+def _write_local_config(config, preserve_opaque_secret=True):
+    global _LOCAL_CONFIG_OPAQUE_API_KEY
+    persisted = dict(config) if isinstance(config, dict) else {}
+    ai_config = persisted.get("ai_api")
+    if not isinstance(ai_config, dict) and preserve_opaque_secret and _LOCAL_CONFIG_OPAQUE_API_KEY:
+        ai_config = {}
+    opaque_secret_persisted = False
+    if isinstance(ai_config, dict):
+        ai_config = dict(ai_config)
+        if ai_config.get("api_key"):
+            ai_config["api_key"] = _protect_local_secret(ai_config["api_key"])
+        elif preserve_opaque_secret and _LOCAL_CONFIG_OPAQUE_API_KEY:
+            ai_config["api_key"] = _LOCAL_CONFIG_OPAQUE_API_KEY
+            opaque_secret_persisted = True
+        persisted["ai_api"] = ai_config
+    LOCAL_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = LOCAL_CONFIG_PATH.with_name(f".{LOCAL_CONFIG_PATH.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary_path.write_text(json.dumps(persisted, indent=2, ensure_ascii=False), encoding="utf-8")
+        _harden_private_file_permissions(temporary_path)
+        os.replace(temporary_path, LOCAL_CONFIG_PATH)
+        _harden_private_file_permissions(LOCAL_CONFIG_PATH)
+        if not opaque_secret_persisted:
+            _LOCAL_CONFIG_OPAQUE_API_KEY = ""
+    finally:
+        if temporary_path.exists():
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _secure_local_config_on_startup():
+    global _LOCAL_CONFIG_SECRET_MIGRATION_NEEDED
+    if LOCAL_CONFIG_PATH.exists():
+        try:
+            if not _harden_private_file_permissions(LOCAL_CONFIG_PATH):
+                print("[WebUI Prompt Bridge] Warning: could not restrict config.local.json permissions")
+        except Exception as exc:
+            print(f"[WebUI Prompt Bridge] Warning: could not restrict config.local.json permissions: {exc}")
+    if _LOCAL_CONFIG_SECRET_MIGRATION_NEEDED:
+        try:
+            _write_local_config(LOCAL_CONFIG)
+            _LOCAL_CONFIG_SECRET_MIGRATION_NEEDED = False
+        except Exception as exc:
+            print(f"[WebUI Prompt Bridge] Warning: could not migrate the saved AI API key to DPAPI: {exc}")
+
+
+LOCAL_CONFIG = _load_local_config()
+_secure_local_config_on_startup()
 
 
 def _data_source_mode():
@@ -596,8 +813,94 @@ def _path_text(path):
     return str(path).replace("\\", "/") if path else ""
 
 
+def _remote_filesystem_paths_allowed():
+    return str(os.environ.get("WEBUI_PROMPT_BRIDGE_ALLOW_REMOTE_PATHS") or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _windows_drive_type(anchor):
+    try:
+        import ctypes
+
+        return int(ctypes.windll.kernel32.GetDriveTypeW(str(anchor)))
+    except Exception:
+        return None
+
+
+def _local_path_candidate_without_reparse(path):
+    if not path:
+        return None
+    raw = str(path).strip()
+    if not raw:
+        return None
+    if os.name == "nt" and not _remote_filesystem_paths_allowed():
+        windows_path = raw.replace("/", "\\")
+        if windows_path.startswith(("\\\\", "\\\\?\\", "\\\\.\\")):
+            return None
+        candidate = Path(raw).expanduser()
+        anchor = candidate.anchor
+        if anchor and re.match(r"^[A-Za-z]:[\\/]$", anchor):
+            drive_type = _windows_drive_type(anchor)
+            if drive_type is None or drive_type == 4:  # DRIVE_REMOTE
+                return None
+        return candidate
+    return Path(raw).expanduser()
+
+
+def _normalize_windows_reparse_target(value):
+    raw = str(value or "")
+    lowered = raw.casefold()
+    for prefix in ("\\\\?\\unc\\", "\\??\\unc\\"):
+        if lowered.startswith(prefix):
+            return "\\\\" + raw[len(prefix):]
+    for prefix in ("\\\\?\\", "\\??\\"):
+        if lowered.startswith(prefix) and re.match(r"^[A-Za-z]:[\\/]", raw[len(prefix):]):
+            return raw[len(prefix):]
+    return raw
+
+
+def _reparse_targets_are_local(path, max_hops=32):
+    if os.name != "nt" or _remote_filesystem_paths_allowed():
+        return True
+    absolute = Path(os.path.abspath(str(path)))
+    current = Path(absolute.anchor)
+    pending = list(absolute.parts[1:])
+    seen = set()
+    hops = 0
+    while pending:
+        current = current / pending.pop(0)
+        try:
+            target_text = os.readlink(current)
+        except OSError:
+            continue
+        hops += 1
+        if hops > max_hops:
+            return False
+        target_text = _normalize_windows_reparse_target(target_text)
+        target = Path(target_text).expanduser()
+        if not target.is_absolute():
+            target = current.parent / target
+        target = Path(os.path.abspath(str(target)))
+        if _local_path_candidate_without_reparse(target) is None:
+            return False
+        key = str(target).casefold()
+        if key in seen:
+            return False
+        seen.add(key)
+        combined = target.joinpath(*pending)
+        current = Path(combined.anchor)
+        pending = list(combined.parts[1:])
+    return True
+
+
+def _safe_local_path_candidate(path):
+    candidate = _local_path_candidate_without_reparse(path)
+    if candidate is None or not _reparse_targets_are_local(candidate):
+        return None
+    return candidate
+
+
 def _existing_path(path):
-    path = Path(str(path)).expanduser() if path else None
+    path = _safe_local_path_candidate(path)
     return path if path and path.exists() else None
 
 
@@ -699,22 +1002,25 @@ def _apply_webui_model_paths(webui_root):
 def _resolve_windows_shortcut(shortcut_path):
     if os.name != "nt" or not shortcut_path:
         return None
-    path = Path(shortcut_path)
-    if path.suffix.casefold() != ".lnk" or not path.exists():
+    path = _existing_path(shortcut_path)
+    if not path or path.suffix.casefold() != ".lnk":
         return None
     script = (
         "$ErrorActionPreference='Stop';"
-        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($args[0]);"
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:WEBUI_PROMPT_BRIDGE_SHORTCUT_PATH);"
         "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
         "Write-Output $s.TargetPath"
     )
+    shortcut_env = os.environ.copy()
+    shortcut_env["WEBUI_PROMPT_BRIDGE_SHORTCUT_PATH"] = str(path)
     try:
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script, str(path)],
+            ["powershell", "-NoProfile", "-Command", script],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=shortcut_env,
             timeout=3,
             check=False,
         )
@@ -723,8 +1029,7 @@ def _resolve_windows_shortcut(shortcut_path):
     target = (result.stdout or "").strip().splitlines()
     if result.returncode != 0 or not target:
         return None
-    resolved = Path(target[-1]).expanduser()
-    return resolved if resolved.exists() else None
+    return _existing_path(target[-1])
 
 
 def _apply_linked_lora_targets(lora_root):
@@ -954,8 +1259,7 @@ def _configured_path(config_key, env_key):
     value = os.environ.get(env_key) or LOCAL_CONFIG.get(config_key)
     if not value:
         return None
-    path = Path(str(value)).expanduser()
-    return path if path.exists() else None
+    return _existing_path(value)
 
 
 def _discover_webui_root():
@@ -1038,7 +1342,7 @@ def _normalize_request_host(value):
     if not raw:
         return "", None
     parsed = urlparse(raw if "://" in raw else f"//{raw}", scheme="http")
-    host = (parsed.hostname or "").strip().lower()
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
     try:
         port = parsed.port
     except ValueError:
@@ -1055,10 +1359,37 @@ def _hosts_same_origin(request_host, request_port, source_host, source_port):
     return request_host in loopback_hosts and source_host in loopback_hosts and request_port == source_port
 
 
+@functools.lru_cache(maxsize=1)
+def _trusted_request_hosts():
+    hosts = {"localhost", "localhost.localdomain"}
+    for value in (socket.gethostname(), socket.getfqdn()):
+        normalized = str(value or "").strip().casefold().rstrip(".")
+        if normalized:
+            hosts.add(normalized)
+            hosts.add(normalized.split(".", 1)[0])
+    configured = os.environ.get("WEBUI_PROMPT_BRIDGE_ALLOWED_HOSTS") or ""
+    for value in re.split(r"[,;\s]+", configured):
+        normalized = value.strip().casefold().rstrip(".")
+        if normalized:
+            hosts.add(normalized)
+    return hosts
+
+
+def _request_host_is_trusted(host):
+    host = str(host or "").strip().casefold().rstrip(".")
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return host in _trusted_request_hosts()
+
+
 def _validate_same_origin_request(request):
     host, port = _normalize_request_host(request.headers.get("Host", ""))
-    if not host:
-        return True
+    if not _request_host_is_trusted(host):
+        return False
     for header in ("Origin", "Referer"):
         value = request.headers.get(header, "")
         if not value:
@@ -1069,6 +1400,20 @@ def _validate_same_origin_request(request):
     return True
 
 
+def _validate_opened_image(image):
+    width, height = image.size
+    frames = max(1, int(getattr(image, "n_frames", 1) or 1))
+    frame_pixels = int(width) * int(height)
+    if width <= 0 or height <= 0:
+        raise ValueError("Image dimensions are invalid")
+    if frames > MAX_IMAGE_FRAMES:
+        raise ValueError(f"Image has too many frames (maximum {MAX_IMAGE_FRAMES})")
+    if frame_pixels > MAX_IMAGE_FRAME_PIXELS:
+        raise ValueError("Image dimensions are too large")
+    if frame_pixels * frames > MAX_IMAGE_TOTAL_PIXELS:
+        raise ValueError("Animated image is too large to decode safely")
+
+
 def _validate_preview_image(image_bytes, extension):
     signatures = _IMAGE_SIGNATURES.get(extension)
     if not signatures:
@@ -1077,6 +1422,22 @@ def _validate_preview_image(image_bytes, extension):
         raise ValueError("Preview image content does not match its file type")
     if extension == ".webp" and image_bytes[8:12] != b"WEBP":
         raise ValueError("Preview image content does not match its file type")
+    expected_formats = {
+        ".png": {"PNG"},
+        ".jpg": {"JPEG"},
+        ".jpeg": {"JPEG"},
+        ".webp": {"WEBP"},
+    }
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            _validate_opened_image(image)
+            if str(image.format or "").upper() not in expected_formats[extension]:
+                raise ValueError("Preview image content does not match its file type")
+            image.verify()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Image file is invalid or corrupted") from exc
 
 
 def _normalize_prompt_group_data(data, key_prefix="groupTags"):
@@ -1622,7 +1983,10 @@ def _ai_translate_prompt(text, from_lang="zh_CN", to_lang="en_US"):
     api_key = str(config.get("api_key") or "").strip()
     if not api_key:
         return ""
-    base_url = str(config.get("base_url") or "https://api.siliconflow.cn/v1").strip().rstrip("/")
+    try:
+        base_url = _normalize_ai_base_url(config.get("base_url"))
+    except ValueError:
+        return ""
     model = str(config.get("model") or "deepseek-ai/DeepSeek-V4-Flash").strip()
     if not base_url or not model:
         return ""
@@ -1652,8 +2016,8 @@ def _ai_translate_prompt(text, from_lang="zh_CN", to_lang="en_US"):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        with _open_same_origin_url(request, timeout=45) as response:
+            data = _read_json_response(response)
         content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
         content = _normalize_network_prompt(content).strip("`")
         content = re.sub(r"^(translated tags?|tags?)\s*[:：]\s*", "", content, flags=re.I).strip()
@@ -2643,10 +3007,56 @@ def _ai_config_response():
             "base_url": str(config.get("base_url") or "https://api.siliconflow.cn/v1"),
             "model": str(config.get("model") or "deepseek-ai/DeepSeek-V4-Flash"),
             "api_key_set": bool(api_key),
-            "api_key_preview": (api_key[:4] + "..." + api_key[-4:]) if len(api_key) > 8 else ("已设置" if api_key else ""),
             "system_prompt": str(config.get("system_prompt") or "You are a Stable Diffusion prompt assistant. Return concise English tags separated by commas."),
         },
     }
+
+
+def _normalize_ai_base_url(value):
+    raw = _truncate_text(value or "", MAX_SHORT_TEXT_LENGTH).strip().rstrip("/") or "https://api.siliconflow.cn/v1"
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("AI Base URL must use http:// or https://")
+    if parsed.username or parsed.password:
+        raise ValueError("AI Base URL must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("AI Base URL must not contain a query string or fragment")
+    hostname = parsed.hostname.casefold()
+    insecure_allowed = str(os.environ.get("WEBUI_PROMPT_BRIDGE_ALLOW_INSECURE_AI_HTTP") or "").strip().casefold() in {"1", "true", "yes", "on"}
+    if parsed.scheme == "http" and hostname not in {"localhost", "127.0.0.1", "::1"} and not insecure_allowed:
+        raise ValueError("HTTP AI endpoints are only allowed on localhost; use HTTPS or explicitly enable insecure HTTP")
+    return raw
+
+
+def _url_origin(value):
+    parsed = urlparse(str(value or ""))
+    scheme = parsed.scheme.casefold()
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    port = parsed.port or (443 if scheme == "https" else 80 if scheme == "http" else None)
+    return scheme, host, port
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, source_url):
+        super().__init__()
+        self.source_origin = _url_origin(source_url)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _url_origin(newurl) != self.source_origin:
+            raise ValueError("AI endpoint redirected to a different origin")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_same_origin_url(request, timeout=45):
+    opener = urllib.request.build_opener(_SameOriginRedirectHandler(request.full_url))
+    return opener.open(request, timeout=timeout)
+
+
+def _read_json_response(response, max_bytes=MAX_AI_RESPONSE_BYTES):
+    content = response.read(max_bytes + 1)
+    if len(content) > max_bytes:
+        raise ValueError("AI endpoint response is too large")
+    return json.loads(content.decode("utf-8"))
 
 
 def _normalize_ai_model_name(model, base_url=""):
@@ -2665,19 +3075,33 @@ def _update_ai_config(data):
     current = config.get("ai_api")
     if not isinstance(current, dict):
         current = {}
+    current = dict(current)
+    try:
+        previous_base_url = _normalize_ai_base_url(current.get("base_url"))
+    except ValueError:
+        previous_base_url = ""
+    next_base_url = _normalize_ai_base_url(data.get("base_url"))
     current["enabled"] = bool(data.get("enabled"))
     current["provider"] = "openai_compatible"
-    current["base_url"] = _truncate_text(data.get("base_url") or "", MAX_SHORT_TEXT_LENGTH).strip().rstrip("/") or "https://api.siliconflow.cn/v1"
+    current["base_url"] = next_base_url
     current["model"] = _normalize_ai_model_name(data.get("model"), current["base_url"])
     system_prompt = _truncate_text(data.get("system_prompt") or "", MAX_PROMPT_TEXT_LENGTH).strip()
     if system_prompt:
         current["system_prompt"] = system_prompt
-    if data.get("clear_api_key"):
+    submitted_api_key = str(data.get("api_key") or "").strip()
+    clear_api_key = bool(data.get("clear_api_key"))
+    base_url_changed = bool(previous_base_url and next_base_url != previous_base_url)
+    if clear_api_key:
         current["api_key"] = ""
-    elif str(data.get("api_key") or "").strip():
-        current["api_key"] = str(data.get("api_key") or "").strip()
+    elif submitted_api_key:
+        current["api_key"] = submitted_api_key
+    elif base_url_changed:
+        current["api_key"] = ""
     config["ai_api"] = current
-    _write_local_config(config)
+    _write_local_config(
+        config,
+        preserve_opaque_secret=not (clear_api_key or submitted_api_key or base_url_changed),
+    )
     _apply_local_config(config)
     return _ai_config_response()
 
@@ -2692,7 +3116,7 @@ def _test_ai_config(prompt="Generate a short Stable Diffusion prompt for a girl 
     api_key = str(config.get("api_key") or "").strip()
     if not api_key:
         raise ValueError("请先填写 API Key")
-    base_url = str(config.get("base_url") or "https://api.siliconflow.cn/v1").strip().rstrip("/")
+    base_url = _normalize_ai_base_url(config.get("base_url"))
     model = _normalize_ai_model_name(config.get("model"), base_url)
     body = json.dumps({
         "model": model,
@@ -2713,8 +3137,8 @@ def _test_ai_config(prompt="Generate a short Stable Diffusion prompt for a girl 
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=45) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    with _open_same_origin_url(request, timeout=45) as response:
+        data = _read_json_response(response)
     content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
     return {"success": True, "content": content, "model": model}
 
@@ -2722,20 +3146,27 @@ def _test_ai_config(prompt="Generate a short Stable Diffusion prompt for a girl 
 def _list_ai_models(data=None):
     data = data if isinstance(data, dict) else {}
     config = _ai_config_raw()
-    api_key = str(data.get("api_key") or config.get("api_key") or "").strip()
+    saved_base_url = _normalize_ai_base_url(config.get("base_url"))
+    requested_base_url = _normalize_ai_base_url(data.get("base_url") or saved_base_url)
+    submitted_api_key = str(data.get("api_key") or "").strip()
+    if submitted_api_key:
+        api_key = submitted_api_key
+    elif requested_base_url == saved_base_url:
+        api_key = str(config.get("api_key") or "").strip()
+    else:
+        raise ValueError("Base URL changed; enter the API Key again before detecting models")
     if not api_key:
         raise ValueError("请先填写 API Key")
-    base_url = _truncate_text(data.get("base_url") or config.get("base_url") or "", MAX_SHORT_TEXT_LENGTH).strip().rstrip("/") or "https://api.siliconflow.cn/v1"
     request = urllib.request.Request(
-        f"{base_url}/models",
+        f"{requested_base_url}/models",
         headers={
             "Authorization": f"Bearer {api_key}",
             "User-Agent": "ComfyUI-WebUI-Prompt-Bridge",
         },
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=45) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    with _open_same_origin_url(request, timeout=45) as response:
+        payload = _read_json_response(response)
     raw_models = payload.get("data") if isinstance(payload, dict) else payload
     models = []
     if isinstance(raw_models, list):
@@ -2758,7 +3189,7 @@ def _list_ai_models(data=None):
         seen.add(key)
         unique.append(item)
     unique.sort(key=lambda item: item["id"].casefold())
-    return {"success": True, "base_url": base_url, "models": unique, "count": len(unique)}
+    return {"success": True, "base_url": requested_base_url, "models": unique, "count": len(unique)}
 
 
 def _update_bridge_settings(data):
@@ -3101,8 +3532,7 @@ def _load_prompt_market_items(source_id):
     return source, items
 
 
-def _import_prompt_market_source(source_id):
-    source, items = _load_prompt_market_items(source_id)
+def _commit_prompt_market_import(source_id, source, items):
     result = _import_custom_tags(items)
     config = dict(LOCAL_CONFIG) if isinstance(LOCAL_CONFIG, dict) else {}
     imported_sources = config.get("prompt_market_imports")
@@ -3127,6 +3557,11 @@ def _import_prompt_market_source(source_id):
         "downloaded": len(items),
         "imported_at": imported_sources[source_id]["imported_at"],
     }
+
+
+def _import_prompt_market_source(source_id):
+    source, items = _load_prompt_market_items(source_id)
+    return _commit_prompt_market_import(source_id, source, items)
 
 
 def _custom_tag_response():
@@ -3421,7 +3856,7 @@ def _install_asset_spec(key, spec, parent):
         }
 
 
-def _install_extension_assets(data):
+def _prepare_extension_asset_install(data):
     mode = str(data.get("mode") or "local").strip().lower()
     if mode not in {"local", "webui"}:
         raise ValueError("mode must be local or webui")
@@ -3445,6 +3880,20 @@ def _install_extension_assets(data):
 
     results = [_install_extension_asset(key, parent) for key in selected]
     ok = all(item["status"] in {"exists", "installed"} for item in results)
+
+    return {
+        "ok": ok,
+        "mode": mode,
+        "root": root,
+        "results": results,
+    }
+
+
+def _commit_extension_asset_install(prepared):
+    ok = bool(prepared.get("ok"))
+    mode = prepared.get("mode") or "local"
+    root = prepared.get("root")
+    results = prepared.get("results") or []
     if ok:
         config = dict(LOCAL_CONFIG) if isinstance(LOCAL_CONFIG, dict) else {}
         settings = dict(_bridge_settings())
@@ -3468,6 +3917,10 @@ def _install_extension_assets(data):
         "results": results,
         **_settings_response(),
     }
+
+
+def _install_extension_assets(data):
+    return _commit_extension_asset_install(_prepare_extension_asset_install(data))
 
 
 def _install_module_node_assets(data):
@@ -4627,39 +5080,61 @@ def _empty_bridge_image(width=64, height=64):
     return image, mask
 
 
+def _normalize_bridge_input_name(value):
+    raw = str(value or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    if not raw.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+        raise ValueError("Bridge image must be PNG, JPEG, or WebP")
+    relative = Path(raw)
+    if relative.is_absolute():
+        raise ValueError("Bridge image paths must stay inside the ComfyUI input directory")
+    input_dir = Path(folder_paths.get_input_directory()).resolve()
+    candidate = (input_dir / relative).resolve()
+    if not candidate.is_relative_to(input_dir):
+        raise ValueError("Bridge image paths must stay inside the ComfyUI input directory")
+    return candidate.relative_to(input_dir).as_posix()
+
+
+def _resolve_bridge_input_path(value):
+    normalized = _normalize_bridge_input_name(value)
+    if not normalized:
+        raise ValueError("Bridge image is required")
+    input_dir = Path(folder_paths.get_input_directory()).resolve()
+    candidate = (input_dir / normalized).resolve()
+    if not candidate.is_relative_to(input_dir) or not candidate.is_file():
+        raise ValueError(f"Invalid image file: {normalized}")
+    return candidate
+
+
 def _coerce_bridge_image_ref(value):
-    name = str(value or "").strip()
-    if not name:
-        return ""
-    lowered = name.lower()
-    if not lowered.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        return ""
-    return name
+    return _normalize_bridge_input_name(value)
 
 
 def _load_bridge_image_tensor(image_name):
-    image_path = folder_paths.get_annotated_filepath(image_name)
+    image_path = _resolve_bridge_input_path(image_name)
     dtype = comfy.model_management.intermediate_dtype()
     device = comfy.model_management.intermediate_device()
-    img = Image.open(image_path)
     output_images = []
     output_alpha_masks = []
     width = None
     height = None
-    for frame in ImageSequence.Iterator(img):
-        frame = ImageOps.exif_transpose(frame)
-        image = frame.convert("RGB")
-        if width is None:
-            width, height = image.size
-        if image.size != (width, height):
-            continue
-        image_array = np.array(image).astype(np.float32) / 255.0
-        output_images.append(torch.from_numpy(image_array)[None,].to(dtype=dtype))
-        if "A" in frame.getbands():
-            alpha = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
-            output_alpha_masks.append((1.0 - torch.from_numpy(alpha)).unsqueeze(0).to(dtype=dtype))
-        else:
-            output_alpha_masks.append(torch.zeros((1, height, width), dtype=dtype))
+    with Image.open(image_path) as img:
+        _validate_opened_image(img)
+        for frame in ImageSequence.Iterator(img):
+            frame = ImageOps.exif_transpose(frame)
+            image = frame.convert("RGB")
+            if width is None:
+                width, height = image.size
+            if image.size != (width, height):
+                continue
+            image_array = np.array(image).astype(np.float32) / 255.0
+            output_images.append(torch.from_numpy(image_array)[None,].to(dtype=dtype))
+            if "A" in frame.getbands():
+                alpha = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
+                output_alpha_masks.append((1.0 - torch.from_numpy(alpha)).unsqueeze(0).to(dtype=dtype))
+            else:
+                output_alpha_masks.append(torch.zeros((1, height, width), dtype=dtype))
     if not output_images:
         raise ValueError(f"Invalid image file: {image_name}")
     return (
@@ -4671,19 +5146,20 @@ def _load_bridge_image_tensor(image_name):
 def _load_bridge_mask_tensor(mask_name, image):
     if not mask_name:
         return _empty_mask_for_image(image)
-    mask_path = folder_paths.get_annotated_filepath(mask_name)
+    mask_path = _resolve_bridge_input_path(mask_name)
     dtype = image.dtype
     device = image.device
     height = int(image.shape[1])
     width = int(image.shape[2])
-    mask_image = Image.open(mask_path)
     masks = []
-    for frame in ImageSequence.Iterator(mask_image):
-        frame = ImageOps.exif_transpose(frame).convert("L")
-        if frame.size != (width, height):
-            frame = frame.resize((width, height), Image.Resampling.LANCZOS)
-        mask = np.array(frame).astype(np.float32) / 255.0
-        masks.append(torch.from_numpy(mask).unsqueeze(0).to(device=device, dtype=dtype))
+    with Image.open(mask_path) as mask_image:
+        _validate_opened_image(mask_image)
+        for frame in ImageSequence.Iterator(mask_image):
+            frame = ImageOps.exif_transpose(frame).convert("L")
+            if frame.size != (width, height):
+                frame = frame.resize((width, height), Image.Resampling.LANCZOS)
+            mask = np.array(frame).astype(np.float32) / 255.0
+            masks.append(torch.from_numpy(mask).unsqueeze(0).to(device=device, dtype=dtype))
     if not masks:
         return _empty_mask_for_image(image)
     mask = torch.cat(masks, dim=0)
@@ -4727,9 +5203,10 @@ class WebUIPromptBridgeImageInput:
         for name in (image, mask):
             if not name:
                 continue
-            path = folder_paths.get_annotated_filepath(name)
+            path = _resolve_bridge_input_path(name)
             with open(path, "rb") as handle:
-                digest.update(handle.read())
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
         digest.update(str(mode).encode("utf-8"))
         digest.update(str(denoise).encode("utf-8"))
         return digest.hexdigest()
@@ -4738,10 +5215,15 @@ class WebUIPromptBridgeImageInput:
     def VALIDATE_INPUTS(cls, image, mask="", mode="img2img", denoise=0.55):
         if not image:
             return "Image is required"
-        if not folder_paths.exists_annotated_filepath(image):
-            return f"Invalid image file: {image}"
-        if mask and not folder_paths.exists_annotated_filepath(mask):
-            return f"Invalid mask file: {mask}"
+        try:
+            _resolve_bridge_input_path(image)
+        except ValueError as exc:
+            return str(exc)
+        if mask:
+            try:
+                _resolve_bridge_input_path(mask)
+            except ValueError as exc:
+                return str(exc)
         return True
 
 
@@ -5314,34 +5796,101 @@ def _register_routes():
     def reject_cross_origin(request):
         if _validate_same_origin_request(request):
             return None
-        return web.json_response({"error": "Cross-origin requests are not allowed"}, status=403)
+        return web.json_response({"error": "Untrusted host or cross-origin request"}, status=403)
 
-    @routes.post("/webui_prompt_bridge/image_input_upload")
+    def protected_route(method, path):
+        register = getattr(routes, method)
+
+        def decorator(handler):
+            @functools.wraps(handler)
+            async def guarded(request):
+                rejected = reject_cross_origin(request)
+                if rejected is not None:
+                    return rejected
+                return await handler(request)
+
+            return register(path)(guarded)
+
+        return decorator
+
+    blocking_io_semaphore = asyncio.Semaphore(2)
+    asset_install_lock = asyncio.Lock()
+
+    async def run_blocking(function, *args):
+        async with blocking_io_semaphore:
+            worker = asyncio.create_task(asyncio.to_thread(function, *args))
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # A cancelled HTTP request does not stop its worker thread. Keep the
+                # semaphore occupied until that work really finishes.
+                try:
+                    await worker
+                except Exception:
+                    pass
+                raise
+
+    async def run_blocking_with_commit(function, commit, *args):
+        async with blocking_io_semaphore:
+            worker = asyncio.create_task(asyncio.to_thread(function, *args))
+            try:
+                prepared = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                try:
+                    prepared = await worker
+                    commit(prepared)
+                except Exception as exc:
+                    print(f"[WebUI Prompt Bridge] Background install commit failed after request cancellation: {exc}")
+                raise
+            return commit(prepared)
+
+    async def read_multipart_field_limited(field, limit):
+        data = bytearray()
+        while True:
+            chunk = await field.read_chunk(size=64 * 1024)
+            if not chunk:
+                break
+            if len(data) + len(chunk) > limit:
+                raise ValueError("Image file is too large")
+            data.extend(chunk)
+        return bytes(data)
+
+    @protected_route("post", "/webui_prompt_bridge/image_input_upload")
     async def image_input_upload(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
             return rejected
+        if request.content_length and request.content_length > MAX_IMAGE_UPLOAD_BYTES + 1024 * 1024:
+            return web.json_response({"error": "Image file is too large"}, status=413)
         reader = await request.multipart()
         image_bytes = b""
         extension = ".png"
         kind = "image"
+        image_field_seen = False
         field = await reader.next()
         while field:
             if field.name == "kind":
-                kind = _truncate_text((await field.text()).strip().lower(), 20)
+                try:
+                    kind = _truncate_text((await read_multipart_field_limited(field, 128)).decode("utf-8", errors="replace").strip().lower(), 20)
+                except ValueError:
+                    return web.json_response({"error": "Invalid image input kind"}, status=400)
             elif field.name == "image":
+                if image_field_seen:
+                    return web.json_response({"error": "Only one image file is allowed"}, status=400)
+                image_field_seen = True
                 filename = field.filename or ""
                 suffix = Path(filename).suffix.lower()
                 if suffix in (".png", ".jpg", ".jpeg", ".webp"):
                     extension = suffix
-                image_bytes = await field.read(decode=False)
+                try:
+                    image_bytes = await read_multipart_field_limited(field, MAX_IMAGE_UPLOAD_BYTES)
+                except ValueError as exc:
+                    return web.json_response({"error": str(exc)}, status=413)
             field = await reader.next()
         if kind not in {"image", "mask"}:
             return web.json_response({"error": "Invalid image input kind"}, status=400)
         if not image_bytes:
             return web.json_response({"error": "Image file is required"}, status=400)
-        if len(image_bytes) > 40 * 1024 * 1024:
-            return web.json_response({"error": "Image file is too large"}, status=400)
         try:
             _validate_preview_image(image_bytes, extension)
         except ValueError as exc:
@@ -5355,11 +5904,11 @@ def _register_routes():
         relative_name = f"webui_prompt_bridge/{safe_name}"
         return web.json_response({"name": relative_name, "kind": kind})
 
-    @routes.get("/webui_prompt_bridge/settings")
+    @protected_route("get", "/webui_prompt_bridge/settings")
     async def bridge_settings_get(request):
         return web.json_response(_settings_response())
 
-    @routes.post("/webui_prompt_bridge/settings")
+    @protected_route("post", "/webui_prompt_bridge/settings")
     async def bridge_settings_post(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5370,11 +5919,11 @@ def _register_routes():
             data = {}
         return web.json_response(_update_bridge_settings(data))
 
-    @routes.get("/webui_prompt_bridge/ai_config")
+    @protected_route("get", "/webui_prompt_bridge/ai_config")
     async def bridge_ai_config_get(request):
         return web.json_response(_ai_config_response())
 
-    @routes.post("/webui_prompt_bridge/ai_config")
+    @protected_route("post", "/webui_prompt_bridge/ai_config")
     async def bridge_ai_config_post(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5385,7 +5934,7 @@ def _register_routes():
             data = {}
         return web.json_response(_update_ai_config(data))
 
-    @routes.post("/webui_prompt_bridge/ai_config/test")
+    @protected_route("post", "/webui_prompt_bridge/ai_config/test")
     async def bridge_ai_config_test(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5395,11 +5944,12 @@ def _register_routes():
         except Exception:
             data = {}
         try:
-            return web.json_response(_test_ai_config(data.get("prompt") or "Generate a short Stable Diffusion prompt for a girl in a garden."))
+            result = await run_blocking(_test_ai_config, data.get("prompt") or "Generate a short Stable Diffusion prompt for a girl in a garden.")
+            return web.json_response(result)
         except Exception as exc:
             return web.json_response({"success": False, "error": str(exc)}, status=400)
 
-    @routes.post("/webui_prompt_bridge/ai_config/models")
+    @protected_route("post", "/webui_prompt_bridge/ai_config/models")
     async def bridge_ai_config_models(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5409,11 +5959,11 @@ def _register_routes():
         except Exception:
             data = {}
         try:
-            return web.json_response(_list_ai_models(data))
+            return web.json_response(await run_blocking(_list_ai_models, data))
         except Exception as exc:
             return web.json_response({"success": False, "error": str(exc)}, status=400)
 
-    @routes.post("/webui_prompt_bridge/import_tags")
+    @protected_route("post", "/webui_prompt_bridge/import_tags")
     async def bridge_import_tags(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5427,11 +5977,11 @@ def _register_routes():
             return web.json_response({"error": "items must be a list"}, status=400)
         return web.json_response(_import_custom_tags(items))
 
-    @routes.get("/webui_prompt_bridge/custom_tags")
+    @protected_route("get", "/webui_prompt_bridge/custom_tags")
     async def bridge_custom_tags_get(request):
         return web.json_response(_custom_tag_response())
 
-    @routes.post("/webui_prompt_bridge/custom_tags")
+    @protected_route("post", "/webui_prompt_bridge/custom_tags")
     async def bridge_custom_tags_post(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5444,7 +5994,7 @@ def _register_routes():
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
-    @routes.delete("/webui_prompt_bridge/custom_tags")
+    @protected_route("delete", "/webui_prompt_bridge/custom_tags")
     async def bridge_custom_tags_delete(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5455,11 +6005,11 @@ def _register_routes():
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
-    @routes.get("/webui_prompt_bridge/prompt_market")
+    @protected_route("get", "/webui_prompt_bridge/prompt_market")
     async def bridge_prompt_market_get(request):
         return web.json_response(_prompt_market_sources_response())
 
-    @routes.post("/webui_prompt_bridge/prompt_market/import")
+    @protected_route("post", "/webui_prompt_bridge/prompt_market/import")
     async def bridge_prompt_market_import(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5470,11 +6020,12 @@ def _register_routes():
             data = {}
         try:
             source_id = str(data.get("source_id") or data.get("id") or "").strip()
-            return web.json_response(_import_prompt_market_source(source_id))
+            source, items = await run_blocking(_load_prompt_market_items, source_id)
+            return web.json_response(_commit_prompt_market_import(source_id, source, items))
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
-    @routes.post("/webui_prompt_bridge/install_assets")
+    @protected_route("post", "/webui_prompt_bridge/install_assets")
     async def bridge_install_assets(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5484,7 +6035,12 @@ def _register_routes():
         except Exception:
             data = {}
         try:
-            result = _install_extension_assets(data)
+            async with asset_install_lock:
+                result = await run_blocking_with_commit(
+                    _prepare_extension_asset_install,
+                    _commit_extension_asset_install,
+                    data,
+                )
             return web.json_response(result, status=200 if result.get("ok") else 500)
         except Exception as exc:
             return web.json_response({
@@ -5493,11 +6049,11 @@ def _register_routes():
                 **_settings_response(),
             }, status=400)
 
-    @routes.get("/webui_prompt_bridge/module_assets")
+    @protected_route("get", "/webui_prompt_bridge/module_assets")
     async def bridge_module_assets_get(request):
         return web.json_response(_module_asset_status())
 
-    @routes.post("/webui_prompt_bridge/install_module_assets")
+    @protected_route("post", "/webui_prompt_bridge/install_module_assets")
     async def bridge_install_module_assets(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5507,7 +6063,8 @@ def _register_routes():
         except Exception:
             data = {}
         try:
-            result = _install_module_node_assets(data)
+            async with asset_install_lock:
+                result = await run_blocking(_install_module_node_assets, data)
             status = 200 if result.get("ok") else (400 if not result.get("results") else 500)
             return web.json_response(result, status=status)
         except Exception as exc:
@@ -5517,7 +6074,7 @@ def _register_routes():
                 "module_assets": _module_asset_status(),
             }, status=400)
 
-    @routes.get("/webui_prompt_bridge/webui_integration")
+    @protected_route("get", "/webui_prompt_bridge/webui_integration")
     async def webui_integration_get(request):
         return web.json_response({
             **_webui_integration_status(),
@@ -5526,7 +6083,7 @@ def _register_routes():
             "guesses": _guess_webui_roots(),
         })
 
-    @routes.post("/webui_prompt_bridge/webui_integration")
+    @protected_route("post", "/webui_prompt_bridge/webui_integration")
     async def webui_integration_post(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5567,7 +6124,7 @@ def _register_routes():
                 "guesses": _guess_webui_roots(root),
             }, status=400)
 
-    @routes.get("/webui_prompt_bridge/models")
+    @protected_route("get", "/webui_prompt_bridge/models")
     async def list_models(request):
         def filenames(kind):
             try:
@@ -5583,7 +6140,7 @@ def _register_routes():
             "embeddings": filenames("embeddings"),
         })
 
-    @routes.get("/webui_prompt_bridge/loras")
+    @protected_route("get", "/webui_prompt_bridge/loras")
     async def list_loras(request):
         detail = str(request.query.get("detail", "full") or "full").casefold()
         basic = detail in {"basic", "lite", "light"}
@@ -5678,7 +6235,7 @@ def _register_routes():
             })
         return web.json_response({"loras": items})
 
-    @routes.get("/webui_prompt_bridge/lora_thumbnail")
+    @protected_route("get", "/webui_prompt_bridge/lora_thumbnail")
     async def lora_thumbnail(request):
         name = request.query.get("name", "")
         if not name:
@@ -5699,14 +6256,14 @@ def _register_routes():
             )
         return web.FileResponse(preview_path)
 
-    @routes.get("/webui_prompt_bridge/lora_info")
+    @protected_route("get", "/webui_prompt_bridge/lora_info")
     async def lora_info(request):
         name = request.query.get("name", "")
         if not name:
             return web.json_response({"error": "LoRA name is required"}, status=400)
         return web.json_response(_lora_metadata_summary(name))
 
-    @routes.get("/webui_prompt_bridge/lora_user_metadata")
+    @protected_route("get", "/webui_prompt_bridge/lora_user_metadata")
     async def lora_user_metadata_get(request):
         name = request.query.get("name", "")
         if not name:
@@ -5720,7 +6277,7 @@ def _register_routes():
             return web.json_response(detail, status=404)
         return web.json_response(detail)
 
-    @routes.post("/webui_prompt_bridge/lora_user_metadata")
+    @protected_route("post", "/webui_prompt_bridge/lora_user_metadata")
     async def lora_user_metadata_post(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5743,33 +6300,43 @@ def _register_routes():
         _write_lora_user_metadata(lora_path, updates)
         return web.json_response(_lora_detail(resolved))
 
-    @routes.post("/webui_prompt_bridge/lora_preview")
+    @protected_route("post", "/webui_prompt_bridge/lora_preview")
     async def lora_preview_post(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
             return rejected
+        if request.content_length and request.content_length > MAX_LORA_PREVIEW_BYTES + 1024 * 1024:
+            return web.json_response({"error": "Preview image is too large"}, status=413)
         reader = await request.multipart()
         name = ""
         image_bytes = b""
         extension = ".png"
+        preview_field_seen = False
         field = await reader.next()
         while field:
             if field.name == "name":
-                name = _truncate_text((await field.text()).strip(), MAX_WEBUI_ROOT_LENGTH)
+                try:
+                    name = _truncate_text((await read_multipart_field_limited(field, 2048)).decode("utf-8", errors="replace").strip(), MAX_WEBUI_ROOT_LENGTH)
+                except ValueError:
+                    return web.json_response({"error": "LoRA name is too long"}, status=400)
             elif field.name == "preview":
+                if preview_field_seen:
+                    return web.json_response({"error": "Only one preview image is allowed"}, status=400)
+                preview_field_seen = True
                 filename = field.filename or ""
                 suffix = Path(filename).suffix.lower()
                 if suffix in (".png", ".jpg", ".jpeg", ".webp"):
                     extension = suffix
-                image_bytes = await field.read(decode=False)
+                try:
+                    image_bytes = await read_multipart_field_limited(field, MAX_LORA_PREVIEW_BYTES)
+                except ValueError:
+                    return web.json_response({"error": "Preview image is too large"}, status=413)
             field = await reader.next()
         resolved = _resolve_lora_name(name)
         if not resolved:
             return web.json_response({"error": "LoRA not found"}, status=404)
         if not image_bytes:
             return web.json_response({"error": "Preview image is required"}, status=400)
-        if len(image_bytes) > 20 * 1024 * 1024:
-            return web.json_response({"error": "Preview image is too large"}, status=400)
         try:
             _validate_preview_image(image_bytes, extension)
         except ValueError as exc:
@@ -5780,7 +6347,7 @@ def _register_routes():
         preview_path.write_bytes(image_bytes)
         return web.json_response(_lora_detail(resolved))
 
-    @routes.get("/webui_prompt_bridge/autocomplete")
+    @protected_route("get", "/webui_prompt_bridge/autocomplete")
     async def autocomplete(request):
         query = request.query.get("q", "")
         try:
@@ -5789,7 +6356,7 @@ def _register_routes():
             limit = 12
         return web.json_response({"items": _autocomplete_prompt_tags(query, limit)})
 
-    @routes.get("/webui_prompt_bridge/prompt_all_in_one")
+    @protected_route("get", "/webui_prompt_bridge/prompt_all_in_one")
     async def prompt_all_in_one(request):
         lang = request.query.get("lang", "zh_CN")
         group_tags = _load_prompt_all_in_one_group_tags(lang)
@@ -5803,7 +6370,7 @@ def _register_routes():
             },
         })
 
-    @routes.post("/webui_prompt_bridge/prompt_all_in_one/translate")
+    @protected_route("post", "/webui_prompt_bridge/prompt_all_in_one/translate")
     async def prompt_all_in_one_translate(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5815,7 +6382,7 @@ def _register_routes():
         text = _truncate_text(data.get("text", ""), MAX_PROMPT_TEXT_LENGTH)
         lang = _truncate_text(data.get("lang", "zh_CN"), MAX_STYLE_NAME_LENGTH)
         to = _truncate_text(data.get("to", "english"), MAX_STYLE_NAME_LENGTH)
-        translated = _translate_prompt_all_in_one_text(text, to=to, lang=lang)
+        translated = await run_blocking(_translate_prompt_all_in_one_text, text, to, lang)
         prompt = ", ".join(item["prompt"] for item in translated if item["prompt"] != "\n")
         return web.json_response({
             "tags": translated,
@@ -5823,7 +6390,7 @@ def _register_routes():
             "matched": sum(1 for item in translated if item.get("matched")),
         })
 
-    @routes.get("/webui_prompt_bridge/prompt_all_in_one/storage")
+    @protected_route("get", "/webui_prompt_bridge/prompt_all_in_one/storage")
     async def prompt_all_in_one_storage_get(request):
         kind = request.query.get("kind", "positive")
         collection = request.query.get("collection", "history")
@@ -5831,7 +6398,7 @@ def _register_routes():
             return web.json_response({"error": "Unknown collection"}, status=400)
         return web.json_response({"items": _get_prompt_all_in_one_items(collection, kind)})
 
-    @routes.post("/webui_prompt_bridge/prompt_all_in_one/storage")
+    @protected_route("post", "/webui_prompt_bridge/prompt_all_in_one/storage")
     async def prompt_all_in_one_storage_post(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5877,11 +6444,11 @@ def _register_routes():
 
         return web.json_response({"error": "Unknown storage action"}, status=400)
 
-    @routes.get("/webui_prompt_bridge/styles")
+    @protected_route("get", "/webui_prompt_bridge/styles")
     async def list_styles(request):
         return web.json_response({"styles": _load_webui_styles()})
 
-    @routes.post("/webui_prompt_bridge/styles")
+    @protected_route("post", "/webui_prompt_bridge/styles")
     async def update_styles(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:
@@ -5916,7 +6483,7 @@ def _register_routes():
         _save_webui_styles(styles)
         return web.json_response({"styles": styles})
 
-    @routes.post("/webui_prompt_bridge/parse_infotext")
+    @protected_route("post", "/webui_prompt_bridge/parse_infotext")
     async def parse_infotext(request):
         rejected = reject_cross_origin(request)
         if rejected is not None:

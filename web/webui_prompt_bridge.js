@@ -108,6 +108,9 @@ const MAX_FONT_SIZE = 22;
 const WORD_DELIMITERS = ",;，；、\n\r\t";
 const DEFAULT_PANEL_WIDTH = 1180;
 const DEFAULT_PANEL_HEIGHT = 1180;
+const BRIDGE_LOW_ZOOM_THRESHOLD = 0.68;
+const BRIDGE_LOW_ZOOM_MAX_WIDTH = 920;
+const BRIDGE_LOW_ZOOM_MAX_HEIGHT = 320;
 const ACTION_SIDEBAR_DEFAULT_WIDTH = 400;
 const ACTION_SIDEBAR_MIN_WIDTH = 300;
 const ACTION_SIDEBAR_MAX_WIDTH = 560;
@@ -234,6 +237,7 @@ const BRIDGE_LAYOUT_STORAGE_KEYS = Object.freeze({
 const BRIDGE_LAYOUT_STORAGE_KEY_SET = new Set(Object.values(BRIDGE_LAYOUT_STORAGE_KEYS));
 const BRIDGE_LAYOUT_LOCAL_UPDATED_PREFIX = "webui-bridge-layout-local-updated:";
 const BRIDGE_LAYOUT_STATE_APPLIED_KEY = "webui-bridge-layout-state-applied";
+const SIDEBAR_ACTIVE_TAB_KEY = "webui-bridge-sidebar-active-tab-v1";
 const BRIDGE_LAYOUT_STATE_NUMBER_SPECS = Object.freeze({
     top_row_height: [64, PANEL_MAX_HEIGHT],
     extra_height: [42, EXTRA_NETWORKS_MAX_HEIGHT],
@@ -268,7 +272,7 @@ const DEFAULT_BRIDGE_SETTINGS = {
     translation_source: "auto",
     tag_translation_source: "auto",
     show_startup_wizard: true,
-    layout_preset: "default",
+    layout_preset: "compact",
     tag_display: "local_first",
     lora_card_size: "normal",
     node_tutorial_popup: "first_time",
@@ -288,7 +292,7 @@ const UI_VISIBILITY_DEFAULTS = {
     prompt_tools: true,
     styles: false,
     lora_browser: true,
-    module_img2img: false,
+    module_img2img: true,
     module_mask: false,
     module_table: false,
     module_negative_common: false,
@@ -1376,7 +1380,7 @@ function normalizeBridgePanelSize(size, fallback = [DEFAULT_PANEL_WIDTH, DEFAULT
 function drawBridgeExternalSlotLabels(node, ctx) {
     if (!node || !ctx || !Array.isArray(node.size) || typeof node.getConnectionPos !== "function") return;
     const scale = app?.canvas?.ds?.scale || 1;
-    if (scale < 0.35) return;
+    if (scale < BRIDGE_LOW_ZOOM_THRESHOLD) return;
     const fontSize = Math.max(10, Math.min(13, DEFAULT_FONT_SIZE));
     const drawLabel = (text, x, y, align) => {
         const label = String(text || "").trim();
@@ -1520,7 +1524,16 @@ function installBridgeSlotLabelOverlay(node) {
         const canvasElement = document.querySelector("#graph-canvas");
         const canvasRect = canvasElement?.getBoundingClientRect?.();
         const scale = canvas?.ds?.scale || 1;
-        if (!canvasRect || scale < 0.35) {
+        const lowZoom = scale < BRIDGE_LOW_ZOOM_THRESHOLD;
+        const bridgePanel = node.__webuiBridgePanel;
+        setBridgeLowZoomState(node, lowZoom);
+        if (bridgePanel?.__webuiBridgeLowZoom !== lowZoom) {
+            bridgePanel.__webuiBridgeLowZoom = lowZoom;
+            bridgePanel.classList.toggle("zoom-summary-mode", lowZoom);
+            bridgePanel.querySelector?.(".webui-bridge-zoom-summary")?.setAttribute("aria-hidden", lowZoom ? "false" : "true");
+        }
+        if (lowZoom) bridgePanel?.__webuiBridgeUpdateZoomSummary?.();
+        if (!canvasRect || lowZoom) {
             overlay.style.display = "none";
         } else {
             overlay.style.display = "";
@@ -2396,6 +2409,69 @@ function canvasBlob(canvas, filename = "mask.png") {
     });
 }
 
+function bridgeAuthoritativePanelSize(node) {
+    if (node?.__webuiBridgeLowZoomActive && looksLikeSavedUserBridgePanelSize(node.__webuiBridgeLowZoomOriginalSize)) {
+        return normalizeBridgePanelSize(node.__webuiBridgeLowZoomOriginalSize);
+    }
+    return resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
+}
+
+function setBridgeLowZoomState(node, lowZoom) {
+    if (!node || typeof node.setSize !== "function") return;
+    if (lowZoom) {
+        if (!node.__webuiBridgeLowZoomActive) {
+            node.__webuiBridgeLowZoomOriginalSize = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
+            node.__webuiBridgeLowZoomActive = true;
+        }
+        const original = normalizeBridgePanelSize(node.__webuiBridgeLowZoomOriginalSize);
+        const summarySize = [
+            Math.max(PANEL_BROKEN_MIN_WIDTH, Math.min(original[0], BRIDGE_LOW_ZOOM_MAX_WIDTH)),
+            Math.max(PANEL_BROKEN_MIN_HEIGHT, Math.min(original[1], BRIDGE_LOW_ZOOM_MAX_HEIGHT)),
+        ];
+        if (!bridgePanelSizesMatch(node.size, summarySize, 1)) {
+            node.__webuiBridgeApplyingLowZoomSize = true;
+            try {
+                node.setSize(summarySize);
+            } finally {
+                node.__webuiBridgeApplyingLowZoomSize = false;
+            }
+        }
+        return;
+    }
+    if (!node.__webuiBridgeLowZoomActive) return;
+    const original = normalizeBridgePanelSize(node.__webuiBridgeLowZoomOriginalSize);
+    node.__webuiBridgeLowZoomActive = false;
+    node.__webuiBridgeLowZoomOriginalSize = null;
+    node.__webuiBridgeDesiredSize = [...original];
+    node.__webuiBridgeSavedPanelSize = [...original];
+    node.__webuiBridgeRepairedPanelSizeUntil = (performance?.now?.() || Date.now()) + 1200;
+    node.__webuiBridgeApplyingLowZoomSize = true;
+    try {
+        node.setSize(original);
+    } finally {
+        node.__webuiBridgeApplyingLowZoomSize = false;
+    }
+}
+
+const MASK_EDITOR_MAX_CANVAS_SIDE = 4096;
+const MASK_EDITOR_MAX_CANVAS_PIXELS = 8_000_000;
+
+function maskEditorCanvasSize(width, height) {
+    const sourceWidth = Math.max(1, Math.floor(Number(width) || 0));
+    const sourceHeight = Math.max(1, Math.floor(Number(height) || 0));
+    const pixelScale = Math.sqrt(MASK_EDITOR_MAX_CANVAS_PIXELS / (sourceWidth * sourceHeight));
+    const scale = Math.min(
+        1,
+        MASK_EDITOR_MAX_CANVAS_SIDE / sourceWidth,
+        MASK_EDITOR_MAX_CANVAS_SIDE / sourceHeight,
+        pixelScale,
+    );
+    return [
+        Math.max(1, Math.floor(sourceWidth * scale)),
+        Math.max(1, Math.floor(sourceHeight * scale)),
+    ];
+}
+
 function showBridgeMaskEditor(node, imageName, maskName, onSaved, widgetNames = {}) {
     const maskWidgetName = widgetNames.mask || "mask";
     const modeWidgetName = widgetNames.mode || "mode";
@@ -2412,8 +2488,80 @@ function showBridgeMaskEditor(node, imageName, maskName, onSaved, widgetNames = 
     const maskCanvas = el("canvas", {});
     const cursor = el("div", { class: "webui-bridge-image-editor-cursor" });
     stage.append(baseCanvas, maskCanvas, cursor);
-    const close = () => overlay.remove();
-    const panel = el("div", { class: "webui-bridge-config-panel webui-bridge-image-editor-panel" }, [
+    let baseImageReady = false;
+    let existingMaskReady = !maskName;
+    let imageLoadFailed = false;
+    let saving = false;
+    let closed = false;
+    let clearButton = null;
+    let saveButton = null;
+    const editorReady = () => baseImageReady && existingMaskReady && !imageLoadFailed;
+    const updateEditorActions = () => {
+        const disabled = !editorReady() || saving;
+        if (clearButton) clearButton.disabled = disabled;
+        if (saveButton) saveButton.disabled = disabled;
+        stage.classList.toggle("loading", !editorReady());
+    };
+    const onEditorKeyDown = (event) => {
+        if (event.key === "Escape") close();
+    };
+    const close = () => {
+        closed = true;
+        document.removeEventListener("keydown", onEditorKeyDown);
+        overlay.remove();
+    };
+    document.addEventListener("keydown", onEditorKeyDown);
+    clearButton = el("button", {
+        type: "button",
+        disabled: true,
+        onclick: () => {
+            if (!editorReady()) return;
+            maskCanvas.getContext("2d").clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+            status.textContent = "Mask 已清空";
+        },
+    }, "清空");
+    saveButton = el("button", {
+        type: "button",
+        class: "primary",
+        disabled: true,
+        onclick: async () => {
+            if (!editorReady()) {
+                status.textContent = imageLoadFailed ? "图片或已有 Mask 载入失败，无法保存" : "图片仍在载入，请稍候";
+                return;
+            }
+            saving = true;
+            updateEditorActions();
+            try {
+                status.textContent = "保存 mask...";
+                const file = await canvasBlob(maskCanvas, "bridge-mask.png");
+                const result = await uploadBridgeImageInput(file, "mask");
+                setWidgetValue(node, maskWidgetName, result.name || "");
+                setWidgetValue(node, modeWidgetName, "inpaint");
+                onSaved?.(result.name || "", "Mask 已保存，模式已切到 Inpaint");
+                close();
+            } catch (error) {
+                status.textContent = error?.message || "Mask 保存失败";
+            } finally {
+                saving = false;
+                if (!closed) updateEditorActions();
+            }
+        },
+    }, "保存 Mask");
+    const editorBody = el("div", { class: "webui-bridge-config-body webui-bridge-image-editor-body" }, [
+        el("div", { class: "webui-bridge-image-editor-toolbar" }, [
+            el("label", {}, [el("span", {}, "画笔"), brushSize]),
+            el("label", { class: "webui-bridge-config-check" }, [eraseToggle, el("span", {}, "橡皮")]),
+            clearButton,
+        ]),
+        stage,
+        status,
+    ]);
+    const panel = el("div", {
+        class: "webui-bridge-config-panel webui-bridge-image-editor-panel",
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-label": "局部涂抹编辑",
+    }, [
         el("div", { class: "webui-bridge-config-head" }, [
             el("div", { class: "webui-bridge-settings-title" }, [
                 el("span", {}, "局部涂抹编辑"),
@@ -2421,39 +2569,16 @@ function showBridgeMaskEditor(node, imageName, maskName, onSaved, widgetNames = 
             ]),
             el("button", { type: "button", onclick: close }, "×"),
         ]),
-        el("div", { class: "webui-bridge-image-editor-toolbar" }, [
-            el("label", {}, [el("span", {}, "画笔"), brushSize]),
-            el("label", { class: "webui-bridge-config-check" }, [eraseToggle, el("span", {}, "橡皮")]),
-            el("button", { type: "button", onclick: () => {
-                maskCanvas.getContext("2d").clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-                status.textContent = "Mask 已清空";
-            } }, "清空"),
-        ]),
-        stage,
-        status,
+        editorBody,
         el("div", { class: "webui-bridge-config-actions" }, [
             el("button", { type: "button", onclick: close }, "取消"),
-            el("button", {
-                type: "button",
-                class: "primary",
-                onclick: async () => {
-                    try {
-                        status.textContent = "保存 mask...";
-                        const file = await canvasBlob(maskCanvas, "bridge-mask.png");
-                        const result = await uploadBridgeImageInput(file, "mask");
-                        setWidgetValue(node, maskWidgetName, result.name || "");
-                        setWidgetValue(node, modeWidgetName, "inpaint");
-                        onSaved?.(result.name || "", "Mask 已保存，模式已切到 Inpaint");
-                        close();
-                    } catch (error) {
-                        status.textContent = error?.message || "Mask 保存失败";
-                    }
-                },
-            }, "保存 Mask"),
+            saveButton,
         ]),
     ]);
+    updateEditorActions();
 
     const paintAt = (event) => {
+        if (!editorReady()) return;
         const rect = maskCanvas.getBoundingClientRect();
         const scaleX = maskCanvas.width / rect.width;
         const scaleY = maskCanvas.height / rect.height;
@@ -2471,6 +2596,7 @@ function showBridgeMaskEditor(node, imageName, maskName, onSaved, widgetNames = 
     };
     let drawing = false;
     maskCanvas.addEventListener("pointerdown", (event) => {
+        if (!editorReady()) return;
         drawing = true;
         maskCanvas.setPointerCapture?.(event.pointerId);
         paintAt(event);
@@ -2497,30 +2623,68 @@ function showBridgeMaskEditor(node, imageName, maskName, onSaved, widgetNames = 
 
     const baseImage = new Image();
     baseImage.onload = () => {
-        const maxWidth = Math.min(960, Math.max(420, window.innerWidth - 120));
-        const maxHeight = Math.min(680, Math.max(360, window.innerHeight - 260));
-        const ratio = Math.min(1, maxWidth / baseImage.naturalWidth, maxHeight / baseImage.naturalHeight);
-        const cssWidth = Math.max(240, Math.round(baseImage.naturalWidth * ratio));
-        const cssHeight = Math.max(180, Math.round(baseImage.naturalHeight * ratio));
-        for (const canvas of [baseCanvas, maskCanvas]) {
-            canvas.width = baseImage.naturalWidth;
-            canvas.height = baseImage.naturalHeight;
-            canvas.style.width = `${cssWidth}px`;
-            canvas.style.height = `${cssHeight}px`;
-        }
-        baseCanvas.getContext("2d").drawImage(baseImage, 0, 0);
-        stage.style.width = `${cssWidth}px`;
-        stage.style.height = `${cssHeight}px`;
-        status.textContent = "按住拖动涂抹需要重绘的区域";
-        if (maskName) {
+        if (closed) return;
+        try {
+            const [canvasWidth, canvasHeight] = maskEditorCanvasSize(baseImage.naturalWidth, baseImage.naturalHeight);
+            const maxWidth = Math.min(960, Math.max(160, window.innerWidth - 96));
+            const maxHeight = Math.min(680, Math.max(140, window.innerHeight - 260));
+            const ratio = Math.min(1, maxWidth / canvasWidth, maxHeight / canvasHeight);
+            const cssWidth = Math.max(1, Math.round(canvasWidth * ratio));
+            const cssHeight = Math.max(1, Math.round(canvasHeight * ratio));
+            for (const canvas of [baseCanvas, maskCanvas]) {
+                canvas.width = canvasWidth;
+                canvas.height = canvasHeight;
+                canvas.style.width = `${cssWidth}px`;
+                canvas.style.height = `${cssHeight}px`;
+            }
+            baseCanvas.getContext("2d").drawImage(baseImage, 0, 0, canvasWidth, canvasHeight);
+            stage.style.width = `${cssWidth}px`;
+            stage.style.height = `${cssHeight}px`;
+            baseImageReady = true;
+            const scaled = canvasWidth !== baseImage.naturalWidth || canvasHeight !== baseImage.naturalHeight;
+            const readyMessage = scaled
+                ? `按住拖动涂抹，工作分辨率 ${canvasWidth}x${canvasHeight}`
+                : "按住拖动涂抹需要重绘的区域";
+            if (!maskName) {
+                status.textContent = readyMessage;
+                updateEditorActions();
+                return;
+            }
+            status.textContent = "载入已有 Mask...";
+            updateEditorActions();
             const maskImage = new Image();
             maskImage.onload = () => {
-                maskCanvas.getContext("2d").drawImage(maskImage, 0, 0, maskCanvas.width, maskCanvas.height);
+                if (closed) return;
+                try {
+                    maskCanvas.getContext("2d").drawImage(maskImage, 0, 0, maskCanvas.width, maskCanvas.height);
+                    existingMaskReady = true;
+                    status.textContent = readyMessage;
+                    updateEditorActions();
+                } catch {
+                    imageLoadFailed = true;
+                    status.textContent = "已有 Mask 载入失败，无法安全保存";
+                    updateEditorActions();
+                }
+            };
+            maskImage.onerror = () => {
+                if (closed) return;
+                imageLoadFailed = true;
+                status.textContent = "已有 Mask 载入失败，无法安全保存";
+                updateEditorActions();
             };
             maskImage.src = bridgeInputViewUrl(maskName);
+        } catch {
+            imageLoadFailed = true;
+            status.textContent = "图片尺寸过大或画布初始化失败";
+            updateEditorActions();
         }
     };
-    baseImage.onerror = () => { status.textContent = "图片载入失败"; };
+    baseImage.onerror = () => {
+        if (closed) return;
+        imageLoadFailed = true;
+        status.textContent = "图片载入失败，无法保存 Mask";
+        updateEditorActions();
+    };
     baseImage.src = bridgeInputViewUrl(imageName);
 }
 
@@ -2612,15 +2776,18 @@ function buildBridgeImageInputPanel(node, options = {}) {
             status.textContent = error?.message || "上传失败";
         }
     });
+    const enableRow = enabledWidget
+        ? el("label", { class: "webui-bridge-config-check webui-bridge-image-input-enable" }, [
+            enabledInput,
+            el("span", {}, "启用图生图输入"),
+        ])
+        : null;
     const panel = el("div", { class: "webui-bridge-image-input-panel" }, [
         el("div", { class: "webui-bridge-image-input-head" }, [
             el("strong", {}, options.title || "WebUI Bridge 图生图"),
             el("small", {}, options.subtitle || "上传原图，必要时打开涂抹编辑局部 mask"),
         ]),
-        el("label", { class: "webui-bridge-config-check webui-bridge-image-input-enable" }, [
-            enabledInput,
-            el("span", {}, "启用图生图输入"),
-        ]),
+        enableRow,
         preview,
         el("div", { class: "webui-bridge-image-input-controls" }, [
             el("button", { type: "button", onclick: () => fileInput.click() }, "上传图片"),
@@ -4461,6 +4628,9 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
     const chips = row.chips;
     if (!chips) return;
     const localMap = buildLocalTagMap(state);
+    const renderToken = Number(row.__webuiBridgeChipRenderToken || 0) + 1;
+    row.__webuiBridgeChipRenderToken = renderToken;
+    const translatableChips = [];
     if (!row.__webuiBridgeSelectedTags) row.__webuiBridgeSelectedTags = new Set();
     const selectedTags = row.__webuiBridgeSelectedTags;
     for (const index of [...selectedTags]) {
@@ -4505,6 +4675,9 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
         const chip = el("div", {
             class: className,
             title,
+            role: "button",
+            tabindex: "0",
+            "aria-label": `${tag.value}${local ? `，${local}` : ""}`,
             draggable: tag.disabled ? "false" : "true",
             onmouseenter: () => {
                 window.clearTimeout(chip.__webuiBridgeHideToolsTimer);
@@ -4545,6 +4718,19 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
                 chip.classList.toggle("show-tools");
                 if (chip.classList.contains("show-tools")) {
                     requestAnimationFrame(() => positionChipTools(chips, chip, tools));
+                }
+            },
+            onkeydown: (event) => {
+                if (event.target !== event.currentTarget) return;
+                if (event.key === "Enter") {
+                    event.preventDefault();
+                    startChipEdit(chip, tag);
+                } else if (event.key === " ") {
+                    event.preventDefault();
+                    chip.classList.toggle("show-tools");
+                    if (chip.classList.contains("show-tools")) {
+                        requestAnimationFrame(() => positionChipTools(chips, chip, tools));
+                    }
                 }
             },
             ondragstart: (event) => {
@@ -4600,6 +4786,7 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             el("span", { class: "webui-bridge-chip-main" }, tag.value),
             el("span", { class: "webui-bridge-chip-local" }, local || " "),
         ]);
+        if (!lora && !tag.disabled) translatableChips.push({ chip, value: tag.value });
         const toolsToggle = el("button", {
             class: "webui-bridge-chip-tools-toggle",
             type: "button",
@@ -4734,19 +4921,20 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
         if (lora) {
             const locallyResolved = resolveLora(state, lora.name);
             fetchLoraInfo(lora.name).then((info) => {
-                if (!info || !chip.isConnected) return;
+                if (!info || !chip.isConnected || row.__webuiBridgeChipRenderToken !== renderToken) return;
                 const localNode = chip.querySelector(".webui-bridge-chip-local");
+                if (!localNode) return;
                 if (info.found && !bridgeModelOutputConnected(state.bridgeNode)) {
                     chip.classList.remove("found", "missing");
                     chip.classList.add("warning");
-                    if (localNode) localNode.textContent = "LoRA已匹配，但model输出未接采样器";
+                    localNode.textContent = "LoRA已匹配，但model输出未接采样器";
                     chip.title = `${tag.value}\n只表示已找到文件: ${info.name || locallyResolved?.name || lora.name}\n要让 LoRA 影响出图，需要把本节点 model 输出接到采样器使用的模型链路。`;
                     return;
                 }
                 if (info.found && !locallyResolved) {
                     chip.classList.remove("missing");
                     chip.classList.add("found");
-                    if (localNode) localNode.textContent = `LoRA已匹配: ${info.name || lora.name}`;
+                    localNode.textContent = `LoRA已匹配: ${info.name || lora.name}`;
                     chip.title = `${tag.value}\n后端已解析到: ${info.name || lora.name}`;
                 } else if (!info.found && !locallyResolved) {
                     return;
@@ -4766,33 +4954,38 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             });
         }
     }
-    const plainTags = tags
-        .map((tag) => tag.value)
-        .filter((value) => value && !parseLoraTag(value));
+    const plainTags = translatableChips.map((item) => item.value);
     translateTagsToLocal(plainTags).then((locals) => {
-        if (!chips.isConnected) return;
-        const chipNodes = [...chips.querySelectorAll(".webui-bridge-prompt-chip:not(.lora)")];
-        chipNodes.forEach((chip, index) => {
+        if (!chips.isConnected || row.__webuiBridgeChipRenderToken !== renderToken) return;
+        translatableChips.forEach(({ chip, value }, index) => {
             const local = locals[index];
-            if (!local || local === plainTags[index]) return;
+            if (!chip.isConnected || !local || local === value) return;
             const localNode = chip.querySelector(".webui-bridge-chip-local");
             if (localNode) localNode.textContent = local;
         });
     });
 }
 
-function updatePromptArea(textarea, text, isNegative = false) {
-    const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const extraRegex = isNegative
-        ? new RegExp(`\\(${escaped.replace(/^\\(|\\)$/g, "")}\\)`, "g")
-        : new RegExp(escaped, "g");
-
-    if (extraRegex.test(textarea.value)) {
-        setTextareaValue(textarea, textarea.value.replace(extraRegex, "").replace(/\s*,\s*,+/g, ", ").replace(/^\s*,\s*|\s*,\s*$/g, ""));
-    } else {
-        const sep = textarea.value.trim() ? EXTRA_SEPARATOR : "";
-        setTextareaValue(textarea, textarea.value + sep + text);
+function normalizedPromptToggleTag(value, isNegative = false) {
+    let normalized = String(value || "").trim().toLowerCase();
+    const attention = normalizeAttentionValue(normalized);
+    if (!attention.lora) {
+        normalized = String(attention.body || normalized).trim().toLowerCase();
+    } else if (isNegative && normalized.startsWith("(") && normalized.endsWith(")")) {
+        normalized = normalized.slice(1, -1).trim();
     }
+    return normalized;
+}
+
+function updatePromptArea(textarea, text, isNegative = false) {
+    const target = normalizedPromptToggleTag(text, isNegative);
+    if (!target) return false;
+    const tags = splitPromptTags(textarea.value);
+    const existingIndex = tags.findIndex((tag) => normalizedPromptToggleTag(tag.value, isNegative) === target);
+    if (existingIndex >= 0) {
+        return removePromptTagAt(textarea, existingIndex);
+    }
+    return addPromptArea(textarea, text);
 }
 
 function addPromptArea(textarea, text) {
@@ -4875,7 +5068,7 @@ function applySamplerPreset(values) {
 async function updatePromptAreaWithLoraKeywords(textarea, text, isNegative, sync, notify, options = {}) {
     const changed = options.toggle === false
         ? addPromptArea(textarea, text)
-        : (updatePromptArea(textarea, text, isNegative), true);
+        : updatePromptArea(textarea, text, isNegative);
     sync?.();
     if (!changed) return;
     const lora = parseLoraTag(text);
@@ -5033,8 +5226,9 @@ async function fetchBridgeApiWithTimeout(url, options = {}, timeoutMs = 0, timeo
     }
 }
 
-function fetchJsonWithTimeout(url, options = {}, timeoutMs = 0, timeoutMessage = "请求超时，请稍后重试") {
-    return fetchBridgeApiWithTimeout(url, options, timeoutMs, timeoutMessage).then((r) => r.json());
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 0, timeoutMessage = "请求超时，请稍后重试") {
+    const response = await fetchBridgeApiWithTimeout(url, options, timeoutMs, timeoutMessage);
+    return bridgeJson(response, `请求失败 (${response.status})`);
 }
 
 async function loadBridgeData(options = {}) {
@@ -5067,6 +5261,17 @@ async function loadBridgeData(options = {}) {
     ]);
     if (options.signal?.aborted) throw bridgeAbortError();
     const lorasLoaded = lorasRes.status === "fulfilled";
+    const loadErrors = [
+        ["LoRA", lorasRes],
+        ["Styles", stylesRes],
+        ["Prompt All in One", promptAllInOneRes],
+        ["模型", modelsRes],
+        ["WebUI 接入状态", webuiRes],
+        ["设置", settingsRes],
+    ].filter(([, result]) => result.status === "rejected").map(([label, result]) => ({
+        label,
+        message: result.reason?.message || String(result.reason || "读取失败"),
+    }));
     return {
         loras: lorasLoaded ? lorasRes.value.loras || [] : fallbackLoras,
         lorasLoaded,
@@ -5075,10 +5280,12 @@ async function loadBridgeData(options = {}) {
         promptAllInOne: promptAllInOneRes.status === "fulfilled" ? promptAllInOneRes.value : { group_tags: [], favorites: {} },
         models: modelsRes.status === "fulfilled" ? modelsRes.value : { checkpoints: [], unets: [], clips: [], vaes: [], embeddings: [] },
         webuiIntegration: webuiRes.status === "fulfilled" ? webuiRes.value : null,
+        startupConfigurationLoaded: webuiRes.status === "fulfilled" && settingsRes.status === "fulfilled",
         settings: normalizeBridgeSettings(settingsRes.status === "fulfilled" ? settingsRes.value.settings : null),
         customTagCount: settingsRes.status === "fulfilled" ? settingsRes.value.custom_tag_count || 0 : 0,
         assets: settingsRes.status === "fulfilled" ? settingsRes.value.assets || null : null,
         moduleAssets: settingsRes.status === "fulfilled" ? settingsRes.value.module_assets || null : null,
+        loadErrors,
     };
 }
 
@@ -5090,7 +5297,18 @@ function getGraphNodeById(id) {
     return getAppGraphSafe()?.getNodeById?.(id) || getGraphNodes().find((graphNode) => String(graphNode.id) === String(id));
 }
 
+function graphContainsBridgeNode(graph = getAppGraphSafe()) {
+    const nodes = graph?._nodes || graph?.nodes || [];
+    if (!Array.isArray(nodes)) return false;
+    return nodes.some((node) =>
+        node?.type === TARGET_NODE ||
+        node?.type === IMAGE_INPUT_NODE ||
+        (node?.subgraph && graphContainsBridgeNode(node.subgraph))
+    );
+}
+
 function repairComfyCorePackageMetadata() {
+    if (!graphContainsBridgeNode()) return 0;
     let changed = 0;
     for (const graphNode of getGraphNodes()) {
         const properties = graphNode?.properties;
@@ -5269,6 +5487,9 @@ function scheduleStaleMissingNodeWarningClear(reason = "scheduled") {
 
 function sanitizeComfyCorePackageMetadataInWorkflowData(data) {
     if (!data || typeof data !== "object") return 0;
+    const nodeLists = [data.nodes, ...(data.definitions?.subgraphs || []).map((subgraph) => subgraph?.nodes)];
+    const hasBridgeNode = nodeLists.some((nodes) => Array.isArray(nodes) && nodes.some((node) => node?.type === TARGET_NODE || node?.type === IMAGE_INPUT_NODE));
+    if (!hasBridgeNode) return 0;
     let changed = repairWorkflowControlToggleLayoutInWorkflowData(data);
     const cleanNodes = (nodes) => {
         if (!Array.isArray(nodes)) return;
@@ -5303,6 +5524,7 @@ function sanitizeComfyCorePackageMetadataInWorkflowData(data) {
 
 async function repairComfyCorePackageMetadataAndReload() {
     if (app.__webuiBridgeComfyCoreReloadDone || typeof app.loadGraphData !== "function") return 0;
+    if (!graphContainsBridgeNode()) return 0;
     const changed = repairComfyCorePackageMetadata();
     if (!changed) return 0;
     const graphData = safeGraphSerialization();
@@ -7210,9 +7432,14 @@ function installAutocomplete(input, options) {
     let lastItems = [];
     let timer = 0;
     let picking = false;
+    let requestVersion = 0;
 
     const getQuery = () => options.getQuery?.() ?? input.value;
     const close = () => {
+        window.clearTimeout(timer);
+        timer = 0;
+        requestVersion += 1;
+        lastQuery = "";
         popup.classList.remove("visible");
         popup.innerHTML = "";
         lastItems = [];
@@ -7281,12 +7508,15 @@ function installAutocomplete(input, options) {
             return;
         }
         clearTimeout(timer);
+        const version = ++requestVersion;
         timer = window.setTimeout(async () => {
             try {
                 const data = await fetchAutocomplete(query, options.limit || 10);
-                if (lastQuery === query) render(data.items || []);
+                if (version === requestVersion && lastQuery === query && input.isConnected && document.activeElement === input) {
+                    render(data.items || []);
+                }
             } catch {
-                close();
+                if (version === requestVersion) close();
             }
         }, 90);
     };
@@ -7568,9 +7798,10 @@ function createPanelErrorView(error) {
     return panel;
 }
 
-function promptContains(text, prompt) {
-    if (!prompt) return false;
-    return (text || "").toLowerCase().includes(prompt.toLowerCase());
+function promptContains(text, prompt, isNegative = false) {
+    const target = normalizedPromptToggleTag(prompt, isNegative);
+    if (!target) return false;
+    return splitPromptTags(text).some((tag) => normalizedPromptToggleTag(tag.value, isNegative) === target);
 }
 
 function promptHasExactTag(text, prompt) {
@@ -7664,13 +7895,14 @@ function createTagButton(tag, textarea, sync, rerender, isNegative = false, stat
     }
     const button = el("button", {
         class: "webui-bridge-aio-tag",
+        "data-prompt": prompt,
         title: [label && label !== prompt ? label : "", tag.name && tag.name !== label ? tag.name : "", prompt].filter(Boolean).join("\n"),
         onclick: async () => {
             await updatePromptAreaWithLoraKeywords(textarea, prompt, isNegative, sync);
             rerender?.();
         },
     }, children);
-    button.classList.toggle("selected", promptContains(textarea.value, prompt));
+    button.classList.toggle("selected", promptContains(textarea.value, prompt, isNegative));
     return button;
 }
 
@@ -7693,7 +7925,6 @@ function createPromptAllInOnePanel(kind, title, textarea, state, sync) {
         placeholder: "在这里输入关键词，按 Enter 或 + 添加",
         title: "输入中文或英文关键词，按 Enter 或右侧 + 添加到当前 Prompt",
     });
-    const autoLoad = el("input", { type: "checkbox", checked: "checked", title: "自动加载提示词" });
     const translateStorageKey = `webui-bridge-aio-auto-translate-${kind}`;
     const autoTranslate = el("input", {
         type: "checkbox",
@@ -7701,16 +7932,16 @@ function createPromptAllInOnePanel(kind, title, textarea, state, sync) {
     });
     autoTranslate.checked = readLocalBoolean(translateStorageKey, true);
     autoTranslate.addEventListener("change", () => writeLocalBoolean(translateStorageKey, autoTranslate.checked));
-    const showInput = el("input", { type: "checkbox", title: "显示默认输入框" });
     const panelHeightKey = `webui-bridge-aio-panel-height-${kind}`;
     root.__webuiBridgeHeightKey = panelHeightKey;
     root.__webuiBridgeMinHeight = kind === "negative" ? AIO_NEGATIVE_MIN_HEIGHT : AIO_POSITIVE_MIN_HEIGHT;
     root.__webuiBridgeMaxHeight = 680;
     applyStoredHeight(root, panelHeightKey, { min: root.__webuiBridgeMinHeight, max: 680 });
     const toggles = el("div", { class: "webui-bridge-aio-toggles" }, [
-        autoLoad,
-        autoTranslate,
-        showInput,
+        el("label", { title: "自动把中文输入翻译为 Anima 英文 tag" }, [
+            autoTranslate,
+            el("span", {}, "自动中译英"),
+        ]),
     ]);
     const appendMenu = el("div", { class: "webui-bridge-append-menu" });
     const closeAppendMenu = () => appendMenu.classList.remove("visible");
@@ -8248,12 +8479,17 @@ function buildPanel(node) {
         textarea.__webuiBridgeAutoTranslateTimer = window.setTimeout(async () => {
             if (textarea.__webuiBridgeComposing || !/[\u3400-\u9fff]/.test(textarea.value || "")) return;
             const before = textarea.value;
+            const requestVersion = Number(textarea.__webuiBridgeAutoTranslateVersion || 0);
             const aiMode = normalizeBridgeSettings(state.settings).translation_source === "ai";
             try {
                 textarea.__webuiBridgeAutoTranslating = true;
                 setPromptTranslateStatus(textarea, aiMode ? "AI 正在翻译..." : "正在翻译...", true);
                 setStatus(aiMode ? "AI 正在翻译提示词..." : "正在自动翻译提示词...");
                 const translated = await translatePromptAllInOne(before, "english");
+                if (textarea.value !== before || Number(textarea.__webuiBridgeAutoTranslateVersion || 0) !== requestVersion) {
+                    setPromptTranslateStatus(textarea, "输入已变化，已忽略旧翻译", false);
+                    return;
+                }
                 const next = translated.prompt || before;
                 if (translated.matched && next && next !== before) {
                     setTextareaValue(textarea, next);
@@ -8268,17 +8504,25 @@ function buildPanel(node) {
                     setPromptTranslateStatus(textarea, aiMode ? "AI 已返回，内容未变化" : "已检查，内容未变化", false);
                 }
             } catch {
-                setPromptTranslateStatus(textarea, "自动翻译失败", false);
-                setStatus("自动翻译失败");
+                if (textarea.value === before && Number(textarea.__webuiBridgeAutoTranslateVersion || 0) === requestVersion) {
+                    setPromptTranslateStatus(textarea, "自动翻译失败", false);
+                    setStatus("自动翻译失败");
+                }
             } finally {
                 textarea.__webuiBridgeAutoTranslating = false;
+                if (textarea.__webuiBridgeAutoTranslatePending) {
+                    textarea.__webuiBridgeAutoTranslatePending = false;
+                    scheduleAutoTranslateInput(textarea);
+                }
             }
         }, 1200);
     };
 
     const onInput = (textarea) => {
         clearPromptPlacementWarning();
+        textarea.__webuiBridgeAutoTranslateVersion = Number(textarea.__webuiBridgeAutoTranslateVersion || 0) + 1;
         if (textarea.__webuiBridgeAutoTranslating) {
+            textarea.__webuiBridgeAutoTranslatePending = true;
             sync();
             return;
         }
@@ -8359,7 +8603,7 @@ function buildPanel(node) {
     const modelSelect = el("select", { class: "webui-bridge-model-select", title: "选择任意整合 checkpoint 模型" });
     const modelModeBadge = el("span", { class: "webui-bridge-model-mode" }, "模型");
     const modelCount = el("span", { class: "webui-bridge-model-count" }, "0");
-    const status = el("div", { class: "webui-bridge-status" }, "");
+    const status = el("div", { class: "webui-bridge-status", role: "status", "aria-live": "polite" }, "");
     const clipStrengthInput = el("input", {
         type: "number",
         min: "-10",
@@ -10245,6 +10489,10 @@ function buildPanel(node) {
         renderPromptPanels();
         updateCounters();
         applyUiVisibility();
+        if (data.loadErrors?.length) {
+            const summary = data.loadErrors.map((item) => `${item.label}: ${item.message}`).join("；");
+            setStatus(`部分数据读取失败：${summary}`, { kind: "warning", sticky: true });
+        }
         return data;
     };
 
@@ -10972,7 +11220,7 @@ function buildPanel(node) {
             baseUrlInput.value = config.base_url || "https://api.siliconflow.cn/v1";
             modelInput.value = config.model || "deepseek-ai/DeepSeek-V4-Flash";
             systemPromptInput.value = config.system_prompt || "";
-            statusLine.textContent = config.api_key_set ? `API Key: ${config.api_key_preview}` : "API Key 未设置";
+            statusLine.textContent = config.api_key_set ? "API Key 已安全保存" : "API Key 未设置";
         };
         const save = async () => {
             statusLine.textContent = "正在保存 AI 配置...";
@@ -11052,7 +11300,7 @@ function buildPanel(node) {
                 el("button", { type: "button", onclick: close }, "×"),
             ]),
             el("div", { class: "webui-bridge-config-body" }, [
-                el("div", { class: "webui-bridge-config-note" }, "支持 OpenAI 兼容接口。SiliconFlow 可填 base URL https://api.siliconflow.cn/v1，模型 deepseek-ai/DeepSeek-V4-Flash；DeepSeek 官方也可填 https://api.deepseek.com/v1。API Key 只保存在本机 config.local.json。"),
+                el("div", { class: "webui-bridge-config-note" }, "支持 OpenAI 兼容接口。SiliconFlow 可填 base URL https://api.siliconflow.cn/v1，模型 deepseek-ai/DeepSeek-V4-Flash；DeepSeek 官方也可填 https://api.deepseek.com/v1。更换 Base URL 时需要重新输入 API Key；Windows 下密钥会用当前用户凭据保护。"),
                 el("label", { class: "webui-bridge-config-check" }, [enabledInput, el("span", {}, "启用 AI 提示词接口")]),
                 el("label", {}, [el("span", {}, "Base URL"), baseUrlInput]),
                 el("label", {}, [el("span", {}, "模型"), modelInput, modelDatalist]),
@@ -11613,10 +11861,11 @@ function buildPanel(node) {
         document.body.append(mask);
     };
 
-    const maybeShowStartupWizard = () => {
+    const maybeShowStartupWizard = (startupConfigurationLoaded = false) => {
+        if (!startupConfigurationLoaded) return;
         if (window.__webuiBridgeStartupWizardShown) return;
         if (state.settings?.show_startup_wizard === false) return;
-        if (state.webuiIntegration?.webui_root) return;
+        if (state.webuiIntegration?.configured || state.webuiIntegration?.webui_root) return;
         window.__webuiBridgeStartupWizardShown = true;
         window.setTimeout(showStartupWizard, 200);
     };
@@ -11890,6 +12139,7 @@ function buildPanel(node) {
                     renderCards();
                 },
                 onkeydown: (event) => {
+                    if (event.target !== event.currentTarget) return;
                     if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
                         event.currentTarget.click();
@@ -13233,19 +13483,7 @@ function buildPanel(node) {
         clipField,
         failOnMissingField,
     ]);
-    actionColumn = el("div", { class: "webui-bridge-action-column" }, [
-        createSidebarWidthButton(() => topRow, actionWidthKey, actionWidthOptions),
-        el("button", { class: "webui-bridge-generate", title: "Queue Prompt", onclick: queuePrompt }, "Generate"),
-        status,
-        bindVisibility(modelSwitchControls, "model_switch"),
-        bindVisibility(generationControls, "generation_controls"),
-        bindVisibility(regionalSection, "regional_control"),
-        regionalModuleSection,
-        bindVisibility(animaModeControls, "model_switch"),
-        bindVisibility(sizeControls, "size_controls"),
-        bindVisibility(layoutPresetControls, "layout_presets"),
-        bindVisibility(toolbar, "prompt_tools"),
-        bindVisibility(el("div", { class: "webui-bridge-style-row" }, [
+    const styleControls = bindVisibility(el("div", { class: "webui-bridge-style-row" }, [
             styleSelect,
             el("div", { class: "webui-bridge-style-edit" }, [
                 styleName,
@@ -13255,8 +13493,91 @@ function buildPanel(node) {
                 createToolButton("+", "保存当前 prompt 为起手式", saveStyle),
                 createToolButton("-", "删除选中或输入的起手式", deleteStyle),
             ]),
-        ]), "styles"),
+        ]), "styles");
+    const imageModuleSection = regionalModuleSection.querySelector('[data-visibility-key="module_img2img"]');
+    const imageSidebarModules = el("div", { class: "webui-bridge-modules webui-bridge-image-tab-modules" }, [
+        imageModuleSection,
+    ].filter(Boolean));
+    const imageTabEmpty = el("div", { class: "webui-bridge-sidebar-empty" }, "在设置中启用图生图模块后可使用上传和局部重绘。");
+    const moduleTabEmpty = el("div", { class: "webui-bridge-sidebar-empty" }, "当前没有启用高级模块，可在设置中选择 ControlNet、ADetailer、SAM 或放大修复。");
+    const sidebarPanels = {
+        model: el("div", { class: "webui-bridge-sidebar-panel", role: "tabpanel", "data-sidebar-tab": "model" }, [
+            bindVisibility(modelSwitchControls, "model_switch"),
+            bindVisibility(animaModeControls, "model_switch"),
+        ]),
+        generation: el("div", { class: "webui-bridge-sidebar-panel", role: "tabpanel", "data-sidebar-tab": "generation" }, [
+            bindVisibility(generationControls, "generation_controls"),
+            bindVisibility(regionalSection, "regional_control"),
+            styleControls,
+        ]),
+        image: el("div", { class: "webui-bridge-sidebar-panel", role: "tabpanel", "data-sidebar-tab": "image" }, [
+            imageSidebarModules,
+            imageTabEmpty,
+        ]),
+        modules: el("div", { class: "webui-bridge-sidebar-panel", role: "tabpanel", "data-sidebar-tab": "modules" }, [
+            regionalModuleSection,
+            moduleTabEmpty,
+        ]),
+    };
+    const sidebarTabOptions = [
+        ["model", "模型"],
+        ["generation", "生成"],
+        ["image", "图生图"],
+        ["modules", "模块"],
+    ];
+    let activeSidebarTab = readLocalString(SIDEBAR_ACTIVE_TAB_KEY, "model");
+    if (!sidebarPanels[activeSidebarTab]) activeSidebarTab = "model";
+    const sidebarTabButtons = new Map();
+    const applySidebarTab = (tabId, { persist = true } = {}) => {
+        const nextTab = sidebarPanels[tabId] ? tabId : "model";
+        activeSidebarTab = nextTab;
+        if (persist) writeLocalString(SIDEBAR_ACTIVE_TAB_KEY, nextTab);
+        for (const [id, panelElement] of Object.entries(sidebarPanels)) {
+            const active = id === nextTab;
+            panelElement.hidden = !active;
+            panelElement.classList.toggle("active", active);
+            panelElement.setAttribute("aria-hidden", active ? "false" : "true");
+        }
+        for (const [id, button] of sidebarTabButtons) {
+            const active = id === nextTab;
+            button.classList.toggle("active", active);
+            button.setAttribute("aria-selected", active ? "true" : "false");
+            button.tabIndex = active ? 0 : -1;
+        }
+        scheduleAdaptiveLayout();
+    };
+    const sidebarTabList = el("div", { class: "webui-bridge-sidebar-tabs", role: "tablist", "aria-label": "右侧功能区" }, sidebarTabOptions.map(([id, label]) => {
+        const button = el("button", {
+            class: "webui-bridge-sidebar-tab",
+            type: "button",
+            role: "tab",
+            "aria-selected": id === activeSidebarTab ? "true" : "false",
+            onclick: () => applySidebarTab(id),
+        }, label);
+        sidebarTabButtons.set(id, button);
+        return button;
+    }));
+    const sidebarLayoutTools = el("details", { class: "webui-bridge-sidebar-layout-tools" }, [
+        el("summary", {}, "布局与工具"),
+        el("div", { class: "webui-bridge-sidebar-layout-body" }, [
+            createSidebarWidthButton(() => topRow, actionWidthKey, actionWidthOptions),
+            bindVisibility(sizeControls, "size_controls"),
+            bindVisibility(layoutPresetControls, "layout_presets"),
+            bindVisibility(toolbar, "prompt_tools"),
+        ]),
     ]);
+    const sidebarHeader = el("div", { class: "webui-bridge-sidebar-header" }, [
+        el("button", { class: "webui-bridge-generate", title: "Queue Prompt", onclick: queuePrompt }, "Generate"),
+        status,
+    ]);
+    const sidebarViewport = el("div", { class: "webui-bridge-sidebar-viewport" }, Object.values(sidebarPanels));
+    actionColumn = el("div", { class: "webui-bridge-action-column" }, [
+        sidebarHeader,
+        sidebarTabList,
+        sidebarViewport,
+        sidebarLayoutTools,
+    ]);
+    applySidebarTab(activeSidebarTab, { persist: false });
     actionResizeGrip = createSidebarWidthGrip(() => topRow, actionWidthKey, actionWidthOptions);
     topRow = el("div", { class: "webui-bridge-toprow" }, [
         promptsColumn,
@@ -13271,12 +13592,19 @@ function buildPanel(node) {
             const key = target.dataset.visibilityKey;
             target.classList.toggle("webui-bridge-ui-hidden", visibility[key] === false);
         }
-        for (const target of regionalModuleSection.querySelectorAll("[data-visibility-key]")) {
-            const key = target.dataset.visibilityKey;
-            target.classList.toggle("webui-bridge-ui-hidden", visibility[key] === false);
+        for (const container of [imageSidebarModules, regionalModuleSection]) {
+            for (const target of container.querySelectorAll("[data-visibility-key]")) {
+                const key = target.dataset.visibilityKey;
+                target.classList.toggle("webui-bridge-ui-hidden", visibility[key] === false);
+            }
         }
-        const anyModuleVisible = MODULE_VISIBILITY_OPTIONS.some(([key]) => visibility[key] !== false);
-        regionalModuleSection.classList.toggle("webui-bridge-ui-hidden", !anyModuleVisible);
+        const imageModuleVisible = Boolean(imageModuleSection) && visibility.module_img2img !== false;
+        imageTabEmpty.classList.toggle("visible", !imageModuleVisible);
+        const anyAdvancedModuleVisible = MODULE_VISIBILITY_OPTIONS
+            .filter(([key]) => key !== "module_img2img")
+            .some(([key]) => visibility[key] !== false);
+        regionalModuleSection.classList.toggle("webui-bridge-ui-hidden", !anyAdvancedModuleVisible);
+        moduleTabEmpty.classList.toggle("visible", !anyAdvancedModuleVisible);
         if (visibility.lora_browser === false && loraOverlayOpen) closeLoraOverlay();
         scheduleAdaptiveLayout();
         window.requestAnimationFrame?.(() => ensureUsableExtraHeight());
@@ -13310,6 +13638,8 @@ function buildPanel(node) {
     const reclaimLoraSpaceAfterNegativeCollapse = (before = null) => {
         if (!negative.row?.classList?.contains("collapsed")) return false;
         if (extraCollapsed || loraOverlayOpen || !topRow?.isConnected || !extraSection?.isConnected) return false;
+        const triggeredByCollapse = before && Number(before.topHeight) > 0 && Number(before.extraHeight) > 0;
+        if (!triggeredByCollapse && promptLoraSplitManual) return false;
         const currentTop = resizeTargetLayoutHeight(topRow) || 0;
         const currentExtra = resizeTargetLayoutHeight(extraSection) || 0;
         const sourceTop = Number(before?.topHeight || currentTop || 0);
@@ -13445,7 +13775,58 @@ function buildPanel(node) {
     applyStoredHeight(topRow, topRowHeightKey, { min: topRow.__webuiBridgeMinHeight, max: topRow.__webuiBridgeMaxHeight });
     applyTopRowCollapsedState(topRow, negative.row.classList.contains("collapsed"));
 
+    const zoomSummaryModel = el("span", { class: "webui-bridge-zoom-model" });
+    const zoomSummaryMetrics = el("div", { class: "webui-bridge-zoom-metrics" });
+    const zoomSummaryPrompt = el("div", { class: "webui-bridge-zoom-prompt" });
+    const zoomSummaryStatus = el("div", { class: "webui-bridge-zoom-status" });
+    const zoomSummary = el("div", { class: "webui-bridge-zoom-summary", "aria-hidden": "true" }, [
+        el("div", { class: "webui-bridge-zoom-head" }, [
+            el("strong", {}, "WebUI Prompt Bridge"),
+            zoomSummaryModel,
+        ]),
+        zoomSummaryPrompt,
+        zoomSummaryMetrics,
+        zoomSummaryStatus,
+    ]);
+    let zoomSummarySignature = "";
+    const updateZoomSummary = () => {
+        const positiveTags = splitPromptTags(positive.textarea.value).filter((tag) => tag.value !== "\n");
+        const negativeTags = splitPromptTags(negative.textarea.value).filter((tag) => tag.value !== "\n");
+        const loraCount = positiveTags.filter((tag) => parseLoraTag(tag.value)).length;
+        const modelLabel = String(modelSelect.selectedOptions?.[0]?.textContent || modelSelect.value || "未选择模型").trim();
+        const promptPreview = String(positive.textarea.value || "").replace(/\s+/g, " ").trim();
+        const img2imgEnabled = Boolean(bridgeWidgetValue(node, "module_img2img_enabled", false));
+        const img2imgMode = bridgeWidgetValue(node, "module_img2img_mode", "img2img") === "inpaint" ? "局部重绘" : "图生图";
+        const generationText = String(generationStatus.textContent || "未接管").trim();
+        const statusText = status.classList.contains("visible") ? String(status.textContent || "").trim() : "";
+        const signature = [
+            modelLabel,
+            promptPreview,
+            positiveTags.length,
+            negativeTags.length,
+            loraCount,
+            img2imgEnabled,
+            img2imgMode,
+            generationText,
+            statusText,
+        ].join("|");
+        if (signature === zoomSummarySignature) return;
+        zoomSummarySignature = signature;
+        zoomSummaryModel.textContent = modelLabel;
+        zoomSummaryPrompt.textContent = promptPreview || "尚未填写正向 Prompt";
+        zoomSummaryMetrics.replaceChildren(
+            el("span", {}, `正向 ${positiveTags.length}`),
+            el("span", {}, `反向 ${negativeTags.length}`),
+            el("span", {}, `LoRA ${loraCount}`),
+            el("span", {}, img2imgEnabled ? img2imgMode : "文生图"),
+            el("span", {}, generationText),
+        );
+        zoomSummaryStatus.textContent = statusText;
+        zoomSummaryStatus.classList.toggle("visible", Boolean(statusText));
+    };
+
     const panel = el("div", { class: "webui-bridge-panel" }, [
+        zoomSummary,
         topControls,
         topRow,
         createHeightSplitGrip(topRow, extraSection, topRowHeightKey, extraHeightKey, {
@@ -13471,6 +13852,8 @@ function buildPanel(node) {
         extraSection,
         resizeGrip,
     ]);
+    panel.__webuiBridgeUpdateZoomSummary = updateZoomSummary;
+    updateZoomSummary();
     panelLayoutIsMeasurable = () => {
         if (!panel?.isConnected) return false;
         const rect = panel.getBoundingClientRect?.();
@@ -13862,12 +14245,13 @@ function buildPanel(node) {
         state.styles = data.styles;
         state.models = data.models;
         state.promptAllInOne = data.promptAllInOne;
+        state.webuiIntegration = data.webuiIntegration;
         const shouldApplyFreshDefaults = node.__webuiBridgeFreshNode && !node.__webuiBridgeWasConfigured && !nodeHasSavedUserBridgePanelSize(node);
-        state.settings = shouldApplyFreshDefaults
-            ? { ...data.settings, layout_preset: "default" }
-            : data.settings;
+        state.settings = data.settings;
         state.customTagCount = data.customTagCount;
         state.assets = data.assets;
+        state.moduleAssets = data.moduleAssets || data.module_assets || state.moduleAssets;
+        renderModuleAssetStatuses();
         renderStyles();
         renderModelSwitch();
         renderTree();
@@ -13879,7 +14263,8 @@ function buildPanel(node) {
         if (!node.__webuiBridgeInitialLayoutApplied) {
             node.__webuiBridgeInitialLayoutApplied = true;
             if (shouldApplyFreshDefaults) {
-                applyLayoutPreset(state.settings?.layout_preset || "default", { preserveNodeSize: true });
+                const initialPreset = state.settings?.layout_preset || DEFAULT_BRIDGE_SETTINGS.layout_preset;
+                applyLayoutPreset(initialPreset, { preserveNodeSize: initialPreset === "default" });
             } else {
                 setLayoutPresetClass(state.settings?.layout_preset || "default");
                 scheduleAdaptiveLayout();
@@ -13892,8 +14277,12 @@ function buildPanel(node) {
         }
         positiveTagPanel.__webuiBridgeRender?.();
         negativeTagPanel.__webuiBridgeRender?.();
+        if (data.loadErrors?.length) {
+            const summary = data.loadErrors.map((item) => `${item.label}: ${item.message}`).join("；");
+            setStatus(`部分数据读取失败：${summary}`, { kind: "warning", sticky: true });
+        }
         const showedNodeTutorial = maybeShowNodeTutorial();
-        if (!showedNodeTutorial) maybeShowStartupWizard();
+        if (!showedNodeTutorial) maybeShowStartupWizard(data.startupConfigurationLoaded);
         repairBridgePanelLayoutAfterWorkflow(node, "data-loaded");
     });
 
@@ -13950,6 +14339,25 @@ function installWebUIPanel(node) {
         const originalSetSize = node.setSize.bind(node);
         node.setSize = function (size) {
             if (Array.isArray(size) && Number.isFinite(size[0]) && Number.isFinite(size[1])) {
+                if (node.__webuiBridgeApplyingLowZoomSize ||
+                    (node.__webuiBridgeLowZoomActive && !node.__webuiBridgeSetSizeIsUser)) {
+                    const lowZoomOriginal = normalizeBridgePanelSize(node.__webuiBridgeLowZoomOriginalSize);
+                    const requestedSize = node.__webuiBridgeApplyingLowZoomSize
+                        ? size
+                        : [
+                            Math.min(lowZoomOriginal[0], BRIDGE_LOW_ZOOM_MAX_WIDTH),
+                            Math.min(lowZoomOriginal[1], BRIDGE_LOW_ZOOM_MAX_HEIGHT),
+                        ];
+                    const transientSize = [
+                        Math.max(PANEL_BROKEN_MIN_WIDTH, Math.min(BRIDGE_LOW_ZOOM_MAX_WIDTH, Math.round(requestedSize[0]))),
+                        Math.max(PANEL_BROKEN_MIN_HEIGHT, Math.min(BRIDGE_LOW_ZOOM_MAX_HEIGHT, Math.round(requestedSize[1]))),
+                    ];
+                    node.size = [...transientSize];
+                    const result = originalSetSize(transientSize);
+                    if (!bridgePanelSizesMatch(node.size, transientSize, 1)) node.size = [...transientSize];
+                    node.__webuiBridgeApplyDomWidgetSize?.(transientSize[0], transientSize[1]);
+                    return result;
+                }
                 const requestedNeedsRepair = shouldRepairBridgePanelSize(size);
                 const currentWidth = Math.round(Number(node.size?.[0] || 0));
                 const currentHeight = Math.round(Number(node.size?.[1] || 0));
@@ -14041,7 +14449,7 @@ function installWebUIPanel(node) {
         chainCallback(node, "onSerialize", function (data) {
             if (!data || !Array.isArray(data.widgets_values)) return;
             repairBridgeNodeWidgetDefaults(node);
-            const desired = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
+            const desired = bridgeAuthoritativePanelSize(node);
             const layoutState = normalizeBridgeLayoutState(
                 node.__webuiBridgePanel?.__webuiBridgeGetLayoutState?.() ||
                 node.__webuiBridgeConfiguredLayoutState,
@@ -14179,6 +14587,97 @@ function addStyles() {
             font-size: var(--webui-bridge-font-size, 12px);
             overflow: hidden;
             container-type: inline-size;
+        }
+        .webui-bridge-zoom-summary {
+            display: none;
+            position: absolute;
+            inset: 8px;
+            z-index: 80;
+            min-width: 0;
+            padding: 28px 32px;
+            box-sizing: border-box;
+            border: 2px solid rgba(116, 164, 238, .78);
+            border-radius: 8px;
+            background: rgba(20, 29, 43, .98);
+            color: #f4f8ff;
+            box-shadow: inset 0 0 0 1px rgba(166, 196, 255, .1);
+            flex-direction: column;
+            justify-content: center;
+            gap: 18px;
+            overflow: hidden;
+            pointer-events: none;
+        }
+        .webui-bridge-panel.zoom-summary-mode {
+            pointer-events: none;
+        }
+        .webui-bridge-panel.zoom-summary-mode > :not(.webui-bridge-zoom-summary) {
+            visibility: hidden !important;
+        }
+        .webui-bridge-panel.zoom-summary-mode > .webui-bridge-zoom-summary {
+            display: flex;
+            visibility: visible !important;
+        }
+        .webui-bridge-zoom-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 24px;
+            min-width: 0;
+        }
+        .webui-bridge-zoom-head strong {
+            flex: 0 0 auto;
+            font-size: 28px;
+            line-height: 1.15;
+        }
+        .webui-bridge-zoom-model {
+            min-width: 0;
+            overflow: hidden;
+            color: #b9d4ff;
+            font-size: 18px;
+            font-weight: 700;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .webui-bridge-zoom-prompt {
+            display: -webkit-box;
+            overflow: hidden;
+            color: #f3f6fb;
+            font-size: 22px;
+            font-weight: 700;
+            line-height: 1.35;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 3;
+        }
+        .webui-bridge-zoom-metrics {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .webui-bridge-zoom-metrics span {
+            padding: 7px 12px;
+            border: 1px solid rgba(93, 126, 174, .86);
+            border-radius: 5px;
+            background: #1a2b43;
+            color: #dceaff;
+            font-size: 16px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .webui-bridge-zoom-status {
+            display: none;
+            overflow: hidden;
+            color: #ffd58a;
+            font-size: 16px;
+            line-height: 1.35;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .webui-bridge-zoom-status.visible {
+            display: block;
+        }
+        .lg-node:has(.webui-bridge-panel.zoom-summary-mode) .lg-slot--input .text-node-component-slot-text,
+        .lg-node:has(.webui-bridge-panel.zoom-summary-mode) .lg-slot--output .text-node-component-slot-text {
+            display: none !important;
         }
         .webui-bridge-slot-label-overlay {
             position: fixed;
@@ -15185,7 +15684,8 @@ function addStyles() {
             font-size: 11px;
             line-height: 15px;
         }
-        .webui-bridge-prompt-chip:hover {
+        .webui-bridge-prompt-chip:hover,
+        .webui-bridge-prompt-chip:focus-visible {
             border-color: #6aa3ff;
             background: #30394a;
         }
@@ -15265,8 +15765,14 @@ function addStyles() {
             box-shadow: 0 2px 7px rgba(0, 0, 0, .32);
         }
         .webui-bridge-prompt-chip:hover .webui-bridge-chip-tools-toggle,
+        .webui-bridge-prompt-chip:focus-within .webui-bridge-chip-tools-toggle,
         .webui-bridge-prompt-chip.show-tools .webui-bridge-chip-tools-toggle {
             display: flex;
+        }
+        @media (pointer: coarse) {
+            .webui-bridge-prompt-chip .webui-bridge-chip-tools-toggle {
+                display: flex;
+            }
         }
         .webui-bridge-chip-tools-toggle:hover {
             border-color: #c7dcff;
@@ -15467,7 +15973,15 @@ function addStyles() {
         .webui-bridge-aio-toggles {
             display: flex;
             align-items: center;
-            gap: 2px;
+            gap: 6px;
+        }
+        .webui-bridge-aio-toggles label {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            color: #b9c9de;
+            font-size: 11px;
+            white-space: nowrap;
         }
         .webui-bridge-aio-toggles input {
             width: 13px;
@@ -15682,14 +16196,14 @@ function addStyles() {
         .webui-bridge-action-column {
             display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: 6px;
             width: 100%;
             justify-self: stretch;
             min-width: 0;
             min-height: 0;
             box-sizing: border-box;
             padding-right: 2px;
-            overflow: auto;
+            overflow: hidden;
         }
         .webui-bridge-action-column > * {
             min-width: 0;
@@ -15697,9 +16211,17 @@ function addStyles() {
         .webui-bridge-action-column.collapsed {
             display: none !important;
         }
+        .webui-bridge-sidebar-header {
+            position: relative;
+            z-index: 3;
+            flex: 0 0 auto;
+            display: grid;
+            gap: 4px;
+            padding: 1px;
+        }
         .webui-bridge-generate {
-            height: 52px;
-            min-height: 48px;
+            height: 42px;
+            min-height: 42px;
             border: 0;
             border-radius: 6px;
             background: #2f73d9;
@@ -15709,6 +16231,91 @@ function addStyles() {
         }
         .webui-bridge-generate:hover {
             filter: brightness(1.08);
+        }
+        .webui-bridge-sidebar-tabs {
+            flex: 0 0 auto;
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 3px;
+            padding: 3px;
+            border: 1px solid #3d4a5d;
+            border-radius: 6px;
+            background: #111824;
+        }
+        .webui-bridge-sidebar-tab {
+            min-width: 0;
+            min-height: 30px;
+            padding: 4px 5px;
+            border: 1px solid transparent;
+            border-radius: 4px;
+            background: transparent;
+            color: #9fb0c7;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        .webui-bridge-sidebar-tab:hover {
+            border-color: #526785;
+            color: #eef5ff;
+        }
+        .webui-bridge-sidebar-tab.active {
+            border-color: #6f9fe4;
+            background: #203a61;
+            color: #f7fbff;
+            box-shadow: inset 0 0 0 1px rgba(174, 208, 255, .08);
+        }
+        .webui-bridge-sidebar-viewport {
+            flex: 1 1 auto;
+            min-width: 0;
+            min-height: 0;
+            overflow: hidden auto;
+            overscroll-behavior: contain;
+            scrollbar-gutter: stable;
+        }
+        .webui-bridge-sidebar-panel {
+            display: none;
+            min-width: 0;
+            padding: 1px 2px 4px;
+            box-sizing: border-box;
+            gap: 8px;
+        }
+        .webui-bridge-sidebar-panel.active {
+            display: grid;
+        }
+        .webui-bridge-sidebar-panel[hidden] {
+            display: none !important;
+        }
+        .webui-bridge-sidebar-empty {
+            display: none;
+            padding: 14px 12px;
+            border: 1px dashed #40506a;
+            border-radius: 6px;
+            background: #111824;
+            color: #9fb0c7;
+            font-size: 11px;
+            line-height: 1.45;
+        }
+        .webui-bridge-sidebar-empty.visible {
+            display: block;
+        }
+        .webui-bridge-sidebar-layout-tools {
+            flex: 0 0 auto;
+            border: 1px solid #3d4a5d;
+            border-radius: 6px;
+            background: #151c27;
+            color: #cbd4e1;
+            font-size: 11px;
+        }
+        .webui-bridge-sidebar-layout-tools summary {
+            padding: 6px 8px;
+            cursor: pointer;
+            color: #b9c8dc;
+            font-weight: 700;
+        }
+        .webui-bridge-sidebar-layout-body {
+            display: grid;
+            gap: 6px;
+            padding: 0 6px 6px;
         }
         .webui-bridge-tools {
             display: grid;
@@ -17671,7 +18278,7 @@ function addStyles() {
             background: #111a26;
             color: #edf4ff;
             font-size: 12px;
-            overflow: hidden;
+            overflow: auto;
         }
         .webui-bridge-image-input-head {
             display: grid;
@@ -17763,11 +18370,16 @@ function addStyles() {
         .webui-bridge-image-editor-panel {
             width: min(1080px, calc(100vw - 48px));
         }
+        .webui-bridge-image-editor-body {
+            min-width: 0;
+            padding: 0 18px 12px;
+            overflow: auto;
+        }
         .webui-bridge-image-editor-toolbar {
             display: grid;
             grid-template-columns: minmax(180px, 1fr) auto auto;
             gap: 10px;
-            padding: 14px 18px 0;
+            padding: 14px 0 0;
             align-items: end;
         }
         .webui-bridge-image-editor-stage {
@@ -17777,6 +18389,19 @@ function addStyles() {
             border-radius: 8px;
             background: #070b10;
             overflow: hidden;
+        }
+        @media (max-width: 560px) {
+            .webui-bridge-config-mask {
+                padding: 12px;
+            }
+            .webui-bridge-config-panel,
+            .webui-bridge-image-editor-panel {
+                width: min(100%, calc(100vw - 24px));
+                max-height: calc(100vh - 24px);
+            }
+            .webui-bridge-image-editor-toolbar {
+                grid-template-columns: minmax(0, 1fr) auto auto;
+            }
         }
         .webui-bridge-image-editor-stage canvas {
             position: absolute;

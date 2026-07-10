@@ -6,6 +6,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 const comfyRoot = path.resolve(repoRoot, "..", "..");
 const defaultBaseUrl = "http://127.0.0.1:8188";
+const bridgeImageInputNode = "WebUIPromptBridgeImageInput";
 const switchIds = [10, 15, 19, 24, 40, 47, 196, 197, 198];
 const rightColumnIds = [6, 8, 9, 11, 199, 200, 201, 202, 221];
 const customLayoutIds = [];
@@ -44,12 +45,15 @@ function parseArgs() {
         baseUrl: process.env.COMFYUI_URL || defaultBaseUrl,
         queue: false,
         headed: false,
+        focusedFixes: false,
     };
     for (const arg of process.argv.slice(2)) {
         if (arg === "--queue") {
             options.queue = true;
         } else if (arg === "--headed") {
             options.headed = true;
+        } else if (arg === "--focused-fixes") {
+            options.focusedFixes = true;
         } else if (arg.startsWith("--url=")) {
             options.baseUrl = arg.slice("--url=".length);
         } else {
@@ -782,6 +786,467 @@ async function verifyBridgeUiErgonomics(browser, baseUrl, workflow) {
     }
 }
 
+async function verifyBridgeImageInputPanelErgonomics(browser, baseUrl) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1000, height: 760 });
+    try {
+        await page.evaluate((nodeType) => {
+            window.app.graph.clear();
+            const node = window.LiteGraph.createNode(nodeType);
+            if (!node) throw new Error(`Missing node type ${nodeType}`);
+            node.id = 950020;
+            node.pos = [80, 60];
+            window.app.graph.add(node);
+            window.app.canvas.setDirty(true, true);
+        }, bridgeImageInputNode);
+        await page.waitForSelector(".webui-bridge-image-input-panel", { timeout: 20000 });
+        await page.waitForTimeout(600);
+        const metrics = await page.evaluate(() => {
+            const panel = document.querySelector(".webui-bridge-image-input-panel");
+            const status = panel?.querySelector(".webui-bridge-image-input-status");
+            const panelRect = panel?.getBoundingClientRect();
+            const statusRect = status?.getBoundingClientRect();
+            return {
+                enableRows: panel?.querySelectorAll(".webui-bridge-image-input-enable").length || 0,
+                clientHeight: panel?.clientHeight || 0,
+                scrollHeight: panel?.scrollHeight || 0,
+                overflowY: panel ? getComputedStyle(panel).overflowY : "",
+                statusInside: Boolean(panelRect && statusRect && statusRect.bottom <= panelRect.bottom + 2),
+                nodeSize: Array.from(window.app.graph.getNodeById(950020)?.size || []),
+            };
+        });
+        assert(metrics.enableRows === 0, "Standalone image input still shows a non-functional enable switch", metrics);
+        assert(metrics.statusInside || ["auto", "scroll"].includes(metrics.overflowY), "Image input panel clips its bottom controls", metrics);
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(!bridgeConsoleErrors.length, "Bridge image input emitted console errors", bridgeConsoleErrors);
+        return { ...metrics, bridgeConsoleErrors: bridgeConsoleErrors.length };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifyStartupWizardRequiresLoadedConfiguration(browser, baseUrl) {
+    const scenarios = [
+        { label: "settings failed", failSettings: true, failWebui: false, expectWizard: false },
+        { label: "webui status failed", failSettings: false, failWebui: true, expectWizard: false },
+        { label: "both loaded and unconfigured", failSettings: false, failWebui: false, expectWizard: true },
+    ];
+    const results = [];
+    for (const scenario of scenarios) {
+        const consoleMessages = [];
+        const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1200, height: 900 }, async (newPage) => {
+            await newPage.addInitScript(() => {
+                localStorage.setItem("webui-bridge-node-tutorial-seen-v2", "1");
+                window.__webuiBridgeStartupWizardShown = false;
+            });
+            await newPage.route("**/webui_prompt_bridge/settings", async (route) => {
+                if (scenario.failSettings) {
+                    await route.fulfill({
+                        status: 503,
+                        contentType: "application/json",
+                        body: JSON.stringify({ error: "mock settings failure" }),
+                    });
+                    return;
+                }
+                await route.fulfill({
+                    status: 200,
+                    contentType: "application/json",
+                    body: JSON.stringify({
+                        settings: {
+                            show_startup_wizard: true,
+                            node_tutorial_popup: "first_time",
+                        },
+                        custom_tag_count: 0,
+                        assets: null,
+                        module_assets: null,
+                    }),
+                });
+            });
+            await newPage.route("**/webui_prompt_bridge/webui_integration", async (route) => {
+                if (scenario.failWebui) {
+                    await route.fulfill({
+                        status: 503,
+                        contentType: "application/json",
+                        body: JSON.stringify({ error: "mock webui status failure" }),
+                    });
+                    return;
+                }
+                await route.fulfill({
+                    status: 200,
+                    contentType: "application/json",
+                    body: JSON.stringify({ configured: false, webui_root: "", checks: {} }),
+                });
+            });
+        });
+        try {
+            await page.evaluate(() => {
+                window.app.graph.clear();
+                const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+                bridge.id = 950022;
+                bridge.pos = [60, 40];
+                window.app.graph.add(bridge);
+                window.app.canvas.setDirty(true, true);
+            });
+            await page.waitForFunction(() => document.querySelector(".webui-bridge-panel")?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
+            if (scenario.expectWizard) {
+                await page.waitForSelector(".webui-bridge-startup", { timeout: 3000 });
+            } else {
+                await page.waitForTimeout(700);
+            }
+            const metrics = await page.evaluate(() => ({
+                wizardCount: document.querySelectorAll(".webui-bridge-startup").length,
+                status: document.querySelector(".webui-bridge-status")?.textContent || "",
+            }));
+            assert(
+                scenario.expectWizard ? metrics.wizardCount === 1 : metrics.wizardCount === 0,
+                `Startup wizard gating failed for ${scenario.label}`,
+                metrics,
+            );
+            results.push({ label: scenario.label, ...metrics });
+        } finally {
+            await context.close();
+        }
+    }
+    return results;
+}
+
+async function verifyMaskEditorLoadGuardsAndCanvasBudget(browser, baseUrl) {
+    const consoleMessages = [];
+    const largeSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="6000" height="6000" viewBox="0 0 6000 6000"><rect width="6000" height="6000" fill="#7890ab"/></svg>';
+    const maskSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512" fill="white"/></svg>';
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1000, height: 760 }, async (newPage) => {
+        await newPage.route("**/view?*", async (route) => {
+            const filename = new URL(route.request().url()).searchParams.get("filename") || "";
+            if (filename === "large.png") {
+                await new Promise((resolve) => setTimeout(resolve, 220));
+                await route.fulfill({ status: 200, contentType: "image/svg+xml", body: largeSvg });
+                return;
+            }
+            if (filename === "valid-mask.png") {
+                await new Promise((resolve) => setTimeout(resolve, 520));
+                await route.fulfill({ status: 200, contentType: "image/svg+xml", body: maskSvg });
+                return;
+            }
+            if (filename === "broken-mask.png") {
+                await route.fulfill({ status: 200, contentType: "image/png", body: "not-an-image" });
+                return;
+            }
+            await route.continue();
+        });
+    });
+    const openEditor = async () => {
+        await page.getByRole("button", { name: "涂抹局部" }).click();
+        await page.waitForSelector(".webui-bridge-image-editor-panel");
+    };
+    const closeEditor = async () => {
+        await page.locator(".webui-bridge-image-editor-panel .webui-bridge-config-head button").click();
+        await page.waitForSelector(".webui-bridge-image-editor-panel", { state: "detached" });
+    };
+    const setMask = async (value) => {
+        await page.evaluate((maskValue) => {
+            const node = window.app.graph.getNodeById(950023);
+            const widget = node?.widgets?.find((item) => item.name === "mask");
+            if (!widget) throw new Error("Image input mask widget is missing");
+            widget.value = maskValue;
+            node.__webuiBridgeImageInputPanel?.__webuiBridgeRender?.();
+        }, value);
+    };
+    try {
+        await page.evaluate(() => {
+            window.app.graph.clear();
+            const node = window.LiteGraph.createNode("WebUIPromptBridgeImageInput");
+            node.id = 950023;
+            node.pos = [80, 60];
+            const imageWidget = node.widgets?.find((item) => item.name === "image");
+            const maskWidget = node.widgets?.find((item) => item.name === "mask");
+            if (!imageWidget || !maskWidget) throw new Error("Image input widgets are missing");
+            imageWidget.value = "webui_prompt_bridge/large.png";
+            maskWidget.value = "";
+            window.app.graph.add(node);
+            node.__webuiBridgeImageInputPanel?.__webuiBridgeRender?.();
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForSelector(".webui-bridge-image-input-panel", { timeout: 20000 });
+
+        await openEditor();
+        assert(await page.getByRole("button", { name: "保存 Mask" }).isDisabled(), "Mask save was enabled before the base image loaded");
+        await page.waitForFunction(() => /按住拖动涂抹/.test(document.querySelector(".webui-bridge-image-editor-panel .webui-bridge-image-input-status")?.textContent || ""));
+        const canvasMetrics = await page.evaluate(() => {
+            const panel = document.querySelector(".webui-bridge-image-editor-panel");
+            const canvases = [...panel.querySelectorAll("canvas")];
+            const save = [...panel.querySelectorAll("button")].find((button) => button.textContent?.includes("保存 Mask"));
+            return {
+                canvases: canvases.map((canvas) => ({ width: canvas.width, height: canvas.height, pixels: canvas.width * canvas.height })),
+                saveDisabled: Boolean(save?.disabled),
+                status: panel.querySelector(".webui-bridge-image-input-status")?.textContent || "",
+            };
+        });
+        assert(canvasMetrics.canvases.length === 2, "Mask editor canvases were not created", canvasMetrics);
+        assert(canvasMetrics.canvases.every((canvas) => canvas.width <= 4096 && canvas.height <= 4096 && canvas.pixels <= 8_000_000),
+            "Mask editor exceeded its canvas budget", canvasMetrics);
+        assert(!canvasMetrics.saveDisabled, "Mask save did not enable after the base image loaded", canvasMetrics);
+        await closeEditor();
+
+        await setMask("webui_prompt_bridge/valid-mask.png");
+        await openEditor();
+        await page.waitForFunction(() => /载入已有 Mask/.test(document.querySelector(".webui-bridge-image-editor-panel .webui-bridge-image-input-status")?.textContent || ""));
+        assert(await page.getByRole("button", { name: "保存 Mask" }).isDisabled(), "Mask save enabled before the existing mask loaded");
+        await page.waitForFunction(() => /按住拖动涂抹/.test(document.querySelector(".webui-bridge-image-editor-panel .webui-bridge-image-input-status")?.textContent || ""));
+        assert(!(await page.getByRole("button", { name: "保存 Mask" }).isDisabled()), "Mask save stayed disabled after the existing mask loaded");
+        await closeEditor();
+
+        await setMask("webui_prompt_bridge/broken-mask.png");
+        await openEditor();
+        await page.waitForFunction(() => /已有 Mask 载入失败/.test(document.querySelector(".webui-bridge-image-editor-panel .webui-bridge-image-input-status")?.textContent || ""));
+        const failedMask = await page.evaluate(() => {
+            const panel = document.querySelector(".webui-bridge-image-editor-panel");
+            const save = [...panel.querySelectorAll("button")].find((button) => button.textContent?.includes("保存 Mask"));
+            return {
+                saveDisabled: Boolean(save?.disabled),
+                status: panel.querySelector(".webui-bridge-image-input-status")?.textContent || "",
+            };
+        });
+        assert(failedMask.saveDisabled, "Mask save enabled after the existing mask failed to load", failedMask);
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(!bridgeConsoleErrors.length, "Mask editor guard checks emitted console errors", bridgeConsoleErrors);
+        return { canvasMetrics, failedMask, bridgeConsoleErrors: bridgeConsoleErrors.length };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifyCompactSidebarTabsAndLowZoomSummary(browser, baseUrl) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1280, height: 900 }, async (newPage) => {
+        await newPage.route("**/*", async (route) => {
+            const requestUrl = new URL(route.request().url());
+            if (!requestUrl.pathname.endsWith("/webui_prompt_bridge/settings") || route.request().method() !== "GET") {
+                await route.continue();
+                return;
+            }
+            await route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({
+                    settings: {
+                        data_source: "auto",
+                        translation_source: "auto",
+                        tag_translation_source: "auto",
+                        show_startup_wizard: false,
+                        layout_preset: "compact",
+                        tag_display: "local_first",
+                        lora_card_size: "compact",
+                        node_tutorial_popup: "off",
+                        ui_visibility: {
+                            model_switch: true,
+                            generation_controls: true,
+                            regional_control: true,
+                            size_controls: true,
+                            layout_presets: true,
+                            prompt_tools: true,
+                            styles: true,
+                            lora_browser: true,
+                            module_img2img: true,
+                            module_controlnet: true,
+                        },
+                    },
+                    custom_tag_count: 0,
+                    assets: null,
+                    module_assets: null,
+                }),
+            });
+        });
+    });
+    try {
+        await page.evaluate(() => {
+            localStorage.removeItem("webui-bridge-sidebar-active-tab-v1");
+            window.app.graph.clear();
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            bridge.id = 950024;
+            bridge.pos = [60, 40];
+            window.app.graph.add(bridge);
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.ds.offset = [20, 20];
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForFunction(() => document.querySelector(".webui-bridge-panel")?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
+        await page.waitForTimeout(700);
+        const initial = await page.evaluate(() => {
+            const bridge = window.app.graph.getNodeById(950024);
+            const panel = document.querySelector(".webui-bridge-panel");
+            const tabs = [...panel.querySelectorAll(".webui-bridge-sidebar-tab")];
+            return {
+                nodeSize: Array.from(bridge?.size || []),
+                tabs: tabs.map((tab) => tab.textContent?.trim()),
+                activeTab: tabs.find((tab) => tab.getAttribute("aria-selected") === "true")?.textContent?.trim() || "",
+                activePanels: panel.querySelectorAll(".webui-bridge-sidebar-panel.active:not([hidden])").length,
+                layoutToolsOpen: Boolean(panel.querySelector(".webui-bridge-sidebar-layout-tools")?.open),
+                layoutCompact: panel.classList.contains("layout-compact"),
+                panelClass: panel.className,
+            };
+        });
+        assert(initial.layoutCompact, "Fresh Bridge did not apply the compact default", initial);
+        assert(initial.nodeSize[0] <= 940 && initial.nodeSize[1] <= 700, "Compact default did not reduce the fresh node size", initial);
+        assert(JSON.stringify(initial.tabs) === JSON.stringify(["模型", "生成", "图生图", "模块"]), "Sidebar tabs are missing or out of order", initial);
+        assert(initial.activeTab === "模型" && initial.activePanels === 1, "Sidebar did not start on a single model tab", initial);
+        assert(!initial.layoutToolsOpen, "Layout tools should start collapsed", initial);
+
+        await page.getByRole("tab", { name: "生成" }).click();
+        const generation = await page.evaluate(() => ({
+            active: document.querySelector('.webui-bridge-sidebar-tab[aria-selected="true"]')?.textContent?.trim() || "",
+            generationVisible: Boolean(document.querySelector('.webui-bridge-sidebar-panel.active .webui-bridge-generation-section')),
+            stored: localStorage.getItem("webui-bridge-sidebar-active-tab-v1"),
+        }));
+        assert(generation.active === "生成" && generation.generationVisible && generation.stored === "generation", "Generation sidebar tab did not activate or persist", generation);
+
+        await page.getByRole("tab", { name: "图生图" }).click();
+        const imageTab = await page.evaluate(() => ({
+            active: document.querySelector('.webui-bridge-sidebar-tab[aria-selected="true"]')?.textContent?.trim() || "",
+            imagePanelVisible: Boolean(document.querySelector('.webui-bridge-sidebar-panel.active .webui-bridge-image-input-panel')),
+            stored: localStorage.getItem("webui-bridge-sidebar-active-tab-v1"),
+        }));
+        assert(imageTab.active === "图生图" && imageTab.imagePanelVisible && imageTab.stored === "image", "Image sidebar tab did not expose the image input panel", imageTab);
+
+        await page.evaluate(() => {
+            window.app.canvas.ds.scale = 0.55;
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForFunction(() => document.querySelector(".webui-bridge-panel")?.classList.contains("zoom-summary-mode"));
+        const lowZoom = await page.evaluate(() => {
+            const panel = document.querySelector(".webui-bridge-panel");
+            const overlay = document.querySelector(".webui-bridge-slot-label-overlay");
+            const summary = panel?.querySelector(".webui-bridge-zoom-summary");
+            return {
+                summaryText: summary?.textContent?.replace(/\s+/g, " ").trim() || "",
+                summaryVisible: summary ? getComputedStyle(summary).display !== "none" : false,
+                detailsHidden: panel?.querySelector(".webui-bridge-top-controls") ? getComputedStyle(panel.querySelector(".webui-bridge-top-controls")).visibility === "hidden" : false,
+                overlayHidden: !overlay || getComputedStyle(overlay).display === "none",
+                nodeSize: Array.from(window.app.graph.getNodeById(950024)?.size || []),
+            };
+        });
+        assert(lowZoom.summaryVisible && /WebUI Prompt Bridge/.test(lowZoom.summaryText), "Low-zoom summary did not render", lowZoom);
+        assert(/正向\s+\d+/.test(lowZoom.summaryText) && /LoRA\s+\d+/.test(lowZoom.summaryText), "Low-zoom summary omitted prompt metrics", lowZoom);
+        assert(lowZoom.detailsHidden && lowZoom.overlayHidden, "Low-zoom mode did not suppress detailed controls and port labels", lowZoom);
+        assert(lowZoom.nodeSize[0] <= 920 && lowZoom.nodeSize[1] <= 320, "Low zoom did not temporarily compact the Bridge node", { initial, lowZoom });
+
+        const serializedLowZoom = await page.evaluate(() => {
+            const bridge = window.app.graph.getNodeById(950024);
+            const data = { widgets_values: [] };
+            bridge.onSerialize?.(data);
+            return { size: data.size, liveSize: Array.from(bridge.size || []) };
+        });
+        assert(JSON.stringify(serializedLowZoom.size) === JSON.stringify(initial.nodeSize), "Low-zoom save did not serialize the original Bridge size", { initial, serializedLowZoom });
+        assert(serializedLowZoom.liveSize[0] <= 920 && serializedLowZoom.liveSize[1] <= 320, "Serialization changed the temporary summary size", serializedLowZoom);
+
+        await page.evaluate(() => {
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForFunction(() => !document.querySelector(".webui-bridge-panel")?.classList.contains("zoom-summary-mode"));
+        const restored = await page.evaluate(() => ({
+            active: document.querySelector('.webui-bridge-sidebar-tab[aria-selected="true"]')?.textContent?.trim() || "",
+            detailedVisibility: getComputedStyle(document.querySelector(".webui-bridge-top-controls")).visibility,
+            nodeSize: Array.from(window.app.graph.getNodeById(950024)?.size || []),
+        }));
+        assert(restored.active === "图生图" && restored.detailedVisibility === "visible", "Normal zoom did not restore the detailed UI and active tab", restored);
+        assert(JSON.stringify(restored.nodeSize) === JSON.stringify(initial.nodeSize), "Normal zoom did not restore the exact original Bridge size", { initial, restored });
+
+        const thresholdCycles = await page.evaluate(async () => {
+            const bridge = window.app.graph.getNodeById(950024);
+            const sizes = [];
+            for (const scale of [0.67, 0.69, 0.32, 1, 0.55, 1]) {
+                window.app.canvas.ds.scale = scale;
+                window.app.canvas.setDirty(true, true);
+                await new Promise((resolve) => setTimeout(resolve, 100));
+                sizes.push({ scale, size: Array.from(bridge.size || []) });
+            }
+            return sizes;
+        });
+        for (const entry of thresholdCycles) {
+            if (entry.scale < 0.68) {
+                assert(entry.size[0] <= 920 && entry.size[1] <= 320, "Repeated threshold crossing did not keep the summary compact", thresholdCycles);
+            } else {
+                assert(JSON.stringify(entry.size) === JSON.stringify(initial.nodeSize), "Repeated threshold crossing lost the original size", { initial, thresholdCycles });
+            }
+        }
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(!bridgeConsoleErrors.length, "UI optimization checks emitted Bridge console errors", bridgeConsoleErrors);
+        return { initial, generation, imageTab, lowZoom, serializedLowZoom, restored, thresholdCycles, bridgeConsoleErrors: bridgeConsoleErrors.length };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifyExactPromptTagToggle(browser, baseUrl) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1200, height: 900 }, async (newPage) => {
+        await newPage.route("**/webui_prompt_bridge/prompt_all_in_one?lang=zh_CN", async (route) => {
+            await route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({
+                    group_tags: [{
+                        name: "Regression",
+                        tabKey: "regression",
+                        type: "tags",
+                        groups: [{
+                            name: "Exact tags",
+                            tabKey: "regression-exact",
+                            type: "tags",
+                            color: "",
+                            tags: [{ prompt: "girl", local: "女孩" }],
+                        }],
+                    }],
+                    favorites: { positive: [], negative: [] },
+                }),
+            });
+        });
+    });
+    try {
+        await page.evaluate(() => {
+            window.app.graph.clear();
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            bridge.id = 950021;
+            bridge.pos = [60, 40];
+            window.app.graph.add(bridge);
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForFunction(() => document.querySelector(".webui-bridge-panel")?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
+        await page.waitForSelector('.webui-bridge-aio-tag[data-prompt="girl"]', { timeout: 20000 });
+        const values = await page.evaluate(async () => {
+            const textarea = document.querySelector(".webui-bridge-positive-prompt-row textarea");
+            textarea.value = "1girl, solo";
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+            await new Promise((resolve) => setTimeout(resolve, 80));
+            document.querySelector('.webui-bridge-aio-tag[data-prompt="girl"]')?.click();
+            await new Promise((resolve) => setTimeout(resolve, 120));
+            const afterAdd = textarea.value;
+            document.querySelector('.webui-bridge-aio-tag[data-prompt="girl"]')?.click();
+            await new Promise((resolve) => setTimeout(resolve, 120));
+            return { afterAdd, afterRemove: textarea.value };
+        });
+        assert(values.afterAdd === "1girl, solo, girl", "Adding girl corrupted or failed to preserve 1girl", values);
+        assert(values.afterRemove === "1girl, solo", "Removing girl did not use exact tag matching", values);
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(!bridgeConsoleErrors.length, "Exact prompt tag toggle emitted console errors", bridgeConsoleErrors);
+        return { ...values, bridgeConsoleErrors: bridgeConsoleErrors.length };
+    } finally {
+        await context.close();
+    }
+}
+
 async function verifyFullNegativeCollapseReclaimsLoraSpace(browser, baseUrl, workflow) {
     const consoleMessages = [];
     const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1900, height: 1500 });
@@ -840,6 +1305,17 @@ async function verifyFullNegativeCollapseReclaimsLoraSpace(browser, baseUrl, wor
         assert((after.layoutState?.extra_height || 0) >= (before.layoutState?.extra_height || 0) + 240,
             "LoRA section did not reclaim the space released by collapsing negative prompt", { before, after });
         assert(after.extraMaxHeight === 520, "LoRA inline max marker changed unexpectedly", { before, after });
+        await dragElementCenter(page, ".webui-bridge-panel-splitter", 260);
+        await page.waitForTimeout(3200);
+        const afterManualDrag = await bridgeBottomBlankMetrics(page, "after manual prompt/lora split drag");
+        assert(afterManualDrag.negativeCollapsed,
+            "Negative prompt unexpectedly expanded after manually dragging the Prompt/LoRA splitter", { after, afterManualDrag });
+        assert((afterManualDrag.topRow?.height || 0) >= (after.topRow?.height || 0) + 120,
+            "Manual Prompt/LoRA splitter drag was pulled back after negative prompt collapse", { after, afterManualDrag });
+        assert((afterManualDrag.extra?.height || 0) <= (after.extra?.height || 0) - 120,
+            "LoRA section did not stay lower after manual splitter drag", { after, afterManualDrag });
+        assert(afterManualDrag.blankBelowExtra !== null && afterManualDrag.blankBelowExtra <= 48,
+            "Manual splitter drag left a large blank below LoRA after negative prompt collapse", { after, afterManualDrag });
         const bridgeConsoleErrors = consoleMessages.filter((message) =>
             ["error", "pageerror"].includes(message.type) &&
             /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
@@ -850,6 +1326,8 @@ async function verifyFullNegativeCollapseReclaimsLoraSpace(browser, baseUrl, wor
             afterBlankBelowExtra: Math.round(after.blankBelowExtra),
             beforeExtraHeight: before.layoutState?.extra_height,
             afterExtraHeight: after.layoutState?.extra_height,
+            manualDragTopRowHeight: afterManualDrag.topRow?.height,
+            manualDragExtraHeight: afterManualDrag.extra?.height,
             bridgeConsoleErrors: bridgeConsoleErrors.length,
         };
     } finally {
@@ -2670,8 +3148,8 @@ async function verifySerializedBridgeLayoutStateOverridesStaleLocalBooleans(brow
             "Serialized LoRA collapse state was not written back to localStorage", report);
         assert(report.restored.local.sidebarCollapsed === "0",
             "Serialized sidebar collapse state was not written back to localStorage", report);
-        assert(report.restored.topRow?.height >= 760,
-            "Serialized tall prompt layout was not restored over stale localStorage", report);
+        assert(Math.abs((report.restored.topRow?.height || 0) - (report.primed.topRow?.height || 0)) <= 2,
+            "Serialized prompt layout was not restored over stale localStorage", report);
         const bridgeConsoleErrors = consoleMessages.filter((message) =>
             ["error", "pageerror"].includes(message.type) &&
             /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
@@ -2807,13 +3285,22 @@ async function main() {
     const browser = await chromium.launch({ headless: !options.headed });
     const workflow = await loadWorkflow();
     try {
-        const results = {
+        const results = options.focusedFixes ? {
+            startupWizardRequiresLoadedConfiguration: await verifyStartupWizardRequiresLoadedConfiguration(browser, options.baseUrl),
+            maskEditorLoadGuardsAndCanvasBudget: await verifyMaskEditorLoadGuardsAndCanvasBudget(browser, options.baseUrl),
+            compactSidebarTabsAndLowZoomSummary: await verifyCompactSidebarTabsAndLowZoomSummary(browser, options.baseUrl),
+        } : {
             bridgeEventFix: await verifyBridgeDoesNotCancelCanvasWidgets(browser, options.baseUrl),
             commonWidgetCompatibility: await verifyCommonWidgetCompatibility(browser, options.baseUrl),
             fullWorkflowSwitches: await verifyFullWorkflowSwitches(browser, options.baseUrl, workflow),
             currentWorkflowLayoutIdempotency: await verifyCurrentWorkflowLayoutIdempotency(browser, options.baseUrl, workflow),
             customWorkflowLayoutPreserved: await verifyCustomWorkflowLayoutPreserved(browser, options.baseUrl, workflow),
             bridgeUiErgonomics: await verifyBridgeUiErgonomics(browser, options.baseUrl, workflow),
+            bridgeImageInputPanelErgonomics: await verifyBridgeImageInputPanelErgonomics(browser, options.baseUrl),
+            startupWizardRequiresLoadedConfiguration: await verifyStartupWizardRequiresLoadedConfiguration(browser, options.baseUrl),
+            maskEditorLoadGuardsAndCanvasBudget: await verifyMaskEditorLoadGuardsAndCanvasBudget(browser, options.baseUrl),
+            compactSidebarTabsAndLowZoomSummary: await verifyCompactSidebarTabsAndLowZoomSummary(browser, options.baseUrl),
+            exactPromptTagToggle: await verifyExactPromptTagToggle(browser, options.baseUrl),
             fullNegativeCollapseReclaimsLoraSpace: await verifyFullNegativeCollapseReclaimsLoraSpace(browser, options.baseUrl, workflow),
             sectionResizeBlankRecovery: await verifySectionResizeBlankRecovery(browser, options.baseUrl, workflow),
             restoreSizeStability: await verifyRestoreSizeStability(browser, options.baseUrl, workflow),
