@@ -1133,7 +1133,7 @@ async function verifyCompactSidebarTabsAndLowZoomSummary(browser, baseUrl) {
         assert(lowZoom.summaryVisible && /WebUI Prompt Bridge/.test(lowZoom.summaryText), "Low-zoom summary did not render", lowZoom);
         assert(/正向\s+\d+/.test(lowZoom.summaryText) && /LoRA\s+\d+/.test(lowZoom.summaryText), "Low-zoom summary omitted prompt metrics", lowZoom);
         assert(lowZoom.detailsHidden && lowZoom.overlayHidden, "Low-zoom mode did not suppress detailed controls and port labels", lowZoom);
-        assert(lowZoom.nodeSize[0] <= 920 && lowZoom.nodeSize[1] <= 320, "Low zoom did not temporarily compact the Bridge node", { initial, lowZoom });
+        assert(JSON.stringify(lowZoom.nodeSize) === JSON.stringify(initial.nodeSize), "Low-zoom summary mutated the Bridge node size", { initial, lowZoom });
 
         const serializedLowZoom = await page.evaluate(() => {
             const bridge = window.app.graph.getNodeById(950024);
@@ -1142,7 +1142,7 @@ async function verifyCompactSidebarTabsAndLowZoomSummary(browser, baseUrl) {
             return { size: data.size, liveSize: Array.from(bridge.size || []) };
         });
         assert(JSON.stringify(serializedLowZoom.size) === JSON.stringify(initial.nodeSize), "Low-zoom save did not serialize the original Bridge size", { initial, serializedLowZoom });
-        assert(serializedLowZoom.liveSize[0] <= 920 && serializedLowZoom.liveSize[1] <= 320, "Serialization changed the temporary summary size", serializedLowZoom);
+        assert(JSON.stringify(serializedLowZoom.liveSize) === JSON.stringify(initial.nodeSize), "Low-zoom serialization mutated the live Bridge size", { initial, serializedLowZoom });
 
         await page.evaluate(() => {
             window.app.canvas.ds.scale = 1;
@@ -1169,11 +1169,7 @@ async function verifyCompactSidebarTabsAndLowZoomSummary(browser, baseUrl) {
             return sizes;
         });
         for (const entry of thresholdCycles) {
-            if (entry.scale < 0.68) {
-                assert(entry.size[0] <= 920 && entry.size[1] <= 320, "Repeated threshold crossing did not keep the summary compact", thresholdCycles);
-            } else {
-                assert(JSON.stringify(entry.size) === JSON.stringify(initial.nodeSize), "Repeated threshold crossing lost the original size", { initial, thresholdCycles });
-            }
+            assert(JSON.stringify(entry.size) === JSON.stringify(initial.nodeSize), "Repeated threshold crossing mutated the Bridge size", { initial, thresholdCycles });
         }
         const bridgeConsoleErrors = consoleMessages.filter((message) =>
             ["error", "pageerror"].includes(message.type) &&

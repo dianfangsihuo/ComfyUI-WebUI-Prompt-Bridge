@@ -109,8 +109,6 @@ const WORD_DELIMITERS = ",;，；、\n\r\t";
 const DEFAULT_PANEL_WIDTH = 1180;
 const DEFAULT_PANEL_HEIGHT = 1180;
 const BRIDGE_LOW_ZOOM_THRESHOLD = 0.68;
-const BRIDGE_LOW_ZOOM_MAX_WIDTH = 920;
-const BRIDGE_LOW_ZOOM_MAX_HEIGHT = 320;
 const ACTION_SIDEBAR_DEFAULT_WIDTH = 400;
 const ACTION_SIDEBAR_MIN_WIDTH = 300;
 const ACTION_SIDEBAR_MAX_WIDTH = 560;
@@ -1526,7 +1524,6 @@ function installBridgeSlotLabelOverlay(node) {
         const scale = canvas?.ds?.scale || 1;
         const lowZoom = scale < BRIDGE_LOW_ZOOM_THRESHOLD;
         const bridgePanel = node.__webuiBridgePanel;
-        setBridgeLowZoomState(node, lowZoom);
         if (bridgePanel?.__webuiBridgeLowZoom !== lowZoom) {
             bridgePanel.__webuiBridgeLowZoom = lowZoom;
             bridgePanel.classList.toggle("zoom-summary-mode", lowZoom);
@@ -2407,50 +2404,6 @@ function canvasBlob(canvas, filename = "mask.png") {
             resolve(new File([blob], filename, { type: "image/png" }));
         }, "image/png");
     });
-}
-
-function bridgeAuthoritativePanelSize(node) {
-    if (node?.__webuiBridgeLowZoomActive && looksLikeSavedUserBridgePanelSize(node.__webuiBridgeLowZoomOriginalSize)) {
-        return normalizeBridgePanelSize(node.__webuiBridgeLowZoomOriginalSize);
-    }
-    return resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
-}
-
-function setBridgeLowZoomState(node, lowZoom) {
-    if (!node || typeof node.setSize !== "function") return;
-    if (lowZoom) {
-        if (!node.__webuiBridgeLowZoomActive) {
-            node.__webuiBridgeLowZoomOriginalSize = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
-            node.__webuiBridgeLowZoomActive = true;
-        }
-        const original = normalizeBridgePanelSize(node.__webuiBridgeLowZoomOriginalSize);
-        const summarySize = [
-            Math.max(PANEL_BROKEN_MIN_WIDTH, Math.min(original[0], BRIDGE_LOW_ZOOM_MAX_WIDTH)),
-            Math.max(PANEL_BROKEN_MIN_HEIGHT, Math.min(original[1], BRIDGE_LOW_ZOOM_MAX_HEIGHT)),
-        ];
-        if (!bridgePanelSizesMatch(node.size, summarySize, 1)) {
-            node.__webuiBridgeApplyingLowZoomSize = true;
-            try {
-                node.setSize(summarySize);
-            } finally {
-                node.__webuiBridgeApplyingLowZoomSize = false;
-            }
-        }
-        return;
-    }
-    if (!node.__webuiBridgeLowZoomActive) return;
-    const original = normalizeBridgePanelSize(node.__webuiBridgeLowZoomOriginalSize);
-    node.__webuiBridgeLowZoomActive = false;
-    node.__webuiBridgeLowZoomOriginalSize = null;
-    node.__webuiBridgeDesiredSize = [...original];
-    node.__webuiBridgeSavedPanelSize = [...original];
-    node.__webuiBridgeRepairedPanelSizeUntil = (performance?.now?.() || Date.now()) + 1200;
-    node.__webuiBridgeApplyingLowZoomSize = true;
-    try {
-        node.setSize(original);
-    } finally {
-        node.__webuiBridgeApplyingLowZoomSize = false;
-    }
 }
 
 const MASK_EDITOR_MAX_CANVAS_SIDE = 4096;
@@ -14339,25 +14292,6 @@ function installWebUIPanel(node) {
         const originalSetSize = node.setSize.bind(node);
         node.setSize = function (size) {
             if (Array.isArray(size) && Number.isFinite(size[0]) && Number.isFinite(size[1])) {
-                if (node.__webuiBridgeApplyingLowZoomSize ||
-                    (node.__webuiBridgeLowZoomActive && !node.__webuiBridgeSetSizeIsUser)) {
-                    const lowZoomOriginal = normalizeBridgePanelSize(node.__webuiBridgeLowZoomOriginalSize);
-                    const requestedSize = node.__webuiBridgeApplyingLowZoomSize
-                        ? size
-                        : [
-                            Math.min(lowZoomOriginal[0], BRIDGE_LOW_ZOOM_MAX_WIDTH),
-                            Math.min(lowZoomOriginal[1], BRIDGE_LOW_ZOOM_MAX_HEIGHT),
-                        ];
-                    const transientSize = [
-                        Math.max(PANEL_BROKEN_MIN_WIDTH, Math.min(BRIDGE_LOW_ZOOM_MAX_WIDTH, Math.round(requestedSize[0]))),
-                        Math.max(PANEL_BROKEN_MIN_HEIGHT, Math.min(BRIDGE_LOW_ZOOM_MAX_HEIGHT, Math.round(requestedSize[1]))),
-                    ];
-                    node.size = [...transientSize];
-                    const result = originalSetSize(transientSize);
-                    if (!bridgePanelSizesMatch(node.size, transientSize, 1)) node.size = [...transientSize];
-                    node.__webuiBridgeApplyDomWidgetSize?.(transientSize[0], transientSize[1]);
-                    return result;
-                }
                 const requestedNeedsRepair = shouldRepairBridgePanelSize(size);
                 const currentWidth = Math.round(Number(node.size?.[0] || 0));
                 const currentHeight = Math.round(Number(node.size?.[1] || 0));
@@ -14449,7 +14383,7 @@ function installWebUIPanel(node) {
         chainCallback(node, "onSerialize", function (data) {
             if (!data || !Array.isArray(data.widgets_values)) return;
             repairBridgeNodeWidgetDefaults(node);
-            const desired = bridgeAuthoritativePanelSize(node);
+            const desired = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
             const layoutState = normalizeBridgeLayoutState(
                 node.__webuiBridgePanel?.__webuiBridgeGetLayoutState?.() ||
                 node.__webuiBridgeConfiguredLayoutState,
