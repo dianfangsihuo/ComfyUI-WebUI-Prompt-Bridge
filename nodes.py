@@ -8,6 +8,7 @@ import html
 import io
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -47,6 +48,9 @@ MAX_IMAGE_FRAME_PIXELS = 40_000_000
 MAX_IMAGE_TOTAL_PIXELS = 80_000_000
 MAX_IMAGE_FRAMES = 32
 MAX_AI_RESPONSE_BYTES = 4 * 1024 * 1024
+DEFAULT_ZOOM_SUMMARY_THRESHOLD = 0.5
+MIN_ZOOM_SUMMARY_THRESHOLD = 0.0
+MAX_ZOOM_SUMMARY_THRESHOLD = 1.0
 _DPAPI_SECRET_PREFIX = "dpapi:"
 _TAG_AUTOCOMPLETE_CACHE = None
 _LORA_METADATA_CACHE = {}
@@ -80,6 +84,7 @@ DEFAULT_BRIDGE_SETTINGS = {
     "tag_display": "local_first",
     "lora_card_size": "normal",
     "node_tutorial_popup": "first_time",
+    "zoom_summary_threshold": DEFAULT_ZOOM_SUMMARY_THRESHOLD,
     "ui_visibility": {},
 }
 UI_VISIBILITY_DEFAULTS = {
@@ -707,6 +712,23 @@ def _load_local_config():
     return {}
 
 
+def _normalize_zoom_summary_threshold(value, fallback=DEFAULT_ZOOM_SUMMARY_THRESHOLD):
+    try:
+        fallback_number = float(fallback)
+    except (TypeError, ValueError):
+        fallback_number = DEFAULT_ZOOM_SUMMARY_THRESHOLD
+    if not math.isfinite(fallback_number):
+        fallback_number = DEFAULT_ZOOM_SUMMARY_THRESHOLD
+    fallback_number = min(MAX_ZOOM_SUMMARY_THRESHOLD, max(MIN_ZOOM_SUMMARY_THRESHOLD, fallback_number))
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return round(fallback_number, 2)
+    if not math.isfinite(number):
+        return round(fallback_number, 2)
+    return round(min(MAX_ZOOM_SUMMARY_THRESHOLD, max(MIN_ZOOM_SUMMARY_THRESHOLD, number)), 2)
+
+
 def _bridge_settings():
     raw = LOCAL_CONFIG.get("settings") if isinstance(LOCAL_CONFIG, dict) else {}
     settings = dict(DEFAULT_BRIDGE_SETTINGS)
@@ -717,6 +739,8 @@ def _bridge_settings():
                 continue
             if key == "show_startup_wizard":
                 settings[key] = bool(value)
+            elif key == "zoom_summary_threshold":
+                settings[key] = _normalize_zoom_summary_threshold(value, settings[key])
             elif key == "ui_visibility" and isinstance(value, dict):
                 visibility = dict(UI_VISIBILITY_DEFAULTS)
                 for visibility_key, default in UI_VISIBILITY_DEFAULTS.items():
@@ -1097,16 +1121,18 @@ def _apply_configured_model_paths():
 
 def _apply_local_config(config):
     global LOCAL_CONFIG, WEBUI_ROOT, PROMPT_ALL_IN_ONE_DIR, TAGCOMPLETE_DIR, WEBUI_PYTHON_SITE_PACKAGES, STORAGE_DIR, STYLES_FILE
-    global _TAG_AUTOCOMPLETE_CACHE, _LORA_METADATA_CACHE, _LORA_RAW_METADATA_CACHE, _LORA_HASH_CACHE, _LORA_LINK_ALIAS_CACHE, _TRANSLATION_MAP_CACHE, _NETWORK_TRANSLATE_CACHE
+    global _TAG_AUTOCOMPLETE_CACHE, _TAG_TRANSLATION_MAP_CACHE, _LORA_METADATA_CACHE, _LORA_RAW_METADATA_CACHE, _LORA_HASH_CACHE, _LORA_LINK_ALIAS_CACHE, _TRANSLATION_MAP_CACHE, _NETWORK_TRANSLATE_CACHE
     LOCAL_CONFIG = config if isinstance(config, dict) else {}
     WEBUI_ROOT = _discover_webui_root()
-    PROMPT_ALL_IN_ONE_DIR = (
-        _configured_path("prompt_all_in_one_dir", "WEBUI_PROMPT_BRIDGE_PROMPT_ALL_IN_ONE_DIR")
-        or (WEBUI_ROOT / "extensions" / "sd-webui-prompt-all-in-one" if WEBUI_ROOT else DATA_DIR / "sd-webui-prompt-all-in-one")
+    PROMPT_ALL_IN_ONE_DIR = _resolve_extension_asset_dir(
+        "prompt_all_in_one_dir",
+        "WEBUI_PROMPT_BRIDGE_PROMPT_ALL_IN_ONE_DIR",
+        "prompt_all_in_one",
     )
-    TAGCOMPLETE_DIR = (
-        _configured_path("tagcomplete_dir", "WEBUI_PROMPT_BRIDGE_TAGCOMPLETE_DIR")
-        or (WEBUI_ROOT / "extensions" / "a1111-sd-webui-tagcomplete" if WEBUI_ROOT else DATA_DIR / "a1111-sd-webui-tagcomplete")
+    TAGCOMPLETE_DIR = _resolve_extension_asset_dir(
+        "tagcomplete_dir",
+        "WEBUI_PROMPT_BRIDGE_TAGCOMPLETE_DIR",
+        "tagcomplete",
     )
     WEBUI_PYTHON_SITE_PACKAGES = (
         _configured_path("webui_python_site_packages", "WEBUI_PROMPT_BRIDGE_WEBUI_SITE_PACKAGES")
@@ -1121,6 +1147,7 @@ def _apply_local_config(config):
         or (WEBUI_ROOT / "styles.csv" if WEBUI_ROOT else DATA_DIR / "styles.csv")
     )
     _TAG_AUTOCOMPLETE_CACHE = None
+    _TAG_TRANSLATION_MAP_CACHE = None
     _LORA_METADATA_CACHE.clear()
     _LORA_RAW_METADATA_CACHE.clear()
     _LORA_HASH_CACHE.clear()
@@ -1262,6 +1289,42 @@ def _configured_path(config_key, env_key):
     return _existing_path(value)
 
 
+def _extension_asset_data_ready(path, asset_key):
+    if not path:
+        return False
+    markers = {
+        "prompt_all_in_one": (
+            ("group_tags", "zh_CN.yaml"),
+            ("group_tags", "default.yaml"),
+        ),
+        "tagcomplete": (
+            ("tags", "danbooru.csv"),
+        ),
+    }
+    try:
+        return any(path.joinpath(*parts).is_file() for parts in markers.get(asset_key, ()))
+    except Exception:
+        return False
+
+
+def _resolve_extension_asset_dir(config_key, env_key, asset_key):
+    spec = EXTENSION_ASSETS[asset_key]
+    configured = _configured_path(config_key, env_key)
+    webui_path = WEBUI_ROOT / "extensions" / spec["directory"] if WEBUI_ROOT else None
+    local_path = DATA_DIR / spec["directory"]
+    candidates = [configured, webui_path, local_path]
+    for candidate in candidates:
+        if _extension_asset_data_ready(candidate, asset_key):
+            return candidate
+    for candidate in candidates:
+        try:
+            if candidate and candidate.is_dir():
+                return candidate
+        except Exception:
+            pass
+    return local_path
+
+
 def _discover_webui_root():
     configured = _configured_path("webui_root", "WEBUI_PROMPT_BRIDGE_WEBUI_ROOT")
     if configured:
@@ -1286,13 +1349,15 @@ def _discover_webui_root():
 
 
 WEBUI_ROOT = _discover_webui_root()
-PROMPT_ALL_IN_ONE_DIR = (
-    _configured_path("prompt_all_in_one_dir", "WEBUI_PROMPT_BRIDGE_PROMPT_ALL_IN_ONE_DIR")
-    or (WEBUI_ROOT / "extensions" / "sd-webui-prompt-all-in-one" if WEBUI_ROOT else DATA_DIR / "sd-webui-prompt-all-in-one")
+PROMPT_ALL_IN_ONE_DIR = _resolve_extension_asset_dir(
+    "prompt_all_in_one_dir",
+    "WEBUI_PROMPT_BRIDGE_PROMPT_ALL_IN_ONE_DIR",
+    "prompt_all_in_one",
 )
-TAGCOMPLETE_DIR = (
-    _configured_path("tagcomplete_dir", "WEBUI_PROMPT_BRIDGE_TAGCOMPLETE_DIR")
-    or (WEBUI_ROOT / "extensions" / "a1111-sd-webui-tagcomplete" if WEBUI_ROOT else DATA_DIR / "a1111-sd-webui-tagcomplete")
+TAGCOMPLETE_DIR = _resolve_extension_asset_dir(
+    "tagcomplete_dir",
+    "WEBUI_PROMPT_BRIDGE_TAGCOMPLETE_DIR",
+    "tagcomplete",
 )
 WEBUI_PYTHON_SITE_PACKAGES = (
     _configured_path("webui_python_site_packages", "WEBUI_PROMPT_BRIDGE_WEBUI_SITE_PACKAGES")
@@ -2982,6 +3047,50 @@ def _lora_basic_detail(lora_name):
     }
 
 
+def _same_local_path(left, right):
+    try:
+        return bool(left and right and left.resolve(strict=False) == right.resolve(strict=False))
+    except Exception:
+        return False
+
+
+def _prompt_asset_source(path, asset_key):
+    spec = EXTENSION_ASSETS[asset_key]
+    local_path = DATA_DIR / spec["directory"]
+    if _same_local_path(path, local_path):
+        return "local"
+    if WEBUI_ROOT and _same_local_path(path, WEBUI_ROOT / "extensions" / spec["directory"]):
+        return "webui"
+    return "custom"
+
+
+def _prompt_library_status():
+    use_external_data = _should_read_webui_data()
+    prompt_ready = use_external_data and _extension_asset_data_ready(PROMPT_ALL_IN_ONE_DIR, "prompt_all_in_one")
+    autocomplete_ready = use_external_data and _extension_asset_data_ready(TAGCOMPLETE_DIR, "tagcomplete")
+    builtin_ready = _should_use_builtin_prompt_data()
+    prompt_source = (
+        _prompt_asset_source(PROMPT_ALL_IN_ONE_DIR, "prompt_all_in_one")
+        if prompt_ready else "builtin" if builtin_ready else "unavailable"
+    )
+    autocomplete_source = (
+        _prompt_asset_source(TAGCOMPLETE_DIR, "tagcomplete")
+        if autocomplete_ready else "builtin" if prompt_ready or builtin_ready else "unavailable"
+    )
+    return {
+        "prompt": {
+            "source": prompt_source,
+            "ready": bool(prompt_ready or builtin_ready),
+            "path": _path_text(PROMPT_ALL_IN_ONE_DIR) if prompt_ready else "",
+        },
+        "autocomplete": {
+            "source": autocomplete_source,
+            "ready": bool(autocomplete_ready or prompt_ready or builtin_ready),
+            "path": _path_text(TAGCOMPLETE_DIR) if autocomplete_ready else "",
+        },
+    }
+
+
 def _settings_response():
     custom_tags = LOCAL_CONFIG.get("custom_tags") if isinstance(LOCAL_CONFIG, dict) else []
     return {
@@ -2989,6 +3098,7 @@ def _settings_response():
         "custom_tag_count": len(custom_tags) if isinstance(custom_tags, list) else 0,
         "config_path": _path_text(LOCAL_CONFIG_PATH),
         "webui_configured": bool(WEBUI_ROOT),
+        "prompt_library": _prompt_library_status(),
         "assets": _bridge_asset_status(),
         "module_assets": _module_asset_status(),
     }
@@ -3201,6 +3311,8 @@ def _update_bridge_settings(data):
         value = data.get(key)
         if key == "show_startup_wizard":
             current[key] = bool(value)
+        elif key == "zoom_summary_threshold":
+            current[key] = _normalize_zoom_summary_threshold(value, current[key])
         elif key == "ui_visibility" and isinstance(value, dict):
             visibility = {}
             for visibility_key, default in UI_VISIBILITY_DEFAULTS.items():
@@ -3588,6 +3700,20 @@ def _delete_custom_tag(index):
     _write_local_config(config)
     _apply_local_config(config)
     return _custom_tag_response()
+
+
+def _clear_custom_tags():
+    config = dict(LOCAL_CONFIG) if isinstance(LOCAL_CONFIG, dict) else {}
+    current = config.get("custom_tags")
+    removed = len(current) if isinstance(current, list) else 0
+    config["custom_tags"] = []
+    config["prompt_market_imports"] = {}
+    _write_local_config(config)
+    _apply_local_config(config)
+    return {
+        **_custom_tag_response(),
+        "removed": removed,
+    }
 
 
 def _update_custom_tag(index, item):
@@ -6000,6 +6126,9 @@ def _register_routes():
         if rejected is not None:
             return rejected
         try:
+            clear_all = str(request.query.get("all", "")).strip().casefold() in {"1", "true", "yes", "on"}
+            if clear_all:
+                return web.json_response(_clear_custom_tags())
             index = int(request.query.get("index", "-1"))
             return web.json_response(_delete_custom_tag(index))
         except Exception as exc:

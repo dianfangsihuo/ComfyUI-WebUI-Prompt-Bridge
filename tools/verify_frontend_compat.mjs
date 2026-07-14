@@ -502,6 +502,291 @@ async function verifyBridgeDoesNotCancelCanvasWidgets(browser, baseUrl) {
     }
 }
 
+async function verifyBridgeNodeDragCrossesDomPanel(browser, baseUrl) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1400, height: 1100 });
+    try {
+        await page.evaluate(() => {
+            window.app.graph.clear();
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            bridge.id = 950100;
+            bridge.pos = [140, 130];
+            window.app.graph.add(bridge);
+            window.app.canvas.ds.offset = [80, 80];
+            window.app.canvas.ds.scale = 0.55;
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForTimeout(2400);
+        const before = await page.evaluate(() => {
+            const bridge = window.app.graph.getNodeById(950100);
+            const panel = bridge?.__webuiBridgePanel;
+            if (!bridge || !panel?.isConnected) return null;
+            const rect = panel.getBoundingClientRect();
+            const scale = window.app.canvas.ds.scale || 1;
+            const titleHeight = (window.LiteGraph.NODE_TITLE_HEIGHT || 30) * scale;
+            const start = [
+                rect.left + Math.min(180, rect.width * 0.35),
+                rect.top - Math.max(6, titleHeight / 2),
+            ];
+            const target = document.elementFromPoint(start[0], start[1]);
+            return {
+                nodePos: Array.from(bridge.pos),
+                nodeSize: Array.from(bridge.size),
+                panel: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+                start,
+                startTarget: target ? `${target.tagName}.${String(target.className || "").replace(/\s+/g, ".")}` : null,
+            };
+        });
+        assert(before, "Bridge panel was not ready for the node drag check");
+        assert(/^CANVAS\b/.test(before.startTarget || ""), "Bridge title drag did not start on the ComfyUI canvas", before);
+        const intended = { x: 260, y: 140 };
+        await page.mouse.move(before.start[0], before.start[1]);
+        await page.mouse.down();
+        await page.mouse.move(before.start[0] + intended.x, before.start[1] + intended.y, { steps: 18 });
+        await page.mouse.up();
+        await page.waitForTimeout(700);
+        const after = await page.evaluate(() => {
+            const bridge = window.app.graph.getNodeById(950100);
+            const rect = bridge?.__webuiBridgePanel?.getBoundingClientRect?.();
+            return {
+                nodePos: Array.from(bridge?.pos || []),
+                nodeSize: Array.from(bridge?.size || []),
+                panel: rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null,
+            };
+        });
+        const moved = {
+            x: (after.panel?.left || 0) - before.panel.left,
+            y: (after.panel?.top || 0) - before.panel.top,
+        };
+        const settledRects = [];
+        for (let index = 0; index < 30; index += 1) {
+            await page.waitForTimeout(30);
+            settledRects.push(await page.evaluate(() => {
+                const rect = document.querySelector(".webui-bridge-panel")?.getBoundingClientRect?.();
+                return rect ? [rect.left, rect.top, rect.width, rect.height] : null;
+            }));
+        }
+        const validSettledRects = settledRects.filter(Boolean);
+        const settledSpans = [0, 1, 2, 3].map((axis) => {
+            const values = validSettledRects.map((item) => item[axis]);
+            return Math.max(...values) - Math.min(...values);
+        });
+        await screenshot(page, "compat-bridge-node-drag-crosses-dom-panel.png");
+        assert(Math.abs(moved.x - intended.x) <= 18 && Math.abs(moved.y - intended.y) <= 18,
+            "Bridge node drag stopped or jumped when the pointer crossed its DOM panel", { before, after, intended, moved });
+        assert(before.nodeSize.every((value, index) => Math.abs(value - after.nodeSize[index]) <= 1),
+            "Bridge node drag changed the node size", { before, after });
+        assert(validSettledRects.length === settledRects.length && settledSpans.every((span) => span <= 1),
+            "Bridge node kept moving or resizing after the drag ended", { settledSpans, settledRects });
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(bridgeConsoleErrors.length === 0, "WebUIPromptBridge reported console errors during node drag stability check", bridgeConsoleErrors);
+        return {
+            intended,
+            moved,
+            nodeSize: after.nodeSize,
+            settledSpans,
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
+        };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifyFreshBridgeStartsAtStablePresetSize(browser, baseUrl) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1400, height: 1100 });
+    try {
+        const immediate = await page.evaluate(() => {
+            window.app.graph.clear();
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            bridge.id = 950200;
+            bridge.pos = [120, 100];
+            window.app.graph.add(bridge);
+            window.app.canvas.ds.offset = [70, 70];
+            window.app.canvas.ds.scale = 0.62;
+            window.app.canvas.setDirty(true, true);
+            return {
+                size: Array.from(bridge.size),
+                desired: Array.from(bridge.__webuiBridgeDesiredSize || []),
+                preset: bridge.__webuiBridgeInitialLayoutPreset || null,
+            };
+        });
+        const samples = [];
+        for (let index = 0; index < 80; index += 1) {
+            await page.waitForTimeout(50);
+            samples.push(await page.evaluate(() => {
+                const bridge = window.app.graph.getNodeById(950200);
+                const panel = bridge?.__webuiBridgePanel;
+                const top = panel?.querySelector?.(".webui-bridge-toprow");
+                const extra = panel?.querySelector?.(".webui-bridge-extra");
+                const rect = (element) => {
+                    const value = element?.getBoundingClientRect?.();
+                    return value ? { width: value.width, height: value.height } : null;
+                };
+                const panelRect = panel?.getBoundingClientRect?.();
+                const extraRect = extra?.getBoundingClientRect?.();
+                const viewportScale = panelRect?.height && panel?.offsetHeight
+                    ? panelRect.height / panel.offsetHeight
+                    : 1;
+                return {
+                    size: Array.from(bridge?.size || []),
+                    desired: Array.from(bridge?.__webuiBridgeDesiredSize || []),
+                    preset: bridge?.__webuiBridgeInitialLayoutPreset || null,
+                    panel: rect(panel),
+                    top: rect(top),
+                    extra: rect(extra),
+                    blankBelowExtra: panelRect && extraRect
+                        ? (panelRect.bottom - extraRect.bottom) / viewportScale - 8
+                        : null,
+                };
+            }));
+        }
+        const final = samples[samples.length - 1];
+        const nodeSizes = [immediate, ...samples].map((item) => item.size.join("x"));
+        const uniqueNodeSizes = [...new Set(nodeSizes)];
+        const settled = samples.slice(-30);
+        const settledPanelWidths = settled.map((item) => item.panel?.width).filter(Number.isFinite);
+        const settledPanelHeights = settled.map((item) => item.panel?.height).filter(Number.isFinite);
+        const settledPanelSpan = {
+            width: Math.max(...settledPanelWidths) - Math.min(...settledPanelWidths),
+            height: Math.max(...settledPanelHeights) - Math.min(...settledPanelHeights),
+        };
+        const bottomGapSamples = samples.filter((item) => Number.isFinite(item.blankBelowExtra));
+        const maxBottomGap = Math.max(...bottomGapSamples.map((item) => item.blankBelowExtra));
+        await screenshot(page, "compat-fresh-bridge-stable-preset-size.png");
+        assert(immediate.size[0] === final.size[0] && immediate.size[1] === final.size[1],
+            "Fresh Bridge changed outer size after its saved layout preset loaded", { immediate, final, uniqueNodeSizes });
+        assert(uniqueNodeSizes.length === 1,
+            "Fresh Bridge outer size jumped during startup", { immediate, final, uniqueNodeSizes, samples });
+        assert(settledPanelWidths.length === settled.length && settledPanelHeights.length === settled.length &&
+            settledPanelSpan.width <= 1 && settledPanelSpan.height <= 1,
+            "Fresh Bridge panel kept resizing after startup", { settledPanelSpan, settled });
+        assert(bottomGapSamples.length && maxBottomGap <= 36,
+            "Fresh Bridge briefly exposed a large blank below the LoRA section", { maxBottomGap, bottomGapSamples });
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(bridgeConsoleErrors.length === 0, "WebUIPromptBridge reported console errors during fresh layout stability check", bridgeConsoleErrors);
+        return {
+            preset: final.preset,
+            size: final.size,
+            uniqueNodeSizes,
+            settledPanelSpan,
+            maxBottomGap,
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
+        };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifyNarrowBridgeWidthLayout(browser, baseUrl) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1400, height: 1100 });
+    try {
+        await page.evaluate(() => {
+            window.app.graph.clear();
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            bridge.id = 950300;
+            bridge.pos = [80, 80];
+            window.app.graph.add(bridge);
+            window.app.canvas.ds.offset = [60, 50];
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForTimeout(2400);
+        await page.evaluate(() => {
+            const bridge = window.app.graph.getNodeById(950300);
+            bridge.setSize([640, 900]);
+            const panel = bridge.__webuiBridgePanel;
+            const topRow = panel?.querySelector?.(".webui-bridge-toprow");
+            if (topRow && !topRow.classList.contains("action-collapsed")) {
+                panel.querySelector(".webui-bridge-side-toggle")?.click?.();
+            }
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForTimeout(1600);
+        const report = await page.evaluate(() => {
+            const bridge = window.app.graph.getNodeById(950300);
+            const panel = bridge?.__webuiBridgePanel;
+            const panelRect = panel?.getBoundingClientRect?.();
+            const elements = {
+                topControls: panel?.querySelector?.(".webui-bridge-top-controls"),
+                prompts: panel?.querySelector?.(".webui-bridge-prompts"),
+                extra: panel?.querySelector?.(".webui-bridge-extra"),
+                extraHead: panel?.querySelector?.(".webui-bridge-extra-head"),
+                networkControls: panel?.querySelector?.(".webui-bridge-network-controls"),
+                extraBody: panel?.querySelector?.(".webui-bridge-extra-body"),
+            };
+            const bounds = (element) => {
+                const rect = element?.getBoundingClientRect?.();
+                return rect ? { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width } : null;
+            };
+            const elementBounds = Object.fromEntries(Object.entries(elements).map(([key, element]) => [key, bounds(element)]));
+            const boundaryViolations = Object.entries(elementBounds).filter(([, rect]) => (
+                rect && panelRect && (rect.left < panelRect.left - 2 || rect.right > panelRect.right + 2)
+            )).map(([key]) => key);
+            const horizontalOverflow = Object.fromEntries(Object.entries(elements).map(([key, element]) => [
+                key,
+                element ? Math.max(0, element.scrollWidth - element.clientWidth) : null,
+            ]));
+            const tree = panel?.querySelector?.(".webui-bridge-network-tree")?.getBoundingClientRect?.();
+            const pane = panel?.querySelector?.(".webui-bridge-network-pane")?.getBoundingClientRect?.();
+            const widthInput = panel?.querySelector?.('.webui-bridge-size-field input[title="输入节点宽度"]');
+            return {
+                nodeSize: Array.from(bridge?.size || []),
+                desiredSize: Array.from(bridge?.__webuiBridgeDesiredSize || []),
+                panel: panelRect ? {
+                    width: panelRect.width,
+                    offsetWidth: panel.offsetWidth,
+                    clientWidth: panel.clientWidth,
+                    scrollWidth: panel.scrollWidth,
+                } : null,
+                widthInputMin: widthInput?.min || null,
+                actionCollapsed: panel?.querySelector?.(".webui-bridge-toprow")?.classList?.contains("action-collapsed") || false,
+                narrowContainerActive: Boolean(panel && panel.offsetWidth <= 620),
+                networkControlColumns: elements.networkControls ? getComputedStyle(elements.networkControls).gridTemplateColumns : null,
+                extraBodySingleColumn: Boolean(tree && pane && Math.abs(tree.left - pane.left) <= 2 && pane.top >= tree.bottom - 2),
+                boundaryViolations,
+                horizontalOverflow,
+                elementBounds,
+            };
+        });
+        await screenshot(page, "compat-narrow-bridge-640px.png");
+        assert(report.nodeSize[0] === 640 && report.desiredSize[0] === 640,
+            "Bridge did not accept the new 640px minimum width", report);
+        assert(report.widthInputMin === "640", "Node width input did not expose the 640px minimum", report);
+        assert(report.actionCollapsed && report.narrowContainerActive,
+            "Narrow Bridge did not use its collapsed-sidebar responsive layout", report);
+        assert(report.extraBodySingleColumn, "Narrow Bridge LoRA browser did not switch to a single-column layout", report);
+        assert(report.boundaryViolations.length === 0, "Narrow Bridge sections escaped the panel boundary", report);
+        const unexpectedOverflow = Object.entries(report.horizontalOverflow)
+            .filter(([, value]) => Number(value) > 2)
+            .map(([key, value]) => ({ key, value }));
+        assert(unexpectedOverflow.length === 0, "Narrow Bridge sections have horizontal overflow", { report, unexpectedOverflow });
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(bridgeConsoleErrors.length === 0, "WebUIPromptBridge reported console errors during narrow layout check", bridgeConsoleErrors);
+        return {
+            nodeSize: report.nodeSize,
+            panelWidth: report.panel?.offsetWidth || null,
+            networkControlColumns: report.networkControlColumns,
+            extraBodySingleColumn: report.extraBodySingleColumn,
+            boundaryViolations: report.boundaryViolations,
+            horizontalOverflow: report.horizontalOverflow,
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
+        };
+    } finally {
+        await context.close();
+    }
+}
+
 async function verifyCommonWidgetCompatibility(browser, baseUrl) {
     const consoleMessages = [];
     const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1200, height: 900 });
@@ -913,6 +1198,126 @@ async function verifyStartupWizardRequiresLoadedConfiguration(browser, baseUrl) 
     return results;
 }
 
+async function verifyFullPromptLibraryAndBulkClear(browser, baseUrl) {
+    const consoleMessages = [];
+    let customItems = [
+        { prompt: "market_tag_one", local: "市场词一", group: "导入词库", subgroup: "提示词", kind: "positive" },
+        { prompt: "market_tag_two", local: "市场词二", group: "导入词库", subgroup: "提示词", kind: "positive" },
+        { prompt: "market_tag_three", local: "市场词三", group: "导入词库", subgroup: "提示词", kind: "positive" },
+    ];
+    let bulkDeleteRequests = 0;
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1500, height: 1100 }, async (newPage) => {
+        await newPage.addInitScript(() => {
+            localStorage.setItem("webui-bridge-node-tutorial-seen-v2", "1");
+        });
+        await newPage.route("**/webui_prompt_bridge/settings", async (route) => {
+            if (route.request().method() !== "GET") {
+                await route.continue();
+                return;
+            }
+            const upstream = await route.fetch();
+            const data = await upstream.json();
+            data.prompt_library = {
+                prompt: { source: "local", ready: true, path: "mock/local/prompt-all-in-one" },
+                autocomplete: { source: "local", ready: true, path: "mock/local/tagcomplete" },
+            };
+            await route.fulfill({
+                status: upstream.status(),
+                contentType: "application/json",
+                body: JSON.stringify(data),
+            });
+        });
+        await newPage.route("**/webui_prompt_bridge/autocomplete*", async (route) => {
+            const query = new URL(route.request().url()).searchParams.get("q") || "";
+            if (query.toLowerCase() !== "smile") {
+                await route.continue();
+                return;
+            }
+            await route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({ items: [{ text: "smile", local: "微笑", count: 2900000, aliases: [], type: "tag" }] }),
+            });
+        });
+        await newPage.route("**/webui_prompt_bridge/custom_tags*", async (route) => {
+            const request = route.request();
+            const url = new URL(request.url());
+            if (request.method() === "DELETE" && url.searchParams.get("all") === "1") {
+                const removed = customItems.length;
+                customItems = [];
+                bulkDeleteRequests += 1;
+                await route.fulfill({
+                    status: 200,
+                    contentType: "application/json",
+                    body: JSON.stringify({ success: true, items: [], total: 0, custom_tag_count: 0, removed }),
+                });
+                return;
+            }
+            if (request.method() === "GET") {
+                await route.fulfill({
+                    status: 200,
+                    contentType: "application/json",
+                    body: JSON.stringify({ success: true, items: customItems, total: customItems.length, custom_tag_count: customItems.length }),
+                });
+                return;
+            }
+            await route.continue();
+        });
+    });
+    try {
+        await page.evaluate(() => {
+            window.app.graph.clear();
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            bridge.id = 950025;
+            bridge.pos = [80, 50];
+            window.app.graph.add(bridge);
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForFunction(() => document.querySelector(".webui-bridge-panel")?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
+
+        const bridgePanel = page.locator(".webui-bridge-panel");
+        await bridgePanel.getByRole("button", { name: "设置", exact: true }).evaluate((button) => button.click());
+        const settingsPanel = page.locator(".webui-bridge-settings-panel");
+        await settingsPanel.waitFor();
+        const libraryStatus = await settingsPanel.locator(".webui-bridge-config-note").filter({ hasText: "当前分类:" }).textContent();
+        assert(/完整词库/.test(libraryStatus || ""), "Settings did not report an active full prompt library", { libraryStatus });
+
+        await settingsPanel.getByRole("button", { name: "编辑词库", exact: true }).click();
+        const editor = page.locator(".webui-bridge-prompt-editor-panel");
+        await editor.waitFor();
+        await editor.getByText("自定义提示词 3 条", { exact: true }).waitFor();
+        page.once("dialog", (dialog) => dialog.accept());
+        await editor.getByRole("button", { name: "清空自定义/市场", exact: true }).click();
+        await editor.getByText("已清空 3 条自定义/市场提示词", { exact: true }).waitFor();
+        assert(bulkDeleteRequests === 1, "Bulk clear did not use exactly one request", { bulkDeleteRequests });
+        await screenshot(page, "compat-prompt-library-bulk-clear-editor.png");
+
+        await editor.getByRole("button", { name: "关闭", exact: true }).click();
+        await settingsPanel.getByRole("button", { name: "取消", exact: true }).click();
+        const positivePanel = page.locator(".webui-bridge-aio-positive");
+        await positivePanel.getByRole("button", { name: "全库搜索", exact: true }).click();
+        const search = positivePanel.locator(".webui-bridge-aio-new");
+        await search.fill("smile");
+        const fullSearchTag = positivePanel.locator('.webui-bridge-aio-tag[data-prompt="smile"]');
+        await fullSearchTag.waitFor({ timeout: 30000 });
+        await screenshot(page, "compat-full-prompt-library-bulk-clear.png");
+
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(!bridgeConsoleErrors.length, "Prompt library flow emitted console errors", bridgeConsoleErrors);
+        return {
+            libraryStatus,
+            bulkDeleteRequests,
+            fullSearchPrompt: await fullSearchTag.getAttribute("data-prompt"),
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
+        };
+    } finally {
+        await context.close();
+    }
+}
+
 async function verifyMaskEditorLoadGuardsAndCanvasBudget(browser, baseUrl) {
     const consoleMessages = [];
     const largeSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="6000" height="6000" viewBox="0 0 6000 6000"><rect width="6000" height="6000" fill="#7890ab"/></svg>';
@@ -1023,39 +1428,47 @@ async function verifyMaskEditorLoadGuardsAndCanvasBudget(browser, baseUrl) {
 
 async function verifyCompactSidebarTabsAndLowZoomSummary(browser, baseUrl) {
     const consoleMessages = [];
-    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1280, height: 900 }, async (newPage) => {
+    let savedZoomSummaryThreshold = null;
+    const mockedSettings = {
+        data_source: "auto",
+        translation_source: "auto",
+        tag_translation_source: "auto",
+        show_startup_wizard: false,
+        layout_preset: "compact",
+        tag_display: "local_first",
+        lora_card_size: "compact",
+        node_tutorial_popup: "off",
+        zoom_summary_threshold: 0.5,
+        ui_visibility: {
+            model_switch: true,
+            generation_controls: true,
+            regional_control: false,
+            size_controls: true,
+            layout_presets: true,
+            prompt_tools: true,
+            styles: false,
+            lora_browser: true,
+            module_img2img: true,
+            module_controlnet: true,
+        },
+    };
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1800, height: 1400 }, async (newPage) => {
         await newPage.route("**/*", async (route) => {
             const requestUrl = new URL(route.request().url());
-            if (!requestUrl.pathname.endsWith("/webui_prompt_bridge/settings") || route.request().method() !== "GET") {
+            if (!requestUrl.pathname.endsWith("/webui_prompt_bridge/settings")) {
                 await route.continue();
                 return;
+            }
+            if (route.request().method() === "POST") {
+                const posted = route.request().postDataJSON();
+                Object.assign(mockedSettings, posted);
+                savedZoomSummaryThreshold = posted.zoom_summary_threshold;
             }
             await route.fulfill({
                 status: 200,
                 contentType: "application/json",
                 body: JSON.stringify({
-                    settings: {
-                        data_source: "auto",
-                        translation_source: "auto",
-                        tag_translation_source: "auto",
-                        show_startup_wizard: false,
-                        layout_preset: "compact",
-                        tag_display: "local_first",
-                        lora_card_size: "compact",
-                        node_tutorial_popup: "off",
-                        ui_visibility: {
-                            model_switch: true,
-                            generation_controls: true,
-                            regional_control: true,
-                            size_controls: true,
-                            layout_presets: true,
-                            prompt_tools: true,
-                            styles: true,
-                            lora_browser: true,
-                            module_img2img: true,
-                            module_controlnet: true,
-                        },
-                    },
+                    settings: mockedSettings,
                     custom_tag_count: 0,
                     assets: null,
                     module_assets: null,
@@ -1117,6 +1530,18 @@ async function verifyCompactSidebarTabsAndLowZoomSummary(browser, baseUrl) {
             window.app.canvas.ds.scale = 0.55;
             window.app.canvas.setDirty(true, true);
         });
+        await page.waitForFunction(() => !document.querySelector(".webui-bridge-panel")?.classList.contains("zoom-summary-mode"));
+        const aboveDefaultThreshold = await page.evaluate(() => ({
+            scale: window.app.canvas.ds.scale,
+            threshold: document.querySelector(".webui-bridge-panel")?.__webuiBridgeLowZoomThreshold,
+            summaryMode: document.querySelector(".webui-bridge-panel")?.classList.contains("zoom-summary-mode"),
+        }));
+        assert(aboveDefaultThreshold.threshold === 0.5 && !aboveDefaultThreshold.summaryMode, "Default low-zoom summary threshold activated too early", aboveDefaultThreshold);
+
+        await page.evaluate(() => {
+            window.app.canvas.ds.scale = 0.49;
+            window.app.canvas.setDirty(true, true);
+        });
         await page.waitForFunction(() => document.querySelector(".webui-bridge-panel")?.classList.contains("zoom-summary-mode"));
         const lowZoom = await page.evaluate(() => {
             const panel = document.querySelector(".webui-bridge-panel");
@@ -1157,10 +1582,91 @@ async function verifyCompactSidebarTabsAndLowZoomSummary(browser, baseUrl) {
         assert(restored.active === "图生图" && restored.detailedVisibility === "visible", "Normal zoom did not restore the detailed UI and active tab", restored);
         assert(JSON.stringify(restored.nodeSize) === JSON.stringify(initial.nodeSize), "Normal zoom did not restore the exact original Bridge size", { initial, restored });
 
+        const lifecycleBottomGaps = [];
+        await page.getByRole("tab", { name: "模型" }).click();
+        await page.waitForTimeout(120);
+        await page.evaluate(() => {
+            const panel = document.querySelector(".webui-bridge-panel");
+            const topRow = panel?.querySelector(".webui-bridge-toprow");
+            const extra = panel?.querySelector(".webui-bridge-extra");
+            if (!panel || !topRow || !extra) return;
+            topRow.style.height = "420px";
+            topRow.style.flex = "0 0 auto";
+            extra.style.height = "96px";
+            extra.style.flex = "0 0 auto";
+            panel.__webuiBridgeSettleManualResizeLayout?.();
+        });
+        await page.waitForTimeout(80);
+        const singleSettleGap = await bridgeBottomBlankMetrics(page, "single settle after compact preset heights");
+        lifecycleBottomGaps.push(singleSettleGap);
+        assert(singleSettleGap.blankBelowExtra !== null && singleSettleGap.blankBelowExtra <= 36,
+            "A single compact layout settle pass created a large bottom blank", singleSettleGap);
+
+        await page.evaluate(() => {
+            window.app.canvas.ds.scale = 1.65;
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForTimeout(500);
+        lifecycleBottomGaps.push(await bridgeBottomBlankMetrics(page, "fresh compact node after zoom in"));
+        await page.evaluate(() => {
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForTimeout(300);
+
+        await page.getByRole("button", { name: "设置", exact: true }).click();
+        const zoomThresholdInput = page.locator(".webui-bridge-settings-panel label")
+            .filter({ hasText: "远景摘要阈值" })
+            .locator('input[type="number"]');
+        assert(await zoomThresholdInput.count() === 1, "Zoom summary threshold setting input is missing");
+        const defaultThresholdPercent = await zoomThresholdInput.inputValue();
+        assert(defaultThresholdPercent === "50", "Zoom summary threshold setting did not show the default percentage", { defaultThresholdPercent });
+        await screenshot(page, "compat-zoom-summary-threshold-setting.png");
+        await zoomThresholdInput.fill("35");
+        await page.locator(".webui-bridge-settings-panel .webui-bridge-config-actions")
+            .getByRole("button", { name: "保存", exact: true })
+            .click();
+        await page.waitForFunction(() => !document.querySelector(".webui-bridge-settings-panel"), null, { timeout: 30000 });
+        assert(savedZoomSummaryThreshold === 0.35, "Zoom summary threshold setting was not persisted as a ratio", { savedZoomSummaryThreshold });
+
+        await page.evaluate(() => {
+            window.app.canvas.ds.scale = 0.4;
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForFunction(() => !document.querySelector(".webui-bridge-panel")?.classList.contains("zoom-summary-mode"));
+        const aboveCustomThreshold = await page.evaluate(() => ({
+            scale: window.app.canvas.ds.scale,
+            threshold: document.querySelector(".webui-bridge-panel")?.__webuiBridgeLowZoomThreshold,
+            summaryMode: document.querySelector(".webui-bridge-panel")?.classList.contains("zoom-summary-mode"),
+        }));
+        assert(aboveCustomThreshold.threshold === 0.35 && !aboveCustomThreshold.summaryMode, "Custom zoom summary threshold activated too early", aboveCustomThreshold);
+
+        await page.evaluate(() => {
+            window.app.canvas.ds.scale = 0.34;
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForFunction(() => document.querySelector(".webui-bridge-panel")?.classList.contains("zoom-summary-mode"));
+        const belowCustomThreshold = await page.evaluate(() => ({
+            scale: window.app.canvas.ds.scale,
+            threshold: document.querySelector(".webui-bridge-panel")?.__webuiBridgeLowZoomThreshold,
+            summaryMode: document.querySelector(".webui-bridge-panel")?.classList.contains("zoom-summary-mode"),
+        }));
+        assert(belowCustomThreshold.threshold === 0.35 && belowCustomThreshold.summaryMode, "Custom zoom summary threshold did not activate below the saved value", belowCustomThreshold);
+
+        await page.evaluate(() => {
+            window.app.canvas.ds.scale = 1.65;
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForTimeout(500);
+        lifecycleBottomGaps.push(await bridgeBottomBlankMetrics(page, "after settings save and zoom round trip"));
+        await screenshot(page, "compat-compact-lifecycle-bottom-gap.png");
+        assert(lifecycleBottomGaps.every((item) => item.blankBelowExtra !== null && item.blankBelowExtra <= 36),
+            "Compact Bridge lifecycle left a large blank below the LoRA section", lifecycleBottomGaps);
+
         const thresholdCycles = await page.evaluate(async () => {
             const bridge = window.app.graph.getNodeById(950024);
             const sizes = [];
-            for (const scale of [0.67, 0.69, 0.32, 1, 0.55, 1]) {
+            for (const scale of [0.34, 0.36, 0.2, 1, 0.4, 1]) {
                 window.app.canvas.ds.scale = scale;
                 window.app.canvas.setDirty(true, true);
                 await new Promise((resolve) => setTimeout(resolve, 100));
@@ -1176,7 +1682,21 @@ async function verifyCompactSidebarTabsAndLowZoomSummary(browser, baseUrl) {
             /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
         );
         assert(!bridgeConsoleErrors.length, "UI optimization checks emitted Bridge console errors", bridgeConsoleErrors);
-        return { initial, generation, imageTab, lowZoom, serializedLowZoom, restored, thresholdCycles, bridgeConsoleErrors: bridgeConsoleErrors.length };
+        return {
+            initial,
+            generation,
+            imageTab,
+            aboveDefaultThreshold,
+            lowZoom,
+            serializedLowZoom,
+            restored,
+            savedZoomSummaryThreshold,
+            aboveCustomThreshold,
+            belowCustomThreshold,
+            lifecycleBottomGaps,
+            thresholdCycles,
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
+        };
     } finally {
         await context.close();
     }
@@ -3282,11 +3802,18 @@ async function main() {
     const workflow = await loadWorkflow();
     try {
         const results = options.focusedFixes ? {
+            freshBridgeStartsAtStablePresetSize: await verifyFreshBridgeStartsAtStablePresetSize(browser, options.baseUrl),
+            narrowBridgeWidthLayout: await verifyNarrowBridgeWidthLayout(browser, options.baseUrl),
+            bridgeNodeDragCrossesDomPanel: await verifyBridgeNodeDragCrossesDomPanel(browser, options.baseUrl),
             startupWizardRequiresLoadedConfiguration: await verifyStartupWizardRequiresLoadedConfiguration(browser, options.baseUrl),
+            fullPromptLibraryAndBulkClear: await verifyFullPromptLibraryAndBulkClear(browser, options.baseUrl),
             maskEditorLoadGuardsAndCanvasBudget: await verifyMaskEditorLoadGuardsAndCanvasBudget(browser, options.baseUrl),
             compactSidebarTabsAndLowZoomSummary: await verifyCompactSidebarTabsAndLowZoomSummary(browser, options.baseUrl),
         } : {
             bridgeEventFix: await verifyBridgeDoesNotCancelCanvasWidgets(browser, options.baseUrl),
+            freshBridgeStartsAtStablePresetSize: await verifyFreshBridgeStartsAtStablePresetSize(browser, options.baseUrl),
+            narrowBridgeWidthLayout: await verifyNarrowBridgeWidthLayout(browser, options.baseUrl),
+            bridgeNodeDragCrossesDomPanel: await verifyBridgeNodeDragCrossesDomPanel(browser, options.baseUrl),
             commonWidgetCompatibility: await verifyCommonWidgetCompatibility(browser, options.baseUrl),
             fullWorkflowSwitches: await verifyFullWorkflowSwitches(browser, options.baseUrl, workflow),
             currentWorkflowLayoutIdempotency: await verifyCurrentWorkflowLayoutIdempotency(browser, options.baseUrl, workflow),
@@ -3294,6 +3821,7 @@ async function main() {
             bridgeUiErgonomics: await verifyBridgeUiErgonomics(browser, options.baseUrl, workflow),
             bridgeImageInputPanelErgonomics: await verifyBridgeImageInputPanelErgonomics(browser, options.baseUrl),
             startupWizardRequiresLoadedConfiguration: await verifyStartupWizardRequiresLoadedConfiguration(browser, options.baseUrl),
+            fullPromptLibraryAndBulkClear: await verifyFullPromptLibraryAndBulkClear(browser, options.baseUrl),
             maskEditorLoadGuardsAndCanvasBudget: await verifyMaskEditorLoadGuardsAndCanvasBudget(browser, options.baseUrl),
             compactSidebarTabsAndLowZoomSummary: await verifyCompactSidebarTabsAndLowZoomSummary(browser, options.baseUrl),
             exactPromptTagToggle: await verifyExactPromptTagToggle(browser, options.baseUrl),
