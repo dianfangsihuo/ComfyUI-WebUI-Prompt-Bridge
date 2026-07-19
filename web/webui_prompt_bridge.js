@@ -5,6 +5,24 @@ const BRIDGE_DEBUG = {};
 
 const TARGET_NODE = "WebUIPromptBridge";
 const IMAGE_INPUT_NODE = "WebUIPromptBridgeImageInput";
+const PROMPT_ONLY_NODES = {
+    WebUIPromptBridgePositivePrompt: {
+        kind: "positive",
+        widgetName: "positive_prompt",
+        label: "正向提示词",
+        placeholder: "输入正向提示词，键入 tag 时会自动补全…",
+        color: "#315145",
+        bgcolor: "#172920",
+    },
+    WebUIPromptBridgeNegativePrompt: {
+        kind: "negative",
+        widgetName: "negative_prompt",
+        label: "负向提示词",
+        placeholder: "输入负向提示词，键入 tag 时会自动补全…",
+        color: "#543b46",
+        bgcolor: "#2b1920",
+    },
+};
 const BRIDGE_WIDGET_DEFINITIONS = [
     ["positive_prompt", "string", "masterpiece, best quality, anime style, 1girl, <lora:anima-highres-aesthetic-boost:0.65>"],
     ["negative_prompt", "string", "worst quality, low quality, blurry, bad anatomy, extra fingers"],
@@ -1730,7 +1748,7 @@ function pinBridgeDomWidgetToTop(node, widget) {
     widget.last_y = 0;
 }
 
-function syncBridgeDomWidgetWrapper(panel, width, height) {
+function syncBridgeDomWidgetWrapper(panel, width, height, options = {}) {
     if (!panel?.parentElement) return;
     const setImportant = (target, property, value) => {
         if (!target?.style) return;
@@ -1742,8 +1760,16 @@ function syncBridgeDomWidgetWrapper(panel, width, height) {
         if (!target?.style || !target.style.getPropertyValue(property)) return;
         target.style.removeProperty(property);
     };
-    const wrapperWidth = Math.max(DOM_WIDGET_CONTENT_MIN_WIDTH, Number(width) || panel.offsetWidth || DEFAULT_PANEL_WIDTH);
-    const wrapperHeight = Math.max(280, Number(height) || panel.offsetHeight || DEFAULT_PANEL_HEIGHT);
+    const storedOptions = panel.__webuiBridgeWidgetSizeOptions || {};
+    const minWidth = Number.isFinite(options.minWidth)
+        ? options.minWidth
+        : Number.isFinite(storedOptions.minWidth) ? storedOptions.minWidth : DOM_WIDGET_CONTENT_MIN_WIDTH;
+    const minHeight = Number.isFinite(options.minHeight)
+        ? options.minHeight
+        : Number.isFinite(storedOptions.minHeight) ? storedOptions.minHeight : 280;
+    panel.__webuiBridgeWidgetSizeOptions = { minWidth, minHeight };
+    const wrapperWidth = Math.max(minWidth, Number(width) || panel.offsetWidth || DEFAULT_PANEL_WIDTH);
+    const wrapperHeight = Math.max(minHeight, Number(height) || panel.offsetHeight || DEFAULT_PANEL_HEIGHT);
     panel.__webuiBridgeExpectedWidgetSize = [wrapperWidth, wrapperHeight];
     panel.__webuiBridgeShellSyncing = true;
     const clearGlobalShell = (root) => {
@@ -5040,11 +5066,25 @@ function updatePromptArea(textarea, text, isNegative = false) {
     return addPromptArea(textarea, text);
 }
 
+function promptTextWithAppendedValues(currentValue, values) {
+    const additions = (Array.isArray(values) ? values : [values])
+        .map((value) => String(value || "").trim())
+        .filter(Boolean);
+    const source = String(currentValue || "");
+    if (!additions.length) return source;
+    if (!source.trim()) return additions.join(EXTRA_SEPARATOR);
+    const endsWithNewline = /\r?\n[ \t]*$/.test(source);
+    const current = endsWithNewline
+        ? source.replace(/[ \t]+$/, "")
+        : source.trimEnd().replace(/[,，、]+$/, "").trimEnd();
+    const separator = current && !endsWithNewline ? EXTRA_SEPARATOR : "";
+    return `${current}${separator}${additions.join(EXTRA_SEPARATOR)}`;
+}
+
 function addPromptArea(textarea, text) {
     if (!text) return false;
     if (promptHasExactTag(textarea.value, text)) return false;
-    const sep = textarea.value.trim() ? EXTRA_SEPARATOR : "";
-    setTextareaValue(textarea, textarea.value + sep + text);
+    setTextareaValue(textarea, promptTextWithAppendedValues(textarea.value, text));
     return true;
 }
 
@@ -7614,6 +7654,717 @@ function installAutocomplete(input, options) {
     return { close, request };
 }
 
+let promptOnlyLibraryDataPromise = null;
+let promptOnlyLoraDataPromise = null;
+
+function refreshPromptOnlyLibraries() {
+    promptOnlyLibraryDataPromise = null;
+    promptOnlyLoraDataPromise = null;
+    for (const graphNode of getGraphNodes()) {
+        graphNode?.__webuiBridgeRefreshPromptOnlyLibrary?.();
+    }
+}
+
+function loadPromptOnlyLoras() {
+    if (!promptOnlyLoraDataPromise) {
+        promptOnlyLoraDataPromise = fetchJsonWithTimeout(
+            "/webui_prompt_bridge/loras?detail=basic",
+            { cache: "no-store" },
+            10000,
+            "LoRA 列表读取超时",
+        ).then((data) => data.loras || []).catch((error) => {
+            promptOnlyLoraDataPromise = null;
+            throw error;
+        });
+    }
+    return promptOnlyLoraDataPromise;
+}
+
+function showPromptOnlyLoraPicker(title, textarea, sync, updateHelp) {
+    const mask = el("div", { class: "webui-bridge-config-mask" });
+    const close = () => mask.remove();
+    const search = el("input", {
+        class: "webui-bridge-config-input",
+        placeholder: "搜索 LoRA 名称、目录或分类…",
+        spellcheck: "false",
+    });
+    const weight = el("input", {
+        class: "webui-bridge-config-input webui-bridge-prompt-only-lora-weight",
+        type: "number",
+        min: "-10",
+        max: "10",
+        step: "0.05",
+        value: "1",
+        title: "插入提示词时使用的 LoRA 权重",
+    });
+    const categoryFilter = el("select", {
+        class: "webui-bridge-config-input webui-bridge-prompt-only-lora-filter",
+        title: "使用与主节点相同的 LoRA 分类筛选",
+    });
+    const status = el("div", { class: "webui-bridge-config-status" }, "正在读取 LoRA 列表…");
+    const grid = el("div", { class: "webui-bridge-prompt-only-lora-grid" });
+    let loras = [];
+
+    const renderCategoryFilters = () => {
+        const tree = buildLoraFolderTree(loras);
+        const selectedFilter = categoryFilter.value || "__all";
+        categoryFilter.replaceChildren(el("option", { value: "__all" }, `全部 LoRA (${loras.length})`));
+        const appendGroup = (path, label) => {
+            const root = tree.children.get(path);
+            if (!root?.children?.size) return;
+            const group = el("optgroup", { label });
+            const appendChildren = (parent, depth = 0) => {
+                const children = [...parent.children.values()]
+                    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+                for (const child of children) {
+                    const prefix = depth ? `${"—".repeat(depth)} ` : "";
+                    group.append(el("option", { value: child.path }, `${prefix}${child.name} (${child.count})`));
+                    if (child.children.size) appendChildren(child, depth + 1);
+                }
+            };
+            appendChildren(root);
+            categoryFilter.append(group);
+        };
+        appendGroup("group:smart", "分类");
+        appendGroup("group:folders", "文件夹");
+        appendGroup("group:sd", "模型版本");
+        appendGroup("group:status", "整理状态");
+        categoryFilter.value = [...categoryFilter.options].some((option) => option.value === selectedFilter)
+            ? selectedFilter
+            : "__all";
+    };
+
+    const formatWeight = () => {
+        const value = clampNumber(Number(weight.value), -10, 10);
+        return Number.isFinite(value) ? String(Math.round(value * 100) / 100) : "1";
+    };
+    const addLora = async (item, card) => {
+        const name = item.alias || item.base_name || item.name;
+        if (!name) return;
+        card.classList.add("adding");
+        status.textContent = `正在添加 ${loraDisplayName(item)}…`;
+        try {
+            const prompt = `<lora:${name}:${formatWeight()}>`;
+            await updatePromptAreaWithLoraKeywords(
+                textarea,
+                prompt,
+                false,
+                sync,
+                (message) => updateHelp?.(message),
+                { toggle: false },
+            );
+            status.textContent = `已添加：${loraDisplayName(item)}（权重 ${formatWeight()}）`;
+            card.classList.add("added");
+            window.setTimeout(() => card.classList.remove("added"), 900);
+        } catch (error) {
+            status.textContent = `添加失败：${error?.message || error}`;
+        } finally {
+            card.classList.remove("adding");
+        }
+    };
+    const render = () => {
+        const query = search.value.trim().toLowerCase();
+        const activeFilter = categoryFilter.value || "__all";
+        const matched = loras.filter((item) => (
+            loraMatchesFilter(item, activeFilter) && loraMatchesQuery(item, query)
+        ));
+        const visible = matched.slice(0, 240);
+        grid.replaceChildren(...visible.map((item) => {
+            const displayName = loraDisplayName(item);
+            const card = el("button", {
+                type: "button",
+                class: "webui-bridge-prompt-only-lora-card",
+                title: `${item.name || displayName}\n点击插入 LoRA 标签`,
+                onclick: () => addLora(item, card),
+            }, [
+                item.thumbnail
+                    ? el("img", {
+                        src: item.thumbnail,
+                        alt: "",
+                        loading: "lazy",
+                        onerror: (event) => event.currentTarget.replaceWith(el("span", { class: "webui-bridge-prompt-only-lora-fallback" }, "LoRA")),
+                    })
+                    : el("span", { class: "webui-bridge-prompt-only-lora-fallback" }, "LoRA"),
+                el("span", { class: "webui-bridge-prompt-only-lora-name" }, displayName),
+                el("span", { class: "webui-bridge-prompt-only-lora-folder" }, loraFolderLabel(item.folder)),
+            ]);
+            return card;
+        }));
+        status.textContent = visible.length
+            ? `显示 ${visible.length} / ${matched.length} 个匹配 LoRA（全库 ${loras.length}），点击卡片即可加入提示词`
+            : "没有匹配的 LoRA";
+    };
+    search.addEventListener("input", render);
+    categoryFilter.addEventListener("change", render);
+    mask.addEventListener("mousedown", (event) => {
+        if (event.target === mask) close();
+    });
+    mask.append(el("div", { class: "webui-bridge-config-panel webui-bridge-prompt-only-lora-picker" }, [
+        el("div", { class: "webui-bridge-config-head" }, [
+            el("span", {}, `${title} · 添加 LoRA`),
+            el("button", { type: "button", onclick: close }, "×"),
+        ]),
+        el("div", { class: "webui-bridge-config-body" }, [
+            el("div", { class: "webui-bridge-config-note" }, "点击卡片会加入 LoRA 标签。把基础模型的 model、clip 接到本节点，再把本节点输出的 model、clip 接到后续工作流，LoRA 就会像主节点一样真正加载；只使用 positive_text 输出时仅保留标签文本。"),
+            el("div", { class: "webui-bridge-prompt-only-lora-toolbar" }, [
+                search,
+                el("label", { class: "webui-bridge-prompt-only-lora-filter-control" }, [
+                    el("span", {}, "分类"),
+                    categoryFilter,
+                ]),
+                el("label", { class: "webui-bridge-prompt-only-lora-weight-control" }, [
+                    el("span", {}, "权重"),
+                    weight,
+                ]),
+            ]),
+            status,
+            grid,
+        ]),
+        el("div", { class: "webui-bridge-config-actions" }, [
+            el("button", { type: "button", class: "primary", onclick: close }, "完成"),
+        ]),
+    ]));
+    document.body.append(mask);
+    search.focus();
+    loadPromptOnlyLoras().then((items) => {
+        loras = items;
+        renderCategoryFilters();
+        render();
+    }).catch((error) => {
+        status.textContent = `LoRA 列表读取失败：${error?.message || error}`;
+        grid.replaceChildren();
+    });
+}
+
+function loadPromptOnlyLibraryData() {
+    if (!promptOnlyLibraryDataPromise) {
+        const fetchOptions = { cache: "no-store" };
+        promptOnlyLibraryDataPromise = Promise.allSettled([
+            fetchJsonWithTimeout(
+                "/webui_prompt_bridge/prompt_all_in_one?lang=zh_CN",
+                fetchOptions,
+                WEBUI_REFRESH_TIMEOUT_MS,
+                "提示词库读取超时",
+            ),
+            fetchJsonWithTimeout(
+                "/webui_prompt_bridge/settings",
+                fetchOptions,
+                WEBUI_REFRESH_TIMEOUT_MS,
+                "提示词设置读取超时",
+            ),
+        ]).then(([promptResult, settingsResult]) => {
+            if (promptResult.status !== "fulfilled") throw promptResult.reason;
+            return {
+                promptAllInOne: promptResult.value || { group_tags: [], favorites: {} },
+                settings: normalizeBridgeSettings(
+                    settingsResult.status === "fulfilled" ? settingsResult.value?.settings : null,
+                ),
+                loras: [],
+                models: { embeddings: [] },
+            };
+        }).catch((error) => {
+            promptOnlyLibraryDataPromise = null;
+            throw error;
+        });
+    }
+    return promptOnlyLibraryDataPromise;
+}
+
+function schedulePromptOnlyPanelInstall(node, config, configuredData = null) {
+    for (const delay of [0, 32, 120, 360]) {
+        window.setTimeout(() => installPromptOnlyPanel(node, config, configuredData), delay);
+    }
+}
+
+function installPromptOnlyPanel(node, config, configuredData = null) {
+    const promptWidget = getWidget(node, config.widgetName);
+    if (!promptWidget) return;
+
+    if (node.__webuiBridgePromptOnlyPanel) {
+        const textarea = node.__webuiBridgePromptOnlyTextarea;
+        if (textarea && document.activeElement !== textarea) {
+            textarea.value = String(promptWidget.value || "");
+            node.__webuiBridgeRenderPromptOnlyChunks?.();
+        }
+        const configuredSize = Array.isArray(configuredData?.size)
+            ? configuredData.size.map(Number)
+            : null;
+        if (
+            configuredSize?.length >= 2
+            && Number.isFinite(configuredSize[0])
+            && Number.isFinite(configuredSize[1])
+        ) {
+            const restoredSize = [
+                Math.max(340, configuredSize[0]),
+                Math.max(260, configuredSize[1]),
+            ];
+            node.__webuiBridgePromptOnlyConfiguredSize = [...restoredSize];
+            node.size = [...restoredSize];
+            node.setSize?.([...restoredSize]);
+        }
+        const configuredExpanded = configuredData?.properties?.webui_prompt_library_expanded;
+        if (typeof configuredExpanded === "boolean") {
+            node.__webuiBridgeSetPromptOnlyLibraryExpanded?.(configuredExpanded, { load: configuredExpanded });
+        }
+        node.__webuiBridgeApplyPromptOnlySize?.(node.size);
+        return;
+    }
+
+    hideWidget(promptWidget);
+    const textarea = el("textarea", {
+        class: "webui-bridge-prompt-only-textarea",
+        placeholder: config.placeholder,
+        spellcheck: "false",
+    });
+    textarea.value = String(promptWidget.value || "");
+    const chunkStorageKey = `webui-bridge-prompt-only-chunks-${config.kind}`;
+    const autoTranslateStorageKey = `webui-bridge-aio-auto-translate-${config.kind}`;
+    const shortcutStorageKey = `webui-bridge-prompt-only-translate-shortcut-${config.kind}`;
+    let chunkEnabled = readLocalBoolean(chunkStorageKey, true);
+    let translateShortcut = readLocalString(shortcutStorageKey, "ctrl_enter");
+    if (!["ctrl_enter", "alt_t", "off"].includes(translateShortcut)) translateShortcut = "ctrl_enter";
+    let promptOnlyState = null;
+    const chips = el("div", { class: "webui-bridge-prompt-only-chips" });
+    const chunkInput = el("input", {
+        type: "text",
+        class: "webui-bridge-prompt-only-chunk-input",
+        placeholder: "输入提示词，逗号或回车生成分块…",
+        spellcheck: "false",
+    });
+    let activeChunkIndex = -1;
+    let chunkCommitQueue = Promise.resolve();
+    const helpLine = el("div", { class: "webui-bridge-prompt-only-help" });
+    const shortcutText = () => ({ ctrl_enter: "Ctrl+Enter", alt_t: "Alt+T", off: "" }[translateShortcut] || "Ctrl+Enter");
+    const updateHelp = (message = "") => {
+        helpLine.textContent = message || [
+            shortcutText() ? `${shortcutText()} 翻译整段` : "",
+            "↑↓ 选择",
+            "Enter/Tab 确认",
+            "拖动排序",
+            "↵ 分行",
+            "Ctrl+↑↓ 调权重",
+        ].filter(Boolean).join(" · ");
+    };
+    const renderChunks = () => {
+        textarea.hidden = chunkEnabled;
+        chips.hidden = !chunkEnabled;
+        if (chunkEnabled) {
+            renderPromptOnlyChunks(chips, textarea, promptOnlyState, {
+                input: chunkInput,
+                activeIndex: activeChunkIndex,
+                onSelect: (index) => {
+                    activeChunkIndex = index;
+                    [...chips.querySelectorAll(".webui-bridge-prompt-only-chip")]
+                        .forEach((chip, chipIndex) => chip.classList.toggle("active", chipIndex === index));
+                },
+                onDelete: (index) => {
+                    if (!removePromptTagAt(textarea, index)) return;
+                    activeChunkIndex = Math.min(activeChunkIndex, splitPromptTags(textarea.value).length - 1);
+                    sync();
+                    chunkInput.focus();
+                },
+                onEdit: (index) => {
+                    const tag = splitPromptTags(textarea.value)[index];
+                    if (!tag || !removePromptTagAt(textarea, index)) return;
+                    chunkInput.value = tag.value;
+                    activeChunkIndex = -1;
+                    sync();
+                    chunkInput.focus();
+                    chunkInput.select();
+                },
+                onMove: (fromIndex, toIndex) => {
+                    if (!movePromptTagAt(textarea, fromIndex, toIndex)) return;
+                    const insertIndex = fromIndex < toIndex ? toIndex - 1 : toIndex;
+                    activeChunkIndex = Math.max(0, Math.min(insertIndex, splitPromptTags(textarea.value).length - 1));
+                    sync();
+                },
+                onToggleSeparator: (index) => {
+                    const tag = splitPromptTags(textarea.value)[index];
+                    if (!tag) return;
+                    const changed = promptSeparatorMarker(tag.separatorAfter)
+                        ? removePromptTagSeparatorAt(textarea, index)
+                        : setPromptTagSeparatorAt(textarea, index, ",\n");
+                    if (changed) sync();
+                },
+            });
+        }
+    };
+
+    const sync = () => {
+        const next = textarea.value;
+        if (promptWidget.value !== next) {
+            promptWidget.value = next;
+            promptWidget.callback?.(next);
+            markGraphChanged(node);
+        }
+        renderChunks();
+    };
+    textarea.addEventListener("input", () => {
+        if (!textarea.__webuiBridgeSettingValue) sync();
+    });
+    const appendChunkEntries = async (values, options = {}) => {
+        const rawValues = (values || []).map((value) => String(value || "").trim()).filter(Boolean);
+        if (!rawValues.length) return;
+        const translatedValues = [];
+        const shouldTranslate = options.translate !== false && readLocalBoolean(autoTranslateStorageKey, true);
+        for (const raw of rawValues) {
+            if (shouldTranslate && /[\u3400-\u9fff]/.test(raw)) {
+                const resolved = await resolveKeywordInput(raw, true);
+                translatedValues.push(...resolved.map((item) => item.prompt).filter(Boolean));
+            } else {
+                translatedValues.push(raw);
+            }
+        }
+        if (!translatedValues.length) return;
+        setTextareaValue(textarea, promptTextWithAppendedValues(textarea.value, translatedValues));
+        activeChunkIndex = splitPromptTags(textarea.value).length - 1;
+        sync();
+    };
+    const queueChunkEntries = (values, options = {}) => {
+        chunkCommitQueue = chunkCommitQueue
+            .then(() => appendChunkEntries(values, options))
+            .catch((error) => updateHelp(`添加失败：${error?.message || error}`));
+        return chunkCommitQueue;
+    };
+    chunkInput.addEventListener("input", () => {
+        const raw = chunkInput.value;
+        if (!/[,，、\n\r]/.test(raw)) return;
+        const parts = raw.split(/[,，、\n\r]+/);
+        const endsWithSeparator = /[,，、\n\r]\s*$/.test(raw);
+        const remainder = endsWithSeparator ? "" : (parts.pop() || "");
+        const completed = parts.map((value) => value.trim()).filter(Boolean);
+        chunkInput.value = remainder;
+        if (completed.length) queueChunkEntries(completed);
+    });
+    chips.addEventListener("click", (event) => {
+        if (event.target === chips) chunkInput.focus();
+    });
+    const translateCurrentPrompt = async () => {
+        const value = textarea.value.trim();
+        if (!value) {
+            updateHelp("提示词为空，无需翻译");
+            return;
+        }
+        if (!/[\u3400-\u9fff]/.test(value)) {
+            updateHelp("没有检测到需要翻译的中文");
+            return;
+        }
+        updateHelp("正在翻译整段提示词…");
+        textarea.classList.add("webui-bridge-input-busy");
+        try {
+            const translated = await translatePromptAllInOne(value, "english");
+            setTextareaValue(textarea, translated.prompt || value);
+            sync();
+            updateHelp(translated.matched ? `已翻译 ${translated.matched} 个关键词` : "本地词库未匹配，已保留原文");
+        } catch (error) {
+            updateHelp(`翻译失败：${error?.message || error}`);
+        } finally {
+            textarea.classList.remove("webui-bridge-input-busy");
+            window.setTimeout(() => updateHelp(), 2400);
+        }
+    };
+    textarea.addEventListener("keydown", (event) => {
+        const translatePressed = translateShortcut === "ctrl_enter"
+            ? (event.ctrlKey || event.metaKey) && event.key === "Enter"
+            : translateShortcut === "alt_t" && event.altKey && String(event.key).toLowerCase() === "t";
+        if (translatePressed) {
+            event.preventDefault();
+            event.stopPropagation();
+            translateCurrentPrompt();
+        } else if ((event.ctrlKey || event.metaKey) && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+            if (editAttention(textarea, event.key === "ArrowUp")) {
+                event.preventDefault();
+                sync();
+            }
+        } else if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+            if (movePromptTag(textarea, event.key === "ArrowLeft")) {
+                event.preventDefault();
+                sync();
+            }
+        }
+    });
+    installAutocomplete(textarea, {
+        limit: 8,
+        showOnFocus: false,
+        getQuery: () => promptTokenAtCursor(textarea).value,
+        onPick: (suggestion) => {
+            replacePromptToken(textarea, suggestion);
+            sync();
+        },
+    });
+    installAutocomplete(chunkInput, {
+        limit: 8,
+        showOnFocus: false,
+        compact: true,
+        getQuery: () => chunkInput.value,
+        onPick: async (suggestion) => {
+            const prompt = suggestion.text || suggestion.prompt || "";
+            if (!prompt) return;
+            chunkInput.value = "";
+            await queueChunkEntries([prompt], { translate: false });
+            chunkInput.focus();
+        },
+    });
+    chunkInput.addEventListener("keydown", (event) => {
+        const popupVisible = chunkInput.__webuiBridgeAutocompletePopup?.classList.contains("visible");
+        const translatePressed = translateShortcut === "ctrl_enter"
+            ? (event.ctrlKey || event.metaKey) && event.key === "Enter"
+            : translateShortcut === "alt_t" && event.altKey && String(event.key).toLowerCase() === "t";
+        if (translatePressed) {
+            event.preventDefault();
+            event.stopPropagation();
+            translateCurrentPrompt();
+            return;
+        }
+        if ((event.key === "Enter" || event.key === "Tab") && !popupVisible) {
+            const value = chunkInput.value.trim();
+            if (!value) return;
+            event.preventDefault();
+            event.stopPropagation();
+            chunkInput.value = "";
+            queueChunkEntries([value]).then(() => chunkInput.focus());
+            return;
+        }
+        if (event.key === "Backspace" && !chunkInput.value && !popupVisible) {
+            const tags = splitPromptTags(textarea.value);
+            if (!tags.length) return;
+            event.preventDefault();
+            const index = activeChunkIndex >= 0 ? activeChunkIndex : tags.length - 1;
+            if (removePromptTagAt(textarea, index)) {
+                activeChunkIndex = Math.min(index - 1, splitPromptTags(textarea.value).length - 1);
+                sync();
+            }
+            return;
+        }
+        if ((event.ctrlKey || event.metaKey) && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+            const tag = splitPromptTags(textarea.value)[activeChunkIndex];
+            if (!tag) return;
+            event.preventDefault();
+            if (replacePromptTagAt(textarea, activeChunkIndex, changeTagNumericWeight(tag.value, event.key === "ArrowUp" ? 0.1 : -0.1))) sync();
+            return;
+        }
+        if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+            const tags = splitPromptTags(textarea.value);
+            if (!tags[activeChunkIndex]) return;
+            const nextIndex = Math.max(0, Math.min(tags.length - 1, activeChunkIndex + (event.key === "ArrowLeft" ? -1 : 1)));
+            if (nextIndex !== activeChunkIndex && movePromptTagAt(textarea, activeChunkIndex, nextIndex + (nextIndex > activeChunkIndex ? 1 : 0))) {
+                event.preventDefault();
+                activeChunkIndex = nextIndex;
+                sync();
+            }
+        }
+    });
+    updateHelp();
+    renderChunks();
+    loadPromptOnlyLibraryData().then((state) => {
+        promptOnlyState = state;
+        renderChunks();
+    }).catch(() => {});
+
+    const libraryToggle = el("button", {
+        type: "button",
+        class: "webui-bridge-prompt-only-library-toggle",
+        title: "展开分类提示词库；首次展开时加载数据",
+    });
+    const settingsButton = el("button", {
+        type: "button",
+        class: "webui-bridge-prompt-only-settings",
+        title: `${config.label}设置`,
+        onclick: () => showPromptManagementSettings(
+            config.label,
+            autoTranslateStorageKey,
+            node.__webuiBridgePromptOnlyLibraryPanel?.__webuiBridgeAutoTranslateInput || null,
+            {
+                smallNode: true,
+                chunkEnabled,
+                shortcutValue: translateShortcut,
+                onChunkChange: (enabled) => {
+                    chunkEnabled = Boolean(enabled);
+                    writeLocalBoolean(chunkStorageKey, chunkEnabled);
+                    renderChunks();
+                    if (chunkEnabled && Number(node.size?.[1] || 0) < 340) {
+                        node.setSize?.([Math.max(340, Number(node.size?.[0] || 0)), 360]);
+                    }
+                    node.__webuiBridgeApplyPromptOnlySize?.(node.size);
+                },
+                onShortcutChange: (value) => {
+                    translateShortcut = ["ctrl_enter", "alt_t", "off"].includes(value) ? value : "ctrl_enter";
+                    writeLocalString(shortcutStorageKey, translateShortcut);
+                    updateHelp();
+                },
+            },
+        ),
+    }, "⚙");
+    const loraButton = config.kind === "positive" ? el("button", {
+        type: "button",
+        class: "webui-bridge-prompt-only-lora-button",
+        title: "打开 LoRA 列表并加入当前提示词",
+        onclick: () => showPromptOnlyLoraPicker(config.label, textarea, sync, updateHelp),
+    }, "LoRA +") : null;
+    const libraryShell = el("div", { class: "webui-bridge-prompt-only-library", hidden: "hidden" });
+    let libraryLoaded = false;
+    let libraryLoading = false;
+    let libraryLoadToken = 0;
+
+    const panel = el("div", { class: "webui-bridge-prompt-only-panel" }, [
+        el("div", { class: "webui-bridge-prompt-only-label" }, [
+            el("strong", {}, config.label),
+            el("div", { class: "webui-bridge-prompt-only-head-actions" }, [
+                el("span", {}, "Tag 自动补全"),
+                settingsButton,
+                loraButton,
+                libraryToggle,
+            ].filter(Boolean)),
+        ]),
+        textarea,
+        chips,
+        helpLine,
+        libraryShell,
+    ]);
+
+    const loadLibrary = async () => {
+        if (libraryLoaded || libraryLoading) return;
+        const loadToken = ++libraryLoadToken;
+        libraryLoading = true;
+        libraryShell.replaceChildren(el("div", { class: "webui-bridge-prompt-only-loading" }, "正在加载提示词库…"));
+        try {
+            const state = await loadPromptOnlyLibraryData();
+            if (!libraryShell.isConnected || loadToken !== libraryLoadToken) return;
+            const libraryPanel = createPromptAllInOnePanel(
+                config.kind,
+                config.kind === "negative" ? "反向词" : "提示词",
+                textarea,
+                state,
+                sync,
+            );
+            libraryPanel.classList.add("webui-bridge-prompt-only-aio");
+            node.__webuiBridgePromptOnlyLibraryPanel = libraryPanel;
+            libraryPanel.style.removeProperty("height");
+            libraryPanel.style.removeProperty("min-height");
+            libraryPanel.style.removeProperty("max-height");
+            libraryShell.replaceChildren(libraryPanel);
+            libraryLoaded = true;
+            node.__webuiBridgeApplyPromptOnlySize?.(node.size);
+        } catch (error) {
+            if (loadToken !== libraryLoadToken) return;
+            libraryShell.replaceChildren(el("div", { class: "webui-bridge-prompt-only-loading error" }, `提示词库加载失败：${error?.message || error}`));
+        } finally {
+            if (loadToken === libraryLoadToken) libraryLoading = false;
+        }
+    };
+    const setLibraryExpanded = (expanded, options = {}) => {
+        const next = Boolean(expanded);
+        panel.classList.toggle("library-expanded", next);
+        libraryShell.hidden = !next;
+        libraryToggle.textContent = next ? "收起词库 ▴" : "展开词库 ▾";
+        libraryToggle.classList.toggle("active", next);
+        node.properties = node.properties && typeof node.properties === "object" ? node.properties : {};
+        node.properties.webui_prompt_library_expanded = next;
+        if (next && options.load !== false) loadLibrary();
+        node.__webuiBridgeApplyPromptOnlySize?.(node.size);
+        if (!options.silent) markGraphChanged(node);
+    };
+    libraryToggle.addEventListener("click", () => {
+        const expanded = !panel.classList.contains("library-expanded");
+        node.properties = node.properties && typeof node.properties === "object" ? node.properties : {};
+        if (expanded) {
+            const collapsedSize = [
+                Math.max(340, Number(node.size?.[0] || 420)),
+                Math.max(260, Number(node.size?.[1] || 260)),
+            ];
+            node.__webuiBridgePromptOnlyCollapsedSize = [...collapsedSize];
+            node.properties.webui_prompt_library_collapsed_size = [...collapsedSize];
+            if (collapsedSize[1] < 560) {
+                node.setSize?.([Math.max(520, collapsedSize[0]), 720]);
+            }
+            setLibraryExpanded(true, { silent: true });
+        } else {
+            setLibraryExpanded(false, { silent: true });
+            const savedCollapsedSize = node.__webuiBridgePromptOnlyCollapsedSize
+                || node.properties.webui_prompt_library_collapsed_size;
+            if (
+                Array.isArray(savedCollapsedSize)
+                && savedCollapsedSize.length >= 2
+                && Number.isFinite(Number(savedCollapsedSize[0]))
+                && Number.isFinite(Number(savedCollapsedSize[1]))
+            ) {
+                const restoredSize = [
+                    Math.max(340, Number(savedCollapsedSize[0])),
+                    Math.max(260, Number(savedCollapsedSize[1])),
+                ];
+                node.size = [...restoredSize];
+                node.setSize?.([...restoredSize]);
+                node.__webuiBridgeApplyPromptOnlySize?.(restoredSize);
+            }
+            delete node.__webuiBridgePromptOnlyCollapsedSize;
+            delete node.properties.webui_prompt_library_collapsed_size;
+        }
+        markGraphChanged(node);
+    });
+
+    const domWidget = node.addDOMWidget("webui_bridge_prompt_only", "webui_bridge_prompt_only", panel, {
+        serialize: false,
+        hideOnZoom: false,
+        getMinHeight: () => 190,
+        getMaxHeight: () => 2400,
+    });
+    installWidgetSerializationFallback(domWidget, () => null);
+    const applySize = (size = node.size) => {
+        const nodeWidth = Math.max(340, Number(size?.[0] || 420));
+        const nodeHeight = Math.max(260, Number(size?.[1] || 260));
+        const widgetWidth = Math.max(300, nodeWidth - 40);
+        const widgetHeight = Math.max(190, nodeHeight - 70);
+        panel.style.width = `${widgetWidth}px`;
+        panel.style.height = `${widgetHeight}px`;
+        syncBridgeDomWidgetWrapper(panel, widgetWidth, widgetHeight, { minWidth: 300, minHeight: 190 });
+        return [widgetWidth, widgetHeight];
+    };
+    domWidget.computeSize = () => [
+        300,
+        panel.classList.contains("library-expanded") ? (chunkEnabled ? 500 : 430) : (chunkEnabled ? 290 : 190),
+    ];
+    node.__webuiBridgePromptOnlyPanel = panel;
+    node.__webuiBridgePromptOnlyTextarea = textarea;
+    node.__webuiBridgeSetPromptOnlyLibraryExpanded = setLibraryExpanded;
+    node.__webuiBridgeApplyPromptOnlySize = applySize;
+    node.__webuiBridgeRenderPromptOnlyChunks = renderChunks;
+    node.__webuiBridgeRefreshPromptOnlyLibrary = () => {
+        libraryLoadToken += 1;
+        libraryLoaded = false;
+        libraryLoading = false;
+        node.__webuiBridgePromptOnlyLibraryPanel = null;
+        libraryShell.replaceChildren();
+        loadPromptOnlyLibraryData().then((state) => {
+            promptOnlyState = state;
+            renderChunks();
+        }).catch(() => {});
+        if (panel.classList.contains("library-expanded")) loadLibrary();
+    };
+    node.color = config.color;
+    node.bgcolor = config.bgcolor;
+    node.resizable = true;
+    const configuredSize = Array.isArray(configuredData?.size)
+        ? configuredData.size.map(Number)
+        : null;
+    const hasValidConfiguredSize = configuredSize?.length >= 2
+        && Number.isFinite(configuredSize[0])
+        && Number.isFinite(configuredSize[1]);
+    const baseInitialSize = hasValidConfiguredSize ? configuredSize : [420, chunkEnabled ? 360 : 260];
+    const initialSize = [
+        Math.max(340, Number(baseInitialSize[0] || 0)),
+        Math.max(260, Number(baseInitialSize[1] || 0)),
+    ];
+    if (hasValidConfiguredSize) node.__webuiBridgePromptOnlyConfiguredSize = [...initialSize];
+    node.size = [...initialSize];
+    node.setSize?.([...initialSize]);
+    applySize(initialSize);
+    chainCallback(node, "onResize", function (size) {
+        applySize(size || this.size);
+    });
+    const configuredExpanded = configuredData?.properties?.webui_prompt_library_expanded;
+    setLibraryExpanded(Boolean(configuredExpanded), { load: Boolean(configuredExpanded), silent: true });
+}
+
 async function updatePromptAllInOneStorage(action, kind, prompt = "", name = "", id = "") {
     const response = await api.fetchApi("/webui_prompt_bridge/prompt_all_in_one/storage", {
         method: "POST",
@@ -7889,6 +8640,180 @@ function promptHintScore(tags, hints) {
     return score;
 }
 
+function showPromptManagementSettings(title, translateStorageKey, autoTranslate = null, options = {}) {
+    const mask = el("div", { class: "webui-bridge-config-mask" });
+    const close = () => mask.remove();
+    const autoTranslateSetting = el("input", { type: "checkbox" });
+    autoTranslateSetting.checked = autoTranslate
+        ? Boolean(autoTranslate.checked)
+        : readLocalBoolean(translateStorageKey, true);
+    autoTranslateSetting.addEventListener("change", () => {
+        if (autoTranslate) autoTranslate.checked = autoTranslateSetting.checked;
+        writeLocalBoolean(translateStorageKey, autoTranslateSetting.checked);
+    });
+    const chunkSetting = options.smallNode ? el("input", { type: "checkbox" }) : null;
+    if (chunkSetting) {
+        chunkSetting.checked = options.chunkEnabled !== false;
+        chunkSetting.addEventListener("change", () => options.onChunkChange?.(chunkSetting.checked));
+    }
+    const shortcutSetting = options.smallNode ? el("select", { class: "webui-bridge-config-input" }, [
+        el("option", { value: "ctrl_enter" }, "Ctrl+Enter（推荐）"),
+        el("option", { value: "alt_t" }, "Alt+T"),
+        el("option", { value: "off" }, "关闭快捷键"),
+    ]) : null;
+    if (shortcutSetting) {
+        shortcutSetting.value = ["ctrl_enter", "alt_t", "off"].includes(options.shortcutValue)
+            ? options.shortcutValue
+            : "ctrl_enter";
+        shortcutSetting.addEventListener("change", () => options.onShortcutChange?.(shortcutSetting.value));
+    }
+    const notes = options.smallNode
+        ? [
+            "分块模式会把整个编辑区变成 Tag 编辑器：输入后按逗号、回车或 Tab 立即生成卡片；关闭后恢复普通文本框。",
+            "Ctrl+Enter 默认用于翻译整个提示词框；Alt+T 适合习惯字母快捷键的用户。两者都不会和 Ctrl+↑↓ 调权重、Alt+←→ 移动 Tag 冲突。",
+            "“回车添加时翻译中文”同时作用于分块编辑器和展开词库后的关键词添加；关闭后按原文生成 Tag。",
+            "“未匹配本地关键词组，保留原文”表示本地词库没有对应映射，并非生成错误；可以换成更短的关键词或在主节点设置中补充词库。",
+        ]
+        : [
+            "“未匹配本地关键词组，保留原文”表示本地 Prompt-all-in-one 词库没有这段中文的映射；不是生成错误。可以换成更短的词、点“英”做整段翻译，或在收藏/词库里补充本地关键词。",
+            "Prompt 文本框、已输入 tag 区、收藏/标签列表和 Extra Networks 边界都有细拖拽条；上下拖动会自动分配相邻区域高度，双击恢复默认。",
+            "Negative prompt 右侧可以折叠反向词区域，适合只管理正向提示词时腾出空间。",
+        ];
+    mask.addEventListener("mousedown", (event) => {
+        if (event.target === mask) close();
+    });
+    mask.append(el("div", { class: "webui-bridge-config-panel webui-bridge-prompt-settings" }, [
+        el("div", { class: "webui-bridge-config-head" }, [
+            el("span", {}, `${title}设置`),
+            el("button", { type: "button", onclick: close }, "×"),
+        ]),
+        el("div", { class: "webui-bridge-config-body" }, [
+            ...(options.smallNode ? [
+                el("label", { class: "webui-bridge-config-check" }, [
+                    chunkSetting,
+                    el("span", {}, "分块编辑模式（默认开启）"),
+                ]),
+                el("label", {}, [
+                    el("span", {}, "整段翻译快捷键"),
+                    shortcutSetting,
+                ]),
+            ] : []),
+            el("label", { class: "webui-bridge-config-check" }, [
+                autoTranslateSetting,
+                el("span", {}, "回车添加时翻译中文"),
+            ]),
+            ...notes.map((note) => el("div", { class: "webui-bridge-config-note" }, note)),
+        ]),
+        el("div", { class: "webui-bridge-config-actions" }, [
+            el("button", { type: "button", class: "primary", onclick: close }, "完成"),
+        ]),
+    ]));
+    document.body.append(mask);
+}
+
+function renderPromptOnlyChunks(chips, textarea, state = null, options = {}) {
+    if (!chips) return;
+    const localMap = state ? buildLocalTagMap(state) : new Map();
+    const tags = splitPromptTags(textarea.value).slice(0, 160);
+    const activeIndex = Number(options.activeIndex);
+    const items = [];
+    for (let index = 0; index < tags.length; index += 1) {
+        const tag = tags[index];
+        const lora = parseLoraTag(tag.value);
+        const local = lora ? "LoRA" : localMap.get(tag.value.toLowerCase()) || "";
+        const chip = el("div", {
+            class: `webui-bridge-prompt-only-chip${lora ? " lora" : ""}${index === activeIndex ? " active" : ""}`,
+            title: local ? `${tag.value}\n${local}` : tag.value,
+            draggable: "true",
+            ondragstart: (event) => {
+                if (event.target.closest(".webui-bridge-prompt-only-chip-remove, .webui-bridge-prompt-only-chip-separator")) {
+                    event.preventDefault();
+                    return;
+                }
+                chips.__webuiBridgeDraggingIndex = index;
+                chip.classList.add("dragging");
+                chips.classList.add("drag-active");
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData("text/plain", String(index));
+            },
+            ondragover: (event) => {
+                if (!Number.isInteger(chips.__webuiBridgeDraggingIndex)) return;
+                event.preventDefault();
+                const rect = chip.getBoundingClientRect();
+                const after = event.clientX > rect.left + rect.width / 2;
+                chip.classList.toggle("drop-before", !after);
+                chip.classList.toggle("drop-after", after);
+            },
+            ondragleave: () => chip.classList.remove("drop-before", "drop-after"),
+            ondrop: (event) => {
+                const fromIndex = chips.__webuiBridgeDraggingIndex;
+                if (!Number.isInteger(fromIndex)) return;
+                event.preventDefault();
+                event.stopPropagation();
+                const rect = chip.getBoundingClientRect();
+                const after = event.clientX > rect.left + rect.width / 2;
+                options.onMove?.(fromIndex, index + (after ? 1 : 0));
+                chip.classList.remove("drop-before", "drop-after");
+            },
+            ondragend: () => {
+                chip.classList.remove("dragging", "drop-before", "drop-after");
+                chips.classList.remove("drag-active");
+                chips.__webuiBridgeDraggingIndex = null;
+            },
+        }, [
+            el("button", {
+                type: "button",
+                class: "webui-bridge-prompt-only-chip-content",
+                draggable: "false",
+                title: "单击选择，双击编辑",
+                onclick: () => options.onSelect?.(index),
+                ondblclick: (event) => {
+                    event.preventDefault();
+                    options.onEdit?.(index);
+                },
+            }, [
+                el("span", { class: "webui-bridge-prompt-only-chip-main" }, tag.value),
+                local ? el("span", { class: "webui-bridge-prompt-only-chip-local" }, local) : null,
+            ].filter(Boolean)),
+            el("button", {
+                type: "button",
+                class: "webui-bridge-prompt-only-chip-remove",
+                draggable: "false",
+                title: "删除这个提示词",
+                onclick: (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    options.onDelete?.(index);
+                },
+            }, "×"),
+            el("button", {
+                type: "button",
+                class: `webui-bridge-prompt-only-chip-separator${promptSeparatorMarker(tag.separatorAfter) ? " active" : ""}`,
+                draggable: "false",
+                title: promptSeparatorMarker(tag.separatorAfter) ? "取消这个 Tag 后的换行" : "在这个 Tag 后换行",
+                onclick: (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    options.onToggleSeparator?.(index);
+                },
+            }, "↵"),
+        ].filter(Boolean));
+        items.push(chip);
+        const separatorMarker = promptSeparatorMarker(tag.separatorAfter);
+        if (separatorMarker) {
+            items.push(el("button", {
+                type: "button",
+                class: "webui-bridge-prompt-only-separator-marker",
+                title: `${separatorMarker.title}；点击取消`,
+                onclick: () => options.onToggleSeparator?.(index),
+            }, separatorMarker.text));
+        }
+    }
+    if (options.input) items.push(options.input);
+    chips.replaceChildren(...items);
+    chips.classList.toggle("empty", tags.length === 0);
+}
+
 function looksLikeMisplacedPositivePrompt(text) {
     const value = String(text || "").trim();
     if (!value) return false;
@@ -8002,6 +8927,7 @@ function createPromptAllInOnePanel(kind, title, textarea, state, sync) {
     });
     autoTranslate.checked = readLocalBoolean(translateStorageKey, true);
     autoTranslate.addEventListener("change", () => writeLocalBoolean(translateStorageKey, autoTranslate.checked));
+    root.__webuiBridgeAutoTranslateInput = autoTranslate;
     const panelHeightKey = `webui-bridge-aio-panel-height-${kind}`;
     root.__webuiBridgeHeightKey = panelHeightKey;
     root.__webuiBridgeMinHeight = kind === "negative" ? AIO_NEGATIVE_MIN_HEIGHT : AIO_POSITIVE_MIN_HEIGHT;
@@ -8104,38 +9030,7 @@ function createPromptAllInOnePanel(kind, title, textarea, state, sync) {
         title,
         onclick,
     }, text);
-    const showPromptSettings = () => {
-        const mask = el("div", { class: "webui-bridge-config-mask" });
-        const close = () => mask.remove();
-        const autoTranslateSetting = el("input", { type: "checkbox" });
-        autoTranslateSetting.checked = autoTranslate.checked;
-        autoTranslateSetting.addEventListener("change", () => {
-            autoTranslate.checked = autoTranslateSetting.checked;
-            writeLocalBoolean(translateStorageKey, autoTranslate.checked);
-        });
-        mask.addEventListener("mousedown", (event) => {
-            if (event.target === mask) close();
-        });
-        mask.append(el("div", { class: "webui-bridge-config-panel webui-bridge-prompt-settings" }, [
-            el("div", { class: "webui-bridge-config-head" }, [
-                el("span", {}, `${title}设置`),
-                el("button", { type: "button", onclick: close }, "×"),
-            ]),
-            el("div", { class: "webui-bridge-config-body" }, [
-                el("label", { class: "webui-bridge-config-check" }, [
-                    autoTranslateSetting,
-                    el("span", {}, "回车添加时翻译中文"),
-                ]),
-                el("div", { class: "webui-bridge-config-note" }, "“未匹配本地关键词组，保留原文”表示本地 Prompt-all-in-one 词库没有这段中文的映射；不是生成错误。可以换成更短的词、点“英”做整段翻译，或在收藏/词库里补充本地关键词。"),
-                el("div", { class: "webui-bridge-config-note" }, "Prompt 文本框、已输入 tag 区、收藏/标签列表和 Extra Networks 边界都有细拖拽条；上下拖动会自动分配相邻区域高度，双击恢复默认。"),
-                el("div", { class: "webui-bridge-config-note" }, "Negative prompt 右侧可以折叠反向词区域，适合只管理正向提示词时腾出空间。"),
-            ]),
-            el("div", { class: "webui-bridge-config-actions" }, [
-                el("button", { type: "button", class: "primary", onclick: close }, "完成"),
-            ]),
-        ]));
-        document.body.append(mask);
-    };
+    const showPromptSettings = () => showPromptManagementSettings(title, translateStorageKey, autoTranslate);
     const translateAll = async () => {
         const value = textarea.value.trim();
         if (!value) return;
@@ -10962,11 +11857,13 @@ function buildPanel(node) {
 
     const showImportTagsDialog = (options = {}) => {
         const editorMode = options.mode === "editor";
+        const initialKind = ["positive", "negative"].includes(options.kind) ? options.kind : "all";
+        const managedSmallNodeLibrary = Boolean(options.smallNodeLibrary);
         const mask = el("div", { class: `webui-bridge-config-mask${editorMode ? " webui-bridge-prompt-editor-mask" : ""}` });
         const fileInput = el("input", { type: "file", accept: ".csv,.tsv,.txt,.json,application/json,text/csv,text/plain", style: { display: "none" } });
         const statusLine = el("div", { class: "webui-bridge-config-status" }, `自定义提示词 ${state.customTagCount || 0} 条`);
         const searchInput = el("input", { class: "webui-bridge-config-input", placeholder: "搜索 prompt / 中文名 / 分类" });
-        const filterKind = settingSelect("all", [
+        const filterKind = settingSelect(initialKind, [
             { value: "all", label: "全部" },
             { value: "positive", label: "正向" },
             { value: "negative", label: "反向" },
@@ -11112,6 +12009,7 @@ function buildPanel(node) {
                             await deleteCustomTag(index);
                             clearEditor();
                             await refreshBridgeData();
+                            refreshPromptOnlyLibraries();
                             await refreshCustomList();
                             setStatus("提示词已删除", { kind: "success" });
                         },
@@ -11147,6 +12045,7 @@ function buildPanel(node) {
             const result = await saveCustomTag(editingIndex, item);
             state.customTagCount = result.custom_tag_count || result.total || state.customTagCount;
             await refreshBridgeData();
+            refreshPromptOnlyLibraries();
             await refreshCustomList();
             clearEditor();
             setStatus("提示词已保存并同步到主页面", { kind: "success" });
@@ -11165,6 +12064,7 @@ function buildPanel(node) {
                 state.settings = normalizeBridgeSettings(result.settings);
                 state.customTagCount = result.custom_tag_count || result.total || state.customTagCount;
                 await refreshBridgeData();
+                refreshPromptOnlyLibraries();
                 await refreshCustomList();
                 statusLine.textContent = `已导入 ${result.imported || 0} 条，当前共 ${state.customTagCount || 0} 条`;
                 setStatus("词库已导入", { kind: "success" });
@@ -11192,6 +12092,7 @@ function buildPanel(node) {
                 state.customTagCount = result.custom_tag_count || result.total || 0;
                 clearEditor();
                 await refreshBridgeData();
+                refreshPromptOnlyLibraries();
                 await refreshCustomList();
                 statusLine.textContent = `已清空 ${result.removed || 0} 条自定义/市场提示词`;
                 setStatus("自定义/市场词库已清空", { kind: "success" });
@@ -11210,11 +12111,15 @@ function buildPanel(node) {
         });
         mask.append(el("div", { class: "webui-bridge-config-panel webui-bridge-prompt-editor-panel" }, [
             el("div", { class: "webui-bridge-config-head" }, [
-                el("span", {}, editorMode ? "提示词编辑" : "导入词库"),
+                el("span", {}, managedSmallNodeLibrary
+                    ? `${initialKind === "negative" ? "负向" : initialKind === "positive" ? "正向" : "全部"}小节点提示词库管理`
+                    : editorMode ? "提示词编辑" : "导入词库"),
                 el("button", { type: "button", onclick: close }, "×"),
             ]),
             el("div", { class: "webui-bridge-config-body" }, [
-                el("div", { class: "webui-bridge-config-note" }, editorMode
+                el("div", { class: "webui-bridge-config-note" }, managedSmallNodeLibrary
+                    ? "这里管理正向、负向提示词小节点共用的分类词库。新增、修改、删除或导入后，画布上已展开的小节点会立即刷新；主页面与小节点共享同一份数据。"
+                    : editorMode
                     ? "这里可以查看自定义/市场词和主页面/WebUI 词库。修改主页面词会保存为自定义覆盖项，避免和原始词重复显示。"
                     : "支持 JSON、CSV、TSV。字段可用 prompt/local/group/subgroup/kind；导入后也可以在这里继续编辑分类。"),
                 el("div", { class: "webui-bridge-custom-editor" }, [
@@ -11273,6 +12178,7 @@ function buildPanel(node) {
                             state.settings = normalizeBridgeSettings(result.settings);
                             state.customTagCount = result.custom_tag_count || result.total || state.customTagCount;
                             await refreshBridgeData();
+                            refreshPromptOnlyLibraries();
                             source.imported = true;
                             source.imported_at = result.imported_at || source.imported_at;
                             source.imported_count = result.downloaded || source.imported_count || 0;
@@ -11482,6 +12388,7 @@ function buildPanel(node) {
         const current = normalizeBridgeSettings(state.settings);
         const librarySourceLabel = (source) => ({
             webui: "WebUI 完整词库",
+            bundled: "节点随包完整补全词库",
             local: "插件本地完整词库",
             custom: "自定义完整词库",
             builtin: "精简内置词库",
@@ -11644,6 +12551,7 @@ function buildPanel(node) {
                 translationSource.value = state.settings.translation_source;
                 wizardToggle.checked = state.settings.show_startup_wizard;
                 await refreshBridgeData();
+                refreshPromptOnlyLibraries();
                 libraryStatusLine.textContent = libraryStatusText();
                 finishSettingsDownload(`${assetInstallMessage(result)}；没有 WebUI 也可以直接使用补全和分类`, "success", [localAssetsButton]);
                 setStatus("本地数据包已就绪", { kind: "success" });
@@ -11659,6 +12567,7 @@ function buildPanel(node) {
                 state.customTagCount = result.custom_tag_count || state.customTagCount;
                 state.assets = result.assets || state.assets;
                 await refreshBridgeData();
+                refreshPromptOnlyLibraries();
                 libraryStatusLine.textContent = libraryStatusText();
                 finishSettingsDownload(`${assetInstallMessage(result)}；已存在的扩展不会重复下载`, "success", [installWebUIButton]);
                 installWebUIButton.disabled = true;
@@ -11764,6 +12673,7 @@ function buildPanel(node) {
                 writeLocalNumber("webui-bridge-font-size", Number(fontSizeInput.value || DEFAULT_FONT_SIZE));
                 applyPanelFontSize(panel);
                 await refreshBridgeData();
+                refreshPromptOnlyLibraries();
                 applyLayoutPreset(state.settings.layout_preset);
                 applyUiVisibility();
                 setStatus("设置已保存", { kind: "success" });
@@ -11825,6 +12735,24 @@ function buildPanel(node) {
                                 },
                             }, "重置首次提示"),
                         ]),
+                    ]),
+                    configSection("小节点提示词库", "正向与负向小节点共享主节点词库；可分别筛选管理，修改后会同步到画布上的小节点。", [
+                        el("div", { class: "webui-bridge-settings-asset-tools" }, [
+                            el("button", {
+                                type: "button",
+                                onclick: () => showImportTagsDialog({ mode: "editor", kind: "positive", smallNodeLibrary: true }),
+                            }, "管理正向词库"),
+                            el("button", {
+                                type: "button",
+                                onclick: () => showImportTagsDialog({ mode: "editor", kind: "negative", smallNodeLibrary: true }),
+                            }, "管理负向词库"),
+                            el("button", {
+                                type: "button",
+                                onclick: () => showImportTagsDialog({ mode: "editor", smallNodeLibrary: true }),
+                            }, "管理全部"),
+                            el("button", { type: "button", onclick: showPromptMarketDialog }, "提示词市场"),
+                        ]),
+                        el("div", { class: "webui-bridge-config-note" }, `当前自定义/市场词 ${state.customTagCount || 0} 条；WebUI 原始词库仍按“数据来源”设置读取。`),
                     ]),
                 ]),
                 configSection("侧栏功能显示", "隐藏只影响面板，不删除已有 widget 值，也不会改变工作流执行。", [
@@ -12295,6 +13223,7 @@ function buildPanel(node) {
                 showLoraMetadataDialog(item, {
                     categoryOptions: collectLoraCategoryOptions(state.loras),
                     onSaved: () => {
+                        promptOnlyLoraDataPromise = null;
                         renderCards();
                         renderTree();
                     },
@@ -18255,6 +19184,420 @@ function addStyles() {
             grid-template-columns: repeat(3, minmax(0, 1fr));
             padding: 14px 24px 20px;
         }
+        .webui-bridge-prompt-only-panel {
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+            width: 100%;
+            min-width: 300px;
+            min-height: 190px;
+            padding: 9px 10px;
+            border: 1px solid #46505e;
+            border-radius: 8px;
+            background: #202630;
+            color: #e7ebf1;
+            font-size: 12px;
+        }
+        .webui-bridge-prompt-only-label {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        .webui-bridge-prompt-only-head-actions {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 7px;
+            min-width: 0;
+        }
+        .webui-bridge-prompt-only-label span,
+        .webui-bridge-prompt-only-help {
+            color: #9da8b7;
+            font-size: 11px;
+        }
+        .webui-bridge-prompt-only-library-toggle {
+            min-width: 82px;
+            height: 25px;
+            padding: 0 8px;
+            border: 1px solid #4b596c;
+            border-radius: 5px;
+            background: #273141;
+            color: #dce7f7;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        .webui-bridge-prompt-only-settings,
+        .webui-bridge-prompt-only-lora-button {
+            flex: 0 0 25px;
+            height: 25px;
+            padding: 0;
+            border: 1px solid #4b596c;
+            border-radius: 5px;
+            background: #273141;
+            color: #dce7f7;
+            cursor: pointer;
+            font-size: 13px;
+            line-height: 23px;
+        }
+        .webui-bridge-prompt-only-settings {
+            width: 25px;
+        }
+        .webui-bridge-prompt-only-lora-button {
+            flex-basis: auto;
+            min-width: 56px;
+            padding: 0 7px;
+            color: #f4dca0;
+            font-size: 10px;
+            font-weight: 800;
+        }
+        .webui-bridge-prompt-only-settings:hover,
+        .webui-bridge-prompt-only-lora-button:hover {
+            border-color: #6aa3ff;
+            background: #274b7c;
+            color: #fff;
+        }
+        .webui-bridge-prompt-only-library-toggle:hover,
+        .webui-bridge-prompt-only-library-toggle.active {
+            border-color: #6aa3ff;
+            background: #274b7c;
+            color: #fff;
+        }
+        .webui-bridge-prompt-only-textarea {
+            box-sizing: border-box;
+            flex: 1 1 auto;
+            width: 100%;
+            min-height: 118px;
+            resize: none;
+            padding: 9px 10px;
+            border: 1px solid #596575;
+            border-radius: 6px;
+            outline: none;
+            background: #11161d;
+            color: #f2f4f7;
+            font: 12px/1.5 Consolas, "Microsoft YaHei UI", sans-serif;
+        }
+        .webui-bridge-prompt-only-textarea:focus {
+            border-color: #5c9ded;
+            box-shadow: 0 0 0 1px rgba(92, 157, 237, 0.28);
+        }
+        .webui-bridge-prompt-only-textarea[hidden],
+        .webui-bridge-prompt-only-chips[hidden] {
+            display: none !important;
+        }
+        .webui-bridge-prompt-only-chips {
+            box-sizing: border-box;
+            display: flex;
+            flex: 1 1 auto;
+            align-content: flex-start;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            gap: 7px;
+            width: 100%;
+            min-height: 118px;
+            padding: 7px;
+            overflow: auto;
+            border: 1px solid #596575;
+            border-radius: 6px;
+            background: #11161d;
+            cursor: text;
+        }
+        .webui-bridge-prompt-only-chips:focus-within {
+            border-color: #5c9ded;
+            box-shadow: 0 0 0 1px rgba(92, 157, 237, 0.28);
+        }
+        .webui-bridge-prompt-only-chip {
+            position: relative;
+            display: flex;
+            flex: 0 1 auto;
+            min-width: 74px;
+            max-width: 220px;
+            min-height: 40px;
+            padding: 0;
+            overflow: hidden;
+            border: 1px solid #3b4659;
+            border-radius: 5px;
+            background: #252d3b;
+            color: #edf2fb;
+            text-align: left;
+            cursor: grab;
+        }
+        .webui-bridge-prompt-only-chip.dragging {
+            opacity: .45;
+            cursor: grabbing;
+        }
+        .webui-bridge-prompt-only-chip.drop-before {
+            box-shadow: -4px 0 0 #6aa3ff;
+        }
+        .webui-bridge-prompt-only-chip.drop-after {
+            box-shadow: 4px 0 0 #6aa3ff;
+        }
+        .webui-bridge-prompt-only-chip:hover,
+        .webui-bridge-prompt-only-chip.active {
+            border-color: #6aa3ff;
+            background: #303a4d;
+        }
+        .webui-bridge-prompt-only-chip.lora {
+            border-color: #b27816;
+            background: #352a19;
+        }
+        .webui-bridge-prompt-only-chip-content {
+            display: flex;
+            flex: 1 1 auto;
+            flex-direction: column;
+            min-width: 0;
+            padding: 0 40px 0 0;
+            overflow: hidden;
+            border: 0;
+            background: transparent;
+            color: inherit;
+            cursor: pointer;
+            text-align: left;
+        }
+        .webui-bridge-prompt-only-chip-remove {
+            position: absolute;
+            top: 2px;
+            right: 2px;
+            width: 18px;
+            height: 18px;
+            padding: 0;
+            border: 0;
+            border-radius: 3px;
+            background: transparent;
+            color: #8793a5;
+            cursor: pointer;
+            font: 700 14px/18px sans-serif;
+        }
+        .webui-bridge-prompt-only-chip-remove:hover {
+            background: #71343b;
+            color: #fff;
+        }
+        .webui-bridge-prompt-only-chip-separator {
+            position: absolute;
+            top: 2px;
+            right: 21px;
+            width: 18px;
+            height: 18px;
+            padding: 0;
+            border: 0;
+            border-radius: 3px;
+            background: transparent;
+            color: #8793a5;
+            cursor: pointer;
+            font: 700 12px/18px sans-serif;
+        }
+        .webui-bridge-prompt-only-chip-separator:hover,
+        .webui-bridge-prompt-only-chip-separator.active {
+            background: #2a5683;
+            color: #dcecff;
+        }
+        .webui-bridge-prompt-only-separator-marker {
+            flex: 0 0 25px;
+            height: 40px;
+            padding: 0;
+            border: 1px dashed #4f779f;
+            border-radius: 5px;
+            background: rgba(51, 96, 139, .18);
+            color: #8ec4f4;
+            cursor: pointer;
+            font: 800 14px/38px sans-serif;
+        }
+        .webui-bridge-prompt-only-separator-marker:hover {
+            border-color: #7fc2ff;
+            background: rgba(64, 125, 184, .3);
+            color: #fff;
+        }
+        .webui-bridge-prompt-only-chip-main,
+        .webui-bridge-prompt-only-chip-local {
+            box-sizing: border-box;
+            display: block;
+            width: 100%;
+            padding: 3px 7px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .webui-bridge-prompt-only-chip-main {
+            color: #f2f5fb;
+            font: 700 11px/15px Consolas, Monaco, monospace;
+        }
+        .webui-bridge-prompt-only-chip-local {
+            color: #e5d7ae;
+            background: rgba(184, 145, 60, .12);
+            font-size: 11px;
+            line-height: 15px;
+        }
+        .webui-bridge-prompt-only-chunk-input {
+            box-sizing: border-box;
+            flex: 1 1 150px;
+            min-width: 130px;
+            height: 40px;
+            padding: 0 8px;
+            border: 1px dashed #46556a;
+            border-radius: 5px;
+            outline: none;
+            background: #181f29;
+            color: #f2f4f7;
+            font: 12px/38px Consolas, "Microsoft YaHei UI", sans-serif;
+        }
+        .webui-bridge-prompt-only-chunk-input:focus {
+            border-color: #6aa3ff;
+            border-style: solid;
+            background: #1c2633;
+        }
+        .webui-bridge-prompt-only-lora-picker {
+            width: min(920px, calc(100vw - 48px));
+            max-width: 920px;
+            height: min(860px, calc(100vh - 48px));
+        }
+        .webui-bridge-prompt-only-lora-picker .webui-bridge-config-body {
+            min-height: 0;
+            overflow: hidden;
+            grid-template-rows: auto auto auto minmax(0, 1fr);
+        }
+        .webui-bridge-prompt-only-lora-toolbar {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(190px, .42fr) auto;
+            gap: 10px;
+            align-items: end;
+        }
+        .webui-bridge-prompt-only-lora-toolbar label {
+            display: grid;
+            gap: 7px;
+            align-items: center;
+            color: #b9c5d6;
+        }
+        .webui-bridge-prompt-only-lora-filter-control {
+            grid-template-columns: auto minmax(140px, 1fr);
+        }
+        .webui-bridge-prompt-only-lora-weight-control {
+            grid-template-columns: auto 78px;
+        }
+        .webui-bridge-prompt-only-lora-filter {
+            min-width: 0;
+        }
+        .webui-bridge-prompt-only-lora-weight {
+            width: 78px;
+        }
+        .webui-bridge-prompt-only-lora-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+            grid-auto-rows: 158px;
+            align-content: start;
+            gap: 10px;
+            min-height: 0;
+            max-height: none;
+            padding: 2px;
+            overflow-x: hidden;
+            overflow-y: auto;
+        }
+        .webui-bridge-prompt-only-lora-card {
+            display: grid;
+            grid-template-rows: 110px auto auto;
+            min-width: 0;
+            min-height: 158px;
+            height: 158px;
+            padding: 0;
+            overflow: hidden;
+            border: 1px solid #46556a;
+            border-radius: 7px;
+            background: #202938;
+            color: #e8eef8;
+            cursor: pointer;
+            text-align: left;
+        }
+        .webui-bridge-prompt-only-lora-card:hover,
+        .webui-bridge-prompt-only-lora-card.added {
+            border-color: #6aa3ff;
+            background: #2a3d57;
+        }
+        .webui-bridge-prompt-only-lora-card.adding {
+            opacity: .62;
+            pointer-events: none;
+        }
+        .webui-bridge-prompt-only-lora-card img,
+        .webui-bridge-prompt-only-lora-fallback {
+            display: grid;
+            place-items: center;
+            width: 100%;
+            height: 110px;
+            object-fit: cover;
+            background: #141b25;
+            color: #8fa3bd;
+            font-weight: 800;
+        }
+        .webui-bridge-prompt-only-lora-name,
+        .webui-bridge-prompt-only-lora-folder {
+            padding: 4px 7px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .webui-bridge-prompt-only-lora-name {
+            font-weight: 800;
+        }
+        .webui-bridge-prompt-only-lora-folder {
+            padding-top: 0;
+            color: #93a2b7;
+            font-size: 10px;
+        }
+        .webui-bridge-prompt-only-library[hidden] {
+            display: none !important;
+        }
+        .webui-bridge-prompt-only-library {
+            flex: 1 1 auto;
+            min-width: 0;
+            min-height: 240px;
+            overflow: hidden;
+        }
+        .webui-bridge-prompt-only-panel.library-expanded .webui-bridge-prompt-only-textarea {
+            flex: 0 0 clamp(96px, 24%, 190px);
+            min-height: 76px;
+            resize: vertical;
+        }
+        .webui-bridge-prompt-only-panel.library-expanded .webui-bridge-prompt-only-chips {
+            flex: 0 0 clamp(96px, 24%, 190px);
+            min-height: 76px;
+        }
+        .webui-bridge-prompt-only-aio {
+            width: 100%;
+            height: 100% !important;
+            min-height: 0 !important;
+            max-height: none !important;
+            flex: 1 1 auto !important;
+        }
+        .webui-bridge-prompt-only-aio > .webui-bridge-section-resizer {
+            display: none;
+        }
+        .webui-bridge-prompt-only-loading {
+            display: grid;
+            place-items: center;
+            height: 100%;
+            min-height: 180px;
+            border: 1px dashed #3f5067;
+            border-radius: 6px;
+            color: #aebbd0;
+            background: #111722;
+        }
+        .webui-bridge-prompt-only-loading.error {
+            color: #ffadb4;
+        }
+        @media (max-width: 720px) {
+            .webui-bridge-prompt-only-label {
+                align-items: flex-start;
+            }
+            .webui-bridge-prompt-only-head-actions > span {
+                display: none;
+            }
+            .webui-bridge-prompt-only-lora-toolbar {
+                grid-template-columns: minmax(0, 1fr) auto;
+            }
+            .webui-bridge-prompt-only-lora-toolbar > .webui-bridge-config-input:first-child {
+                grid-column: 1 / -1;
+            }
+        }
         .webui-bridge-prompt-editor-panel .webui-bridge-custom-tags {
             max-height: none;
             min-height: 0;
@@ -18799,6 +20142,16 @@ app.registerExtension({
     },
     beforeRegisterNodeDef(nodeType, nodeData) {
         installWorkflowLoadSanitizer();
+        const promptOnlyConfig = PROMPT_ONLY_NODES[nodeData.name];
+        if (promptOnlyConfig) {
+            chainCallback(nodeType.prototype, "onNodeCreated", function () {
+                schedulePromptOnlyPanelInstall(this, promptOnlyConfig);
+            });
+            chainCallback(nodeType.prototype, "onConfigure", function (data) {
+                schedulePromptOnlyPanelInstall(this, promptOnlyConfig, data);
+            });
+            return;
+        }
         if (nodeData.name === IMAGE_INPUT_NODE) {
             chainCallback(nodeType.prototype, "onNodeCreated", function () {
                 installBridgeImageInputPanel(this);

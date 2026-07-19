@@ -149,6 +149,7 @@ EXTENSION_ASSETS = {
         "zip_url": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/archive/refs/heads/main.zip",
     },
 }
+BUNDLED_TAGCOMPLETE_DIR = DATA_DIR / EXTENSION_ASSETS["tagcomplete"]["directory"]
 MODULE_NODE_ASSETS = {
     "impact_pack": {
         "label": "ComfyUI Impact Pack",
@@ -363,7 +364,7 @@ TAGCOMPLETE_TYPE_LABELS = {
 ONLINE_TAG_TRANSLATION_URLS = (
     "https://raw.githubusercontent.com/byzod/a1111-sd-webui-tagcomplete-CN/main/tags/Tags-zh-full-pack.csv",
 )
-TAG_TRANSLATION_CACHE_FILE = DATA_DIR / EXTENSION_ASSETS["tagcomplete"]["directory"] / "tags" / "Tags-zh-full-pack.csv"
+TAG_TRANSLATION_CACHE_FILE = BUNDLED_TAGCOMPLETE_DIR / "tags" / "Tags-zh-full-pack.csv"
 BUILTIN_GROUP_TAGS = [
     {
         "name": "人物",
@@ -831,6 +832,14 @@ def _should_use_builtin_prompt_data(webui_groups=None):
     if mode == "webui":
         return False
     return not webui_groups
+
+
+def _tag_autocomplete_data_dir():
+    if _should_read_webui_data() and _extension_asset_data_ready(TAGCOMPLETE_DIR, "tagcomplete"):
+        return TAGCOMPLETE_DIR
+    if _data_source_mode() != "webui" and _extension_asset_data_ready(BUNDLED_TAGCOMPLETE_DIR, "tagcomplete"):
+        return BUNDLED_TAGCOMPLETE_DIR
+    return TAGCOMPLETE_DIR
 
 
 def _path_text(path):
@@ -1731,8 +1740,9 @@ def _load_tag_autocomplete_items():
 
     items = []
     item_by_key = {}
-    if _should_read_webui_data():
-        tag_file = TAGCOMPLETE_DIR / "tags" / "danbooru.csv"
+    autocomplete_dir = _tag_autocomplete_data_dir()
+    if _extension_asset_data_ready(autocomplete_dir, "tagcomplete"):
+        tag_file = autocomplete_dir / "tags" / "danbooru.csv"
         try:
             with tag_file.open("r", encoding="utf-8-sig", newline="") as f:
                 for row in csv.reader(f):
@@ -3057,6 +3067,8 @@ def _same_local_path(left, right):
 def _prompt_asset_source(path, asset_key):
     spec = EXTENSION_ASSETS[asset_key]
     local_path = DATA_DIR / spec["directory"]
+    if asset_key == "tagcomplete" and _same_local_path(path, BUNDLED_TAGCOMPLETE_DIR):
+        return "bundled"
     if _same_local_path(path, local_path):
         return "local"
     if WEBUI_ROOT and _same_local_path(path, WEBUI_ROOT / "extensions" / spec["directory"]):
@@ -3066,8 +3078,13 @@ def _prompt_asset_source(path, asset_key):
 
 def _prompt_library_status():
     use_external_data = _should_read_webui_data()
+    use_bundled_autocomplete = _data_source_mode() != "webui"
     prompt_ready = use_external_data and _extension_asset_data_ready(PROMPT_ALL_IN_ONE_DIR, "prompt_all_in_one")
     autocomplete_ready = use_external_data and _extension_asset_data_ready(TAGCOMPLETE_DIR, "tagcomplete")
+    bundled_autocomplete_ready = (
+        use_bundled_autocomplete
+        and _extension_asset_data_ready(BUNDLED_TAGCOMPLETE_DIR, "tagcomplete")
+    )
     builtin_ready = _should_use_builtin_prompt_data()
     prompt_source = (
         _prompt_asset_source(PROMPT_ALL_IN_ONE_DIR, "prompt_all_in_one")
@@ -3075,7 +3092,10 @@ def _prompt_library_status():
     )
     autocomplete_source = (
         _prompt_asset_source(TAGCOMPLETE_DIR, "tagcomplete")
-        if autocomplete_ready else "builtin" if prompt_ready or builtin_ready else "unavailable"
+        if autocomplete_ready
+        else "bundled" if bundled_autocomplete_ready
+        else "builtin" if prompt_ready or builtin_ready
+        else "unavailable"
     )
     return {
         "prompt": {
@@ -3085,8 +3105,10 @@ def _prompt_library_status():
         },
         "autocomplete": {
             "source": autocomplete_source,
-            "ready": bool(autocomplete_ready or prompt_ready or builtin_ready),
-            "path": _path_text(TAGCOMPLETE_DIR) if autocomplete_ready else "",
+            "ready": bool(autocomplete_ready or bundled_autocomplete_ready or prompt_ready or builtin_ready),
+            "path": _path_text(
+                TAGCOMPLETE_DIR if autocomplete_ready else BUNDLED_TAGCOMPLETE_DIR
+            ) if autocomplete_ready or bundled_autocomplete_ready else "",
         },
     }
 
@@ -5294,6 +5316,125 @@ def _load_bridge_mask_tensor(mask_name, image):
     return mask[: image.shape[0]]
 
 
+class _WebUIPromptBridgePromptBase:
+    """Small prompt-only node; the frontend adds the shared tag autocomplete UI."""
+
+    CATEGORY = "conditioning/webui"
+    FUNCTION = "output"
+    RETURN_TYPES = ("STRING",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                cls.PROMPT_NAME: (
+                    "STRING",
+                    {
+                        "default": cls.DEFAULT_PROMPT,
+                        "multiline": True,
+                    },
+                ),
+            },
+        }
+
+    def output(self, **kwargs):
+        return (str(kwargs.get(self.PROMPT_NAME, "") or ""),)
+
+
+class WebUIPromptBridgePositivePrompt(_WebUIPromptBridgePromptBase):
+    PROMPT_NAME = "positive_prompt"
+    DEFAULT_PROMPT = "masterpiece, best quality, anime style, 1girl"
+    RETURN_TYPES = ("STRING", "MODEL", "CLIP", "STRING")
+    RETURN_NAMES = ("positive_text", "model", "clip", "lora_info")
+    SEARCH_ALIASES = [
+        "webui positive prompt",
+        "positive prompt autocomplete",
+        "正向提示词",
+        "正面提示词",
+        "提示词补全",
+    ]
+
+    def __init__(self):
+        self.loaded_loras = {}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        input_types = super().INPUT_TYPES()
+        input_types["optional"] = {
+            "model": ("MODEL",),
+            "clip": ("CLIP",),
+        }
+        input_types["hidden"] = {
+            "prompt": "PROMPT",
+            "unique_id": "UNIQUE_ID",
+        }
+        return input_types
+
+    def _load_lora(self, lora_name):
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        cached = self.loaded_loras.get(lora_path)
+        if cached is None:
+            cached = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            self.loaded_loras[lora_path] = cached
+        return cached
+
+    def output(self, positive_prompt, model=None, clip=None, prompt=None, unique_id=None):
+        source_text = str(positive_prompt or "")
+        cleaned_text, loras = _parse_lora_tags(source_text)
+        if not loras:
+            return (source_text, model, clip, "未检测到 LoRA 标签")
+        if model is None or clip is None:
+            return (
+                source_text,
+                model,
+                clip,
+                f"检测到 {len(loras)} 个 LoRA，但 model / clip 未完整连接，尚未加载",
+            )
+
+        applied = []
+        skipped_upstream = []
+        missing = []
+        upstream_loras = _collect_upstream_loras_from_prompt(prompt, unique_id)
+        for requested, strength_model, strength_clip in loras:
+            resolved = _resolve_lora_name(requested)
+            if resolved is None:
+                missing.append(requested)
+                continue
+            if _lora_key(resolved) in upstream_loras or _lora_key(requested) in upstream_loras:
+                skipped_upstream.append(resolved)
+                continue
+            if strength_clip is None:
+                strength_clip = 1.0
+            if strength_model == 0 and strength_clip == 0:
+                continue
+            lora = self._load_lora(resolved)
+            model, clip = comfy.sd.load_lora_for_models(model, clip, lora, strength_model, strength_clip)
+            applied.append(f"{resolved}:model={strength_model:g}:clip={strength_clip:g}")
+            print(f"[WebUIPromptBridgePositivePrompt] Applied LoRA: {resolved} model={strength_model:g} clip={strength_clip:g}")
+
+        if missing:
+            raise ValueError("Missing LoRA(s): " + ", ".join(missing))
+        info_parts = []
+        if applied:
+            info_parts.append("Applied: " + "; ".join(applied))
+        if skipped_upstream:
+            info_parts.append("Skipped upstream: " + ", ".join(skipped_upstream))
+        return (cleaned_text, model, clip, " | ".join(info_parts) or "LoRA 标签未产生变更")
+
+
+class WebUIPromptBridgeNegativePrompt(_WebUIPromptBridgePromptBase):
+    PROMPT_NAME = "negative_prompt"
+    DEFAULT_PROMPT = "worst quality, low quality, blurry, bad anatomy, extra fingers"
+    RETURN_NAMES = ("negative_text",)
+    SEARCH_ALIASES = [
+        "webui negative prompt",
+        "negative prompt autocomplete",
+        "负向提示词",
+        "反向提示词",
+        "提示词补全",
+    ]
+
+
 class WebUIPromptBridgeImageInput:
     CATEGORY = "conditioning/webui"
     SEARCH_ALIASES = ["webui img2img", "webui image input", "webui inpaint", "bridge image input", "图生图", "局部重绘"]
@@ -5853,6 +5994,8 @@ class WebUIPromptBridgeInpaintConditioning:
 
 
 _BRIDGE_NODE_SEARCH_ALIASES = {
+    "WebUIPromptBridgePositivePrompt": ["webui positive prompt", "positive prompt", "正向提示词"],
+    "WebUIPromptBridgeNegativePrompt": ["webui negative prompt", "negative prompt", "负向提示词", "反向提示词"],
     "WebUIPromptBridgeImageInput": ["webui img2img", "image input", "inpaint image", "图生图", "局部重绘"],
     "WebUIPromptBridgeADetailerConfig": ["webui adetailer", "adetailer config", "face detailer", "hand detailer"],
     "WebUIPromptBridgeControlNetConfig": ["webui controlnet", "controlnet config", "control net"],
@@ -5870,6 +6013,8 @@ _BRIDGE_NODE_SEARCH_ALIASES = {
 
 NODE_CLASS_MAPPINGS = {
     "WebUIPromptBridge": WebUIPromptBridge,
+    "WebUIPromptBridgePositivePrompt": WebUIPromptBridgePositivePrompt,
+    "WebUIPromptBridgeNegativePrompt": WebUIPromptBridgeNegativePrompt,
     "WebUIPromptBridgeImageInput": WebUIPromptBridgeImageInput,
     "WebUIPromptBridgeADetailerConfig": WebUIPromptBridgeADetailerConfig,
     "WebUIPromptBridgeControlNetConfig": WebUIPromptBridgeControlNetConfig,
@@ -5892,6 +6037,8 @@ for _node_name, _aliases in _BRIDGE_NODE_SEARCH_ALIASES.items():
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "WebUIPromptBridge": "WebUI Prompt Bridge",
+    "WebUIPromptBridgePositivePrompt": "WebUI Bridge Positive Prompt",
+    "WebUIPromptBridgeNegativePrompt": "WebUI Bridge Negative Prompt",
     "WebUIPromptBridgeImageInput": "WebUI Bridge Image Input",
     "WebUIPromptBridgeADetailerConfig": "WebUI Bridge ADetailer Config",
     "WebUIPromptBridgeControlNetConfig": "WebUI Bridge ControlNet Config",

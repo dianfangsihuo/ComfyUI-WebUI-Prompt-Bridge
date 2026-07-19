@@ -18,6 +18,100 @@ SPEC.loader.exec_module(NODES)
 
 
 class PromptLibraryTests(unittest.TestCase):
+    def test_bundled_autocomplete_works_offline_on_a_clean_install(self):
+        bundled_dir = REPO_ROOT / "data" / "a1111-sd-webui-tagcomplete"
+        tag_file = bundled_dir / "tags" / "danbooru.csv"
+        translation_file = bundled_dir / "tags" / "Tags-zh-full-pack.csv"
+        self.assertTrue(tag_file.is_file(), "release package must include danbooru.csv")
+        self.assertTrue(translation_file.is_file(), "release package must include the Chinese tag map")
+        self.assertGreater(tag_file.stat().st_size, 3_000_000)
+        self.assertGreater(translation_file.stat().st_size, 250_000)
+
+        for data_source in ("auto", "builtin"):
+            with self.subTest(data_source=data_source), mock.patch.object(
+                NODES,
+                "LOCAL_CONFIG",
+                {"settings": {"data_source": data_source, "tag_translation_source": "local"}},
+            ), mock.patch.object(
+                NODES,
+                "TAGCOMPLETE_DIR",
+                REPO_ROOT / "missing-webui-tagcomplete",
+            ), mock.patch.object(
+                NODES,
+                "BUNDLED_TAGCOMPLETE_DIR",
+                bundled_dir,
+            ), mock.patch.object(
+                NODES,
+                "TAG_TRANSLATION_CACHE_FILE",
+                translation_file,
+            ), mock.patch.object(
+                NODES,
+                "_TAG_AUTOCOMPLETE_CACHE",
+                None,
+            ), mock.patch.object(
+                NODES,
+                "_TAG_TRANSLATION_MAP_CACHE",
+                None,
+            ), mock.patch.object(
+                NODES.urllib.request,
+                "urlopen",
+                side_effect=AssertionError("bundled autocomplete must not use the network"),
+            ):
+                suggestions = NODES._autocomplete_prompt_tags("s", limit=6)
+                status = NODES._prompt_library_status()
+
+            self.assertEqual(
+                [item["text"] for item in suggestions],
+                ["solo", "smile", "short_hair", "simple_background", "shirt", "skirt"],
+            )
+            self.assertEqual(suggestions[0]["local"], "单人")
+            self.assertEqual(suggestions[0]["count"], 5_000_954)
+            self.assertEqual(status["autocomplete"]["source"], "bundled")
+            self.assertTrue(status["autocomplete"]["ready"])
+
+    def test_prompt_only_nodes_are_registered_and_return_text(self):
+        positive_class = NODES.NODE_CLASS_MAPPINGS["WebUIPromptBridgePositivePrompt"]
+        positive_inputs = positive_class.INPUT_TYPES()
+        self.assertEqual(list(positive_inputs["required"]), ["positive_prompt"])
+        self.assertEqual(list(positive_inputs["optional"]), ["model", "clip"])
+        self.assertEqual(positive_class.RETURN_TYPES, ("STRING", "MODEL", "CLIP", "STRING"))
+        self.assertEqual(positive_class.RETURN_NAMES, ("positive_text", "model", "clip", "lora_info"))
+        self.assertEqual(
+            positive_class().output(positive_prompt="tag_a, tag_b"),
+            ("tag_a, tag_b", None, None, "未检测到 LoRA 标签"),
+        )
+        self.assertEqual(
+            positive_class().output(positive_prompt="tag_a,\ntag_b"),
+            ("tag_a,\ntag_b", None, None, "未检测到 LoRA 标签"),
+        )
+
+        negative_class = NODES.NODE_CLASS_MAPPINGS["WebUIPromptBridgeNegativePrompt"]
+        negative_inputs = negative_class.INPUT_TYPES()["required"]
+        self.assertEqual(list(negative_inputs), ["negative_prompt"])
+        self.assertTrue(negative_inputs["negative_prompt"][1]["multiline"])
+        self.assertEqual(negative_class.RETURN_TYPES, ("STRING",))
+        self.assertEqual(negative_class.RETURN_NAMES, ("negative_text",))
+        self.assertEqual(negative_class().output(negative_prompt="tag_a, tag_b"), ("tag_a, tag_b",))
+        self.assertEqual(negative_class().output(negative_prompt="tag_a,\ntag_b"), ("tag_a,\ntag_b",))
+
+    def test_positive_prompt_node_applies_lora_to_connected_model_and_clip(self):
+        node = NODES.WebUIPromptBridgePositivePrompt()
+        with (
+            mock.patch.object(NODES, "_resolve_lora_name", return_value="folder/example.safetensors"),
+            mock.patch.object(node, "_load_lora", return_value="loaded_lora"),
+            mock.patch.object(NODES.comfy.sd, "load_lora_for_models", return_value=("patched_model", "patched_clip")) as apply_lora,
+        ):
+            result = node.output(
+                positive_prompt="masterpiece, <lora:example:0.75>",
+                model="base_model",
+                clip="base_clip",
+                prompt={},
+                unique_id="42",
+            )
+        self.assertEqual(result[:3], ("masterpiece", "patched_model", "patched_clip"))
+        self.assertIn("folder/example.safetensors:model=0.75:clip=1", result[3])
+        apply_lora.assert_called_once_with("base_model", "base_clip", "loaded_lora", 0.75, 1.0)
+
     def test_zoom_summary_threshold_is_normalized_and_persisted(self):
         with mock.patch.object(
             NODES,

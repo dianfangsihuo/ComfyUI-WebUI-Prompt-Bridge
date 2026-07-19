@@ -4,7 +4,13 @@ __pycache__/
 data/storage/
 data/styles.csv
 data/sd-webui-prompt-all-in-one/
-data/a1111-sd-webui-tagcomplete/
+# Keep downloaded TagComplete files private, but ship the two data files that
+# make English/Chinese autocomplete available on a clean installation.
+data/a1111-sd-webui-tagcomplete/*
+!data/a1111-sd-webui-tagcomplete/tags/
+data/a1111-sd-webui-tagcomplete/tags/*
+!data/a1111-sd-webui-tagcomplete/tags/danbooru.csv
+!data/a1111-sd-webui-tagcomplete/tags/Tags-zh-full-pack.csv
 config.local.json
 .env
 .venv/
