@@ -126,7 +126,7 @@ const MAX_FONT_SIZE = 22;
 const WORD_DELIMITERS = ",;，；、\n\r\t";
 const DEFAULT_PANEL_WIDTH = 1180;
 const DEFAULT_PANEL_HEIGHT = 1180;
-const BRIDGE_LOW_ZOOM_THRESHOLD = 0.5;
+const BRIDGE_LOW_ZOOM_THRESHOLD = 0.62;
 const BRIDGE_LOW_ZOOM_THRESHOLD_MIN = 0;
 const BRIDGE_LOW_ZOOM_THRESHOLD_MAX = 1;
 const ACTION_SIDEBAR_DEFAULT_WIDTH = 400;
@@ -256,6 +256,7 @@ const BRIDGE_LAYOUT_STORAGE_KEY_SET = new Set(Object.values(BRIDGE_LAYOUT_STORAG
 const BRIDGE_LAYOUT_LOCAL_UPDATED_PREFIX = "webui-bridge-layout-local-updated:";
 const BRIDGE_LAYOUT_STATE_APPLIED_KEY = "webui-bridge-layout-state-applied";
 const SIDEBAR_ACTIVE_TAB_KEY = "webui-bridge-sidebar-active-tab-v1";
+const PROMPT_WORKSPACE_ACTIVE_KEY = "webui-bridge-prompt-workspace-active-v1";
 const BRIDGE_LAYOUT_STATE_NUMBER_SPECS = Object.freeze({
     top_row_height: [64, PANEL_MAX_HEIGHT],
     extra_height: [42, EXTRA_NETWORKS_MAX_HEIGHT],
@@ -386,9 +387,9 @@ const ADVANCED_MODULE_VISIBILITY_OPTIONS = [
     ["module_mask", "Mask 区域"],
     ["module_controlnet", "ControlNet"],
     ["module_adetailer", "ADetailer"],
-    ["module_sam", "SAM/Inpaint"],
-    ["module_upscale", "放大修复"],
-    ["module_regional_lora", "区域 LoRA"],
+    ["module_sam", "SAM / Inpaint 接入"],
+    ["module_upscale", "放大 / Hires.fix 接入"],
+    ["module_regional_lora", "区域 LoRA 审计"],
 ];
 const MODULE_VISIBILITY_OPTIONS = [
     ...MAIN_MODULE_VISIBILITY_OPTIONS,
@@ -961,8 +962,10 @@ function resetResizeTargetHeight(target, storageKey, fill = "") {
 
 function applyTopRowCollapsedState(topRow, collapsed) {
     if (!topRow) return;
-    topRow.classList.toggle("negative-collapsed", collapsed);
-    if (collapsed) {
+    const negativeWorkspaceVisible = topRow.querySelector?.(".webui-bridge-prompts")?.classList?.contains("show-negative-workspace");
+    const shouldCollapse = Boolean(collapsed && negativeWorkspaceVisible);
+    topRow.classList.toggle("negative-collapsed", shouldCollapse);
+    if (shouldCollapse) {
         topRow.style.height = "";
         topRow.style.flex = "";
         return;
@@ -8676,7 +8679,7 @@ function showPromptManagementSettings(title, translateStorageKey, autoTranslate 
         ]
         : [
             "“未匹配本地关键词组，保留原文”表示本地 Prompt-all-in-one 词库没有这段中文的映射；不是生成错误。可以换成更短的词、点“英”做整段翻译，或在收藏/词库里补充本地关键词。",
-            "Prompt 文本框、已输入 tag 区、收藏/标签列表和 Extra Networks 边界都有细拖拽条；上下拖动会自动分配相邻区域高度，双击恢复默认。",
+            "Prompt 文本框、已输入 tag 区、收藏/标签列表和 LoRA 区边界都有细拖拽条；上下拖动会自动分配相邻区域高度，双击恢复默认。",
             "Negative prompt 右侧可以折叠反向词区域，适合只管理正向提示词时腾出空间。",
         ];
     mask.addEventListener("mousedown", (event) => {
@@ -10320,18 +10323,32 @@ function buildPanel(node) {
         el("div", { class: "webui-bridge-config-note" }, message),
         ...(template ? [el("textarea", { class: "webui-bridge-config-input", rows: "4", readonly: "readonly" }, template)] : []),
     ]);
-    const moduleAssetStatus = (kind, packageKey = "") => {
+    const moduleReadiness = (moduleKey) => state.moduleAssets?.readiness?.[moduleKey] || null;
+    const moduleAssetItems = (kind) => (state.moduleAssets?.models?.[kind]?.items || []).map((item) => String(item || ""));
+    const pickModuleAsset = (kind, markers = []) => {
+        const items = moduleAssetItems(kind);
+        const needles = markers.map((marker) => String(marker || "").toLowerCase());
+        return items.find((item) => needles.some((needle) => item.toLowerCase().includes(needle))) || items[0] || "";
+    };
+    const moduleAssetStatus = (kind, packageKey = "", moduleKey = "") => {
         const line = el("div", { class: "webui-bridge-module-note webui-bridge-module-asset" }, "模块资产: 正在等待扫描");
         const render = () => {
             const assets = state.moduleAssets || {};
             const model = assets.models?.[kind];
             const pkg = packageKey ? assets.node_packages?.[packageKey] : null;
+            const readiness = moduleKey ? moduleReadiness(moduleKey) : null;
             const parts = [];
             if (model) parts.push(`${model.count || 0} 个模型`);
             if (pkg) parts.push(pkg.installed ? `${pkg.name} 已安装` : `${pkg.name} 未安装`);
             if (!parts.length) parts.push("重启 ComfyUI 后可读取模块资产");
-            line.textContent = `模块资产: ${parts.join("；")}`;
-            line.title = model?.items?.length ? model.items.slice(0, 16).join("\n") : "";
+            line.classList.remove("ready", "partial", "blocked", "audit");
+            if (readiness?.level) line.classList.add(readiness.level);
+            line.replaceChildren(
+                el("b", {}, readiness?.label || "资产状态"),
+                el("span", {}, parts.join("；")),
+                ...(readiness?.detail ? [el("small", {}, readiness.detail)] : []),
+            );
+            line.title = model?.items?.length ? model.items.slice(0, 16).join("\n") : (readiness?.detail || "");
         };
         line.__webuiBridgeRender = render;
         render();
@@ -10503,9 +10520,9 @@ function buildPanel(node) {
     const moduleUpscaleEnabledInput = moduleCheckbox(moduleUpscaleEnabledWidget);
     const moduleUpscaleModeInput = moduleSelect(moduleUpscaleModeWidget, "hires_fix", [
         { value: "hires_fix", label: "Hires.fix" },
-        { value: "ultimate_sd_upscale", label: "Ultimate SD Upscale" },
+        { value: "ultimate_sd_upscale", label: "Ultimate 参数（手动接）" },
         { value: "latent_upscale", label: "Latent Upscale" },
-        { value: "tile", label: "Tiled" },
+        { value: "tile", label: "Tiled 参数（手动接）" },
     ]);
     const moduleUpscaleByInput = moduleNumber(moduleUpscaleByWidget, 2, { min: "1", max: "8", step: "0.05" });
     const moduleUpscaleUpscalerInput = moduleText(moduleUpscaleUpscalerWidget, "Latent", 1);
@@ -10956,7 +10973,18 @@ function buildPanel(node) {
         return graphNode;
     };
     const moduleBuildHistory = [];
+    const moduleBuildButtons = [];
     const restoreButtons = [];
+    const updateModuleBuildButtons = () => {
+        for (const button of moduleBuildButtons) {
+            const readiness = moduleReadiness(button.dataset.moduleKind);
+            const blocked = readiness?.level === "blocked";
+            button.disabled = blocked;
+            button.title = blocked
+                ? `${readiness.label || "当前不可用"}：${readiness.detail || "请先补齐模块资产"}`
+                : (readiness?.detail || "");
+        }
+    };
     const updateModuleRestoreButtons = () => {
         for (const button of restoreButtons) {
             const kind = button.dataset.moduleKind;
@@ -11017,22 +11045,47 @@ function buildPanel(node) {
         if (created[0]) {
             app.canvas.selectNode?.(created[0]);
         }
-        const missingInputs = report?.manualHint || "未自动连接的 IMAGE / VAE / MASK / CONTROL_NET 等接口，需要按当前工作流手动接入";
+        const required = [...new Set(report?.required || [])];
+        const missingInputs = String(report?.manualHint || (required.length
+            ? `待接入 ${required.join("、")}`
+            : "请检查新节点是否已接入当前生成主链路"))
+            .trim()
+            .replace(/[。；;]+$/u, "");
+        const compactMessages = (items, limit) => (items || [])
+            .slice(0, limit)
+            .map((item) => String(item || "").trim().replace(/[。；;]+$/u, ""))
+            .filter(Boolean)
+            .join("；");
         const details = [];
-        if (report?.errors?.length) details.push(`失败: ${report.errors.slice(0, 3).join("；")}`);
-        if (report?.warnings?.length) details.push(`注意: ${report.warnings.slice(0, 4).join("；")}`);
+        if (report?.errors?.length) details.push(`失败: ${compactMessages(report.errors, 3)}`);
+        if (report?.warnings?.length) details.push(`注意: ${compactMessages(report.warnings, 4)}`);
         const kind = report?.errors?.length ? "error" : (report?.warnings?.length ? "warning" : "success");
         const prefix = report?.errors?.length ? `部分构建 ${label} 外置节点` : `已构建 ${label} 外置节点`;
-        setStatus(`${prefix}，已自动连接 ${report?.connected?.length || 0} 条线；${missingInputs}${details.length ? `；${details.join("；")}` : ""}`, { kind, sticky: true });
+        setStatus(`${prefix}：${created.length} 个节点 / ${report?.connected?.length || 0} 条自动连线；${missingInputs}${details.length ? `；${details.join("；")}` : ""}`, { kind, sticky: true });
     };
     const buildExternalModuleNodes = (kind) => {
         const report = { connected: [], warnings: [], errors: [], replacedLinks: [] };
+        const readiness = moduleReadiness(kind);
+        if (readiness?.level === "blocked") {
+            setStatus(`${readiness.label || "模块当前不可用"}：${readiness.detail || "请先补齐模块资产"}`, { kind: "error", sticky: true });
+            return;
+        }
         const moduleControlsSnapshot = captureModuleControlSnapshot();
         try {
             syncModuleWidgets();
         } catch (error) {
             setStatus(`同步模块参数失败: ${error?.message || error}`, { kind: "error", sticky: true });
             return;
+        }
+        if (kind === "upscale") {
+            moduleUpscaleEnabledInput.checked = true;
+            syncModuleWidgets();
+            const mode = moduleUpscaleModeInput.value || "hires_fix";
+            if (mode === "ultimate_sd_upscale" || mode === "tile") {
+                const modeLabel = mode === "tile" ? "Tiled" : "Ultimate";
+                setStatus(`已保存 ${modeLabel} 参数：未创建内置节点，请手动接入已安装的外置分块放大节点`, { kind: "success", sticky: true });
+                return;
+            }
         }
         if (!app?.graph || !LiteGraph) {
             setStatus("无法构建外置节点：ComfyUI 图形接口还没有就绪，请稍后再试。", { kind: "error", sticky: true });
@@ -11046,6 +11099,7 @@ function buildPanel(node) {
             return graphNode;
         };
         if (kind === "img2img") {
+            report.required = ["IMAGE", "VAE", "KSampler 主链路"];
             setWidgetValue(node, "module_img2img_enabled", true);
             const mode = String(moduleImg2ImgModeWidget?.value || "img2img");
             const hasMask = Boolean(normalizeBridgeImageRef(moduleImg2ImgMaskWidget?.value));
@@ -11060,6 +11114,7 @@ function buildPanel(node) {
             return;
         }
         if (kind === "mask") {
+            report.required = ["LATENT", "MASK", "IMAGE", "VAE"];
             moduleMaskEnabledInput.checked = true;
             moduleSamEnabledInput.checked = moduleSamEnabledInput.checked || false;
             syncModuleWidgets();
@@ -11075,6 +11130,7 @@ function buildPanel(node) {
             return;
         }
         if (kind === "adetailer") {
+            report.required = ["IMAGE", "VAE"];
             moduleAdetailerEnabledInput.checked = true;
             syncModuleWidgets();
             const conditioning = make("WebUIPromptBridgeADetailerConditioning", "ADetailer Conditioning", 0, 0);
@@ -11094,6 +11150,7 @@ function buildPanel(node) {
             return;
         }
         if (kind === "controlnet") {
+            report.required = ["CONTROL_NET", "控制图 IMAGE"];
             moduleControlnetEnabledInput.checked = true;
             syncModuleWidgets();
             const apply = make("WebUIPromptBridgeControlNetApply", "Apply ControlNet", 0, 0);
@@ -11106,6 +11163,8 @@ function buildPanel(node) {
             return;
         }
         if (kind === "sam") {
+            report.required = ["SAM 分割节点输出的 MASK", "IMAGE", "VAE"];
+            report.warnings.push("当前只构建 Mask/Inpaint 接入节点，不会自动创建第三方 SAM Loader 或分割节点。");
             moduleSamEnabledInput.checked = true;
             moduleMaskEnabledInput.checked = true;
             syncModuleWidgets();
@@ -11121,10 +11180,10 @@ function buildPanel(node) {
             return;
         }
         if (kind === "upscale") {
+            report.required = ["KSampler / VAE 主链路"];
             moduleUpscaleEnabledInput.checked = true;
             const upgradedSharpDefaults = applyHiresSharpDefaults();
             syncModuleWidgets();
-            const mode = moduleUpscaleModeInput.value || "hires_fix";
             const latent = make("WebUIPromptBridgeLatentUpscale", "Latent Upscale", 0, 0);
             const hires = make("KSampler", "Hires.fix KSampler", 420, 0);
             setNodeWidgetValue(latent, "fallback_method", "nearest-exact");
@@ -11134,14 +11193,7 @@ function buildPanel(node) {
                 report.warnings.push("已把旧版偏糊的 Hires.fix 默认值升级为清晰优先：nearest-exact / steps 18 / denoise 0.48。");
             }
             if (!insertedLatent) {
-                let image = null;
-                if (mode === "ultimate_sd_upscale" || mode === "tile") {
-                    image = make("WebUIPromptBridgeImageUpscale", "Image Upscale", 0, 220);
-                    connectGraphSlots(node, "module_config", image, "module_config", report);
-                }
-                if (!image || !insertImageUpscaleIntoMainRoute(image, report)) {
-                    report.warnings.push("放大节点已创建，但没有找到可自动改线的 KSampler/VAE/Preview 主链路。真正 Hires.fix 需要接成：原 KSampler.LATENT -> Latent Upscale.samples -> Hires KSampler.latent_image -> VAE Decode.samples。");
-                }
+                report.warnings.push("放大节点已创建，但没有找到可自动改线的 KSampler/VAE/Preview 主链路。真正 Hires.fix 需要接成：原 KSampler.LATENT -> Latent Upscale.samples -> Hires KSampler.latent_image -> VAE Decode.samples。");
             }
             moduleBuildHistory.push({ kind, label: "放大修复", created: [...created], replacedLinks: [...report.replacedLinks], moduleControls: moduleControlsSnapshot });
             updateModuleRestoreButtons();
@@ -11149,11 +11201,16 @@ function buildPanel(node) {
             return;
         }
     };
-    const buildModuleButton = (kind, label) => el("button", {
-        class: "webui-bridge-module-button",
-        type: "button",
-        onclick: () => buildExternalModuleNodes(kind),
-    }, label);
+    const buildModuleButton = (kind, label) => {
+        const button = el("button", {
+            class: "webui-bridge-module-button",
+            type: "button",
+            onclick: () => buildExternalModuleNodes(kind),
+        }, label);
+        button.dataset.moduleKind = kind;
+        moduleBuildButtons.push(button);
+        return button;
+    };
     const restoreModuleButton = (kind, label = "还原上次构建") => {
         const button = el("button", {
             class: "webui-bridge-module-button webui-bridge-module-button-secondary",
@@ -11172,6 +11229,7 @@ function buildPanel(node) {
     const regionalModuleSection = el("div", { class: "webui-bridge-modules" }, [
         moduleSection("module_img2img", "图生图 / 局部重绘", null, [
             moduleHint("直接在主节点侧栏上传原图；需要局部重绘时打开涂抹编辑，主节点会输出 IMAGE、MASK、denoise 和 mode。"),
+            moduleAssetStatus("", "", "img2img"),
             buildBridgeImageInputPanel(node, {
                 title: "图生图输入",
                 subtitle: "输出在主节点 image / mask 接口，可接 VAE Encode 或 Inpaint Conditioning",
@@ -11189,6 +11247,7 @@ function buildPanel(node) {
         ]),
         moduleSection("module_mask", "Mask 区域", moduleMaskEnabledInput, [
             moduleHint("连接本节点可选 MASK 输入后，启用会把 mask 写入正向 conditioning；也可把 module_config 接到 WebUI Bridge Set Latent Mask。"),
+            moduleAssetStatus("", "", "mask"),
             el("label", {}, [el("span", {}, "强度"), moduleMaskStrengthInput]),
             el("label", { class: "webui-bridge-module-check" }, [moduleMaskBoundsInput, el("span", {}, "Mask 决定采样边界")]),
             moduleBuildActions("mask", "一键构建 Mask/Inpaint 节点"),
@@ -11220,7 +11279,7 @@ function buildPanel(node) {
         ]),
         moduleSection("module_adetailer", "ADetailer 局部修复", moduleAdetailerEnabledInput, [
             moduleHint("检测脸、手、人物等目标区域后局部重绘。module_config 可接 WebUI Bridge ADetailer Conditioning，再接 WebUI Bridge Apply ADetailer 直接输出修复图。"),
-            moduleAssetStatus("ultralytics", "impact_pack"),
+            moduleAssetStatus("ultralytics", "impact_pack", "adetailer"),
             el("label", {}, [el("span", {}, "模型"), moduleAdetailerModelInput]),
             el("div", { class: "webui-bridge-module-grid" }, [
                 el("label", {}, [el("span", {}, "置信度"), moduleAdetailerConfidenceInput]),
@@ -11258,8 +11317,8 @@ function buildPanel(node) {
             installModuleAssetsButton(["impact_pack", "impact_subpack"], "安装检测节点包"),
         ]),
         moduleSection("module_controlnet", "ControlNet", moduleControlnetEnabledInput, [
-            moduleHint("WebUI ControlNet 风格配置模块。把 module_config、CONTROL_NET、控制图接到 WebUI Bridge Apply ControlNet 即可应用权重和控制区间。"),
-            moduleAssetStatus("controlnet", "controlnet_aux"),
+            moduleHint("配置权重和控制区间；预处理器与 ControlNet 模型是两类资产。构建后仍需把 CONTROL_NET 和控制图接到 Apply 节点。"),
+            moduleAssetStatus("controlnet", "controlnet_aux", "controlnet"),
             el("label", {}, [el("span", {}, "预处理"), moduleControlnetPreprocessorInput]),
             el("label", {}, [el("span", {}, "模型"), moduleControlnetModelInput]),
             el("div", { class: "webui-bridge-module-grid" }, [
@@ -11272,9 +11331,16 @@ function buildPanel(node) {
             el("label", { class: "webui-bridge-module-check" }, [moduleControlnetPixelPerfectInput, el("span", {}, "Pixel Perfect")]),
             el("div", { class: "webui-bridge-module-actions" }, [
                 el("button", { class: "webui-bridge-module-button", type: "button", onclick: () => {
+                    const model = pickModuleAsset("controlnet", ["canny"]);
+                    if (!model) {
+                        moduleControlnetEnabledInput.checked = false;
+                        syncModuleWidgets();
+                        setStatus("缺少 ControlNet 模型：Canny 模板不会写入不存在的 SD1.5 模型名。", { kind: "error", sticky: true });
+                        return;
+                    }
                     moduleControlnetEnabledInput.checked = true;
                     moduleControlnetPreprocessorInput.value = "canny";
-                    moduleControlnetModelInput.value = "control_v11p_sd15_canny";
+                    moduleControlnetModelInput.value = model;
                     moduleControlnetWeightInput.value = "1";
                     moduleControlnetStartInput.value = "0";
                     moduleControlnetEndInput.value = "1";
@@ -11283,9 +11349,16 @@ function buildPanel(node) {
                     syncModuleWidgets();
                 } }, "Canny 模板"),
                 el("button", { class: "webui-bridge-module-button", type: "button", onclick: () => {
+                    const model = pickModuleAsset("controlnet", ["openpose", "pose"]);
+                    if (!model) {
+                        moduleControlnetEnabledInput.checked = false;
+                        syncModuleWidgets();
+                        setStatus("缺少可匹配的 OpenPose ControlNet 模型，未写入虚假的默认模型名。", { kind: "error", sticky: true });
+                        return;
+                    }
                     moduleControlnetEnabledInput.checked = true;
                     moduleControlnetPreprocessorInput.value = "openpose";
-                    moduleControlnetModelInput.value = "control_v11p_sd15_openpose";
+                    moduleControlnetModelInput.value = model;
                     moduleControlnetWeightInput.value = "0.85";
                     moduleControlnetStartInput.value = "0";
                     moduleControlnetEndInput.value = "0.85";
@@ -11298,9 +11371,9 @@ function buildPanel(node) {
             refreshModuleAssetsButton(),
             installModuleAssetsButton(["controlnet_aux"], "安装预处理节点包"),
         ]),
-        moduleSection("module_sam", "SAM/Inpaint", moduleSamEnabledInput, [
-            moduleHint("SAM 分割 + Inpaint 参数模块。已有 MASK 时可把 module_config 接到 WebUI Bridge Inpaint Conditioning 或 Set Latent Mask；检测模型链路可接 SAM 类节点。"),
-            moduleAssetStatus("sams", "segment_anything"),
+        moduleSection("module_sam", "SAM / Inpaint 接入", moduleSamEnabledInput, [
+            moduleHint("这里保存 SAM/Inpaint 参数并构建 Mask/Inpaint 接入节点；不会猜测第三方 SAM 节点类型。请先由已安装的 SAM 插件输出 MASK。"),
+            moduleAssetStatus("sams", "segment_anything", "sam"),
             el("label", {}, [el("span", {}, "模型"), moduleSamModelInput]),
             el("label", {}, [el("span", {}, "模式"), moduleSamPromptModeInput]),
             el("div", { class: "webui-bridge-module-grid" }, [
@@ -11326,13 +11399,13 @@ function buildPanel(node) {
                 } }, "局部重绘模板"),
                 el("button", { class: "webui-bridge-module-button", type: "button", onclick: showMaskModule }, "Mask 接入"),
             ]),
-            moduleBuildActions("sam", "一键构建 SAM/Inpaint 节点"),
+            moduleBuildActions("sam", "构建 Inpaint 接入节点"),
             refreshModuleAssetsButton(),
             installModuleAssetsButton(["segment_anything"], "安装 SAM 节点包"),
         ]),
-        moduleSection("module_upscale", "放大修复", moduleUpscaleEnabledInput, [
-            moduleHint("WebUI Hires.fix / Ultimate SD Upscale 风格参数。module_config 可接 WebUI Bridge Image Upscale 或 Latent Upscale 直接按倍率放大。"),
-            moduleAssetStatus("upscale_models", "ultimate_upscale"),
+        moduleSection("module_upscale", "放大 / Hires.fix 接入", moduleUpscaleEnabledInput, [
+            moduleHint("一键构建负责内置 Latent/Image Upscale 与二次采样接入。Ultimate/Tiled 选项只保存参数，不会冒充已连接外置分块放大节点。"),
+            moduleAssetStatus("upscale_models", "ultimate_upscale", "upscale"),
             el("label", {}, [el("span", {}, "模式"), moduleUpscaleModeInput]),
             el("label", {}, [el("span", {}, "算法"), moduleUpscaleUpscalerInput]),
             el("div", { class: "webui-bridge-module-grid" }, [
@@ -11364,20 +11437,23 @@ function buildPanel(node) {
                     moduleUpscaleTileHeightInput.value = "768";
                     moduleUpscaleOverlapInput.value = "64";
                     syncModuleWidgets();
-                } }, "Ultimate"),
+                } }, "Ultimate 参数"),
             ]),
-            moduleBuildActions("upscale", "一键构建放大节点"),
+            moduleBuildActions("upscale", "执行当前放大模式"),
             refreshModuleAssetsButton(),
             installModuleAssetsButton(["ultimate_upscale"], "安装 Ultimate 节点包"),
         ]),
-        moduleSection("module_regional_lora", "区域 LoRA", moduleRegionalLoraEnabledInput, [
-            moduleHint("后端会审计区域 prompt 里的 LoRA；普通 LoRA 仍是全局加载，需要严格分离时用多分支 + mask 合成。"),
+        moduleSection("module_regional_lora", "区域 LoRA 审计", moduleRegionalLoraEnabledInput, [
+            moduleHint("仅统计区域 Prompt 中出现的 LoRA，不改变加载范围，也不会把 LoRA 隔离到某个区域。需要严格分离时请使用多分支 + Mask 合成。"),
+            moduleAssetStatus("", "", "regional_lora"),
         ]),
     ]);
     renderModuleAssetStatuses = () => {
         for (const item of regionalModuleSection.querySelectorAll(".webui-bridge-module-asset")) item.__webuiBridgeRender?.();
         for (const item of document.querySelectorAll(".webui-bridge-settings-asset-card")) item.__webuiBridgeRender?.();
+        updateModuleBuildButtons();
     };
+    renderModuleAssetStatuses();
     syncModuleWidgets();
 
     const setStatus = (message, options = {}) => {
@@ -12159,12 +12235,18 @@ function buildPanel(node) {
 
     const showPromptMarketDialog = () => {
         const mask = el("div", { class: "webui-bridge-config-mask" });
+        const categoryBar = el("div", { class: "webui-bridge-prompt-market-categories" });
         const sourceList = el("div", { class: "webui-bridge-prompt-market-list" });
         const statusLine = el("div", { class: "webui-bridge-config-status" }, "正在读取提示词市场...");
+        let sourceCache = [];
+        let activeCategory = "全部";
         const close = () => mask.remove();
         const renderSources = (sources) => {
             sourceList.innerHTML = "";
-            for (const source of sources || []) {
+            const visibleSources = activeCategory === "全部"
+                ? (sources || [])
+                : (sources || []).filter((source) => (source.category || "其他") === activeCategory);
+            for (const source of visibleSources) {
                 const importLabel = source.importable ? (source.imported ? "重新导入" : "一键导入") : "仅可打开";
                 const importButton = el("button", {
                     type: "button",
@@ -12213,7 +12295,10 @@ function buildPanel(node) {
                 const metaLine = el("code", {}, marketSourceMeta(source));
                 sourceList.append(el("div", { class: "webui-bridge-prompt-market-source" }, [
                     el("div", { class: "webui-bridge-prompt-market-main" }, [
-                        el("b", {}, source.label || source.id),
+                        el("div", { class: "webui-bridge-prompt-market-title" }, [
+                            el("b", {}, source.label || source.id),
+                            el("span", { class: "webui-bridge-prompt-market-category" }, source.category || "其他"),
+                        ]),
                         el("span", {}, source.description || ""),
                         metaLine,
                     ]),
@@ -12223,17 +12308,48 @@ function buildPanel(node) {
                     ]),
                 ]));
             }
+            if (!visibleSources.length) {
+                sourceList.append(el("div", { class: "webui-bridge-config-note" }, "这个分类暂时没有可用来源。"));
+            }
+        };
+        const renderCategories = (sources) => {
+            const preferredOrder = ["推荐", "画风精选", "分类词库", "完整 Prompt", "案例网站", "成人专项", "其他"];
+            const counts = new Map();
+            for (const source of sources || []) {
+                const category = source.category || "其他";
+                counts.set(category, (counts.get(category) || 0) + 1);
+            }
+            const categories = [...counts.keys()].sort((left, right) => {
+                const leftIndex = preferredOrder.indexOf(left);
+                const rightIndex = preferredOrder.indexOf(right);
+                return (leftIndex < 0 ? preferredOrder.length : leftIndex) - (rightIndex < 0 ? preferredOrder.length : rightIndex);
+            });
+            categoryBar.innerHTML = "";
+            for (const category of ["全部", ...categories]) {
+                const count = category === "全部" ? (sources || []).length : (counts.get(category) || 0);
+                categoryBar.append(el("button", {
+                    type: "button",
+                    class: category === activeCategory ? "active" : "",
+                    onclick: () => {
+                        activeCategory = category;
+                        renderCategories(sourceCache);
+                        renderSources(sourceCache);
+                        statusLine.textContent = `正在查看「${category}」：${count} 个来源`;
+                    },
+                }, `${category} ${count}`));
+            }
         };
         mask.addEventListener("mousedown", (event) => {
             if (event.target === mask) close();
         });
         mask.append(el("div", { class: "webui-bridge-config-panel webui-bridge-settings-panel" }, [
             el("div", { class: "webui-bridge-config-head" }, [
-                el("span", {}, "提示词市场"),
+                el("span", {}, "提示词来源与市场"),
                 el("button", { type: "button", onclick: close }, "×"),
             ]),
             el("div", { class: "webui-bridge-config-body" }, [
-                el("div", { class: "webui-bridge-config-note" }, "可一键导入的来源会下载公开词库并自动分类；案例网站会在浏览器中打开，适合手动挑选完整 prompt。"),
+                el("div", { class: "webui-bridge-config-note" }, "这里是主节点与正/负向小节点共用的全局来源库。导入内容会写入同一份自定义词库，并立即同步到已展开的提示词面板；案例网站仅用于浏览和手动挑选。"),
+                categoryBar,
                 sourceList,
                 statusLine,
             ]),
@@ -12245,8 +12361,11 @@ function buildPanel(node) {
         document.body.append(mask);
         fetchPromptMarketSources()
             .then((result) => {
-                renderSources(result.sources || []);
-                statusLine.textContent = `已加载 ${(result.sources || []).length} 个来源`;
+                sourceCache = result.sources || [];
+                renderCategories(sourceCache);
+                renderSources(sourceCache);
+                const styleCount = sourceCache.filter((source) => source.category === "画风精选").length;
+                statusLine.textContent = `已加载 ${sourceCache.length} 个来源，其中画风精选 ${styleCount} 个`;
             })
             .catch((error) => {
                 statusLine.textContent = `读取失败: ${error?.message || error}`;
@@ -12736,7 +12855,7 @@ function buildPanel(node) {
                             }, "重置首次提示"),
                         ]),
                     ]),
-                    configSection("小节点提示词库", "正向与负向小节点共享主节点词库；可分别筛选管理，修改后会同步到画布上的小节点。", [
+                    configSection("全局提示词库与市场", "主节点与正/负向小节点共用同一份词库；下方的正向、负向按钮只是筛选视图，编辑、删除或市场导入会同步到所有提示词面板。", [
                         el("div", { class: "webui-bridge-settings-asset-tools" }, [
                             el("button", {
                                 type: "button",
@@ -12748,9 +12867,9 @@ function buildPanel(node) {
                             }, "管理负向词库"),
                             el("button", {
                                 type: "button",
-                                onclick: () => showImportTagsDialog({ mode: "editor", smallNodeLibrary: true }),
-                            }, "管理全部"),
-                            el("button", { type: "button", onclick: showPromptMarketDialog }, "提示词市场"),
+                                onclick: () => showImportTagsDialog({ mode: "editor" }),
+                            }, "编辑词库"),
+                            el("button", { type: "button", onclick: showPromptMarketDialog }, "浏览 / 导入提示词市场"),
                         ]),
                         el("div", { class: "webui-bridge-config-note" }, `当前自定义/市场词 ${state.customTagCount || 0} 条；WebUI 原始词库仍按“数据来源”设置读取。`),
                     ]),
@@ -12764,6 +12883,12 @@ function buildPanel(node) {
                 configSection("高级扩展模块显示", "这里只控制面板是否显示；真正启用执行要打开各模块标题里的复选框。", [
                     makeVisibilityGrid(ADVANCED_MODULE_VISIBILITY_OPTIONS),
                 ]),
+                configSection("连接与智能", "外部 WebUI 路径和 AI 翻译配置集中在这里，不占用保存操作区。", [
+                    el("div", { class: "webui-bridge-settings-asset-tools webui-bridge-settings-link-tools" }, [
+                        el("button", { type: "button", onclick: showWebUIIntegrationDialog }, "WebUI 接入"),
+                        el("button", { type: "button", onclick: showAIConfigDialog }, "AI 翻译设置"),
+                    ]),
+                ]),
                 configSection("扩展与资源下载", "按需逐项下载。已存在的项目会跳过；新节点包通常需要重启 ComfyUI 后生效。", [
                     el("div", { class: "webui-bridge-settings-asset-tools" }, [
                         el("button", { type: "button", onclick: refreshSettingsAssets }, "刷新状态"),
@@ -12775,10 +12900,6 @@ function buildPanel(node) {
                 statusLine,
             ]),
             el("div", { class: "webui-bridge-config-actions" }, [
-                el("button", { type: "button", onclick: showPromptMarketDialog }, "市场"),
-                el("button", { type: "button", onclick: () => showImportTagsDialog({ mode: "editor" }) }, "编辑词库"),
-                el("button", { type: "button", onclick: showAIConfigDialog }, "AI"),
-                el("button", { type: "button", onclick: showWebUIIntegrationDialog }, "WebUI"),
                 el("button", { type: "button", onclick: close }, "取消"),
                 el("button", { type: "button", class: "primary", onclick: save }, "保存"),
             ]),
@@ -13100,7 +13221,9 @@ function buildPanel(node) {
         return (state.loras || []).filter((item) => selected.has(loraSelectionKey(item)));
     };
     const updateSelectedLoraCount = () => {
-        selectedLoraCount.textContent = `选中 ${state.selectedLoras?.size || 0}`;
+        const count = state.selectedLoras?.size || 0;
+        selectedLoraCount.textContent = `选中 ${count}`;
+        networkControls?.classList?.toggle("has-selection", count > 0);
     };
     const loraNeedsLazyDetail = (item) => item && !item.__webuiBridgeLoraDetailLoaded &&
         (item.thumbnail_unknown || !item.user_metadata || (!item.activation_text && !item.sd_version && !item.description));
@@ -14036,50 +14159,50 @@ function buildPanel(node) {
         "data-preset": item.value,
         onclick: () => applyAndSaveLayoutPreset(item.value),
     }, item.short)));
-    const makeNetworkSortButton = (key, label, title) => el("button", {
-        class: `webui-bridge-network-tool${state.loraSort === key ? " active" : ""}`,
-        title,
-        onclick: (event) => {
-            state.loraSort = key;
+    const networkSortSelect = el("select", {
+        class: "webui-bridge-network-sort",
+        title: "LoRA 排序方式",
+        onchange: (event) => {
+            state.loraSort = event.currentTarget.value;
             state.loraPage = 0;
-            for (const button of event.currentTarget.parentElement.querySelectorAll(".webui-bridge-network-tool[data-sort]")) {
-                button.classList.toggle("active", button.dataset.sort === key);
-            }
             renderCards();
         },
-        "data-sort": key,
-    }, label);
+    }, [
+        el("option", { value: "path" }, "按路径"),
+        el("option", { value: "name" }, "按名称"),
+        el("option", { value: "modified" }, "按日期"),
+    ]);
+    networkSortSelect.value = state.loraSort;
+    const addSelectedLorasButton = el("button", {
+        class: "webui-bridge-network-tool webui-bridge-network-primary webui-bridge-selection-action",
+        title: "把勾选的 LoRA 添加到正向提示词",
+        onclick: addSelectedLorasToPositive,
+    }, "添加选中到正向");
+    const clearSelectedLorasButton = el("button", {
+        class: "webui-bridge-network-tool webui-bridge-selection-action",
+        title: "清空已勾选的 LoRA",
+        onclick: clearSelectedLoras,
+    }, "清空选择");
     const networkControls = el("div", { class: "webui-bridge-network-controls" }, [
         networkSearch,
-        el("button", {
-            class: "webui-bridge-network-tool webui-bridge-network-primary",
-            title: "把勾选的 LoRA 添加到正向提示词",
-            onclick: addSelectedLorasToPositive,
-        }, "添加选中到正向"),
-        el("button", {
-            class: "webui-bridge-network-tool",
-            title: "清空已勾选的 LoRA",
-            onclick: clearSelectedLoras,
-        }, "清空选择"),
+        addSelectedLorasButton,
+        clearSelectedLorasButton,
         selectedLoraCount,
         loraPageSizeSelect,
         loraPagePrev,
         loraPageInfo,
         loraPageNext,
-        el("span", { class: "webui-bridge-network-sort-label" }, "Sort"),
-        makeNetworkSortButton("path", "Path", "Sort by folder path"),
-        makeNetworkSortButton("name", "Name", "Sort by LoRA name"),
-        makeNetworkSortButton("modified", "Date", "Sort by modified time"),
+        networkSortSelect,
         el("button", {
             class: "webui-bridge-network-tool",
-            title: "Reverse sort direction",
+            title: "切换排序方向",
             onclick: (event) => {
                 state.loraSortDescending = !state.loraSortDescending;
                 state.loraPage = 0;
                 event.currentTarget.classList.toggle("active", state.loraSortDescending);
                 renderCards();
             },
-        }, "↓"),
+        }, "升/降"),
         networkCount,
     ]);
     const resizeGrip = el("div", { class: "webui-bridge-resize-grip", title: "拖动调整整个节点宽高；缩放时会保留关键拖拽入口" }, "↘");
@@ -14089,9 +14212,7 @@ function buildPanel(node) {
     const promptRowBottomKey = (row) => row.__webuiBridgeBottomResizeKey?.() || row.__webuiBridgeHeightKey || "";
     let negativeMainStartTopHeight = 0;
     let negativeMainStartExtraHeight = 0;
-    const promptsColumn = el("div", { class: "webui-bridge-prompts" }, [
-        positive.row,
-        createHeightSplitGrip(
+    const positiveDetailGrip = createHeightSplitGrip(
             () => promptRowBottomTarget(positive.row),
             positiveTagPanel,
             () => promptRowBottomKey(positive.row),
@@ -14107,9 +14228,9 @@ function buildPanel(node) {
                 onDragMove: () => markPromptInnerManualResize(),
                 onDragEnd: () => markPromptInnerManualResize({ commit: true }),
             },
-        ),
-        positiveTagPanel,
-        createHeightSplitGrip(
+        );
+    positiveDetailGrip.classList.add("webui-bridge-positive-detail-resizer");
+    const promptPolarityGrip = createHeightSplitGrip(
             positiveTagPanel,
             negative.textarea,
             () => positiveTagPanel.__webuiBridgeHeightKey,
@@ -14154,9 +14275,8 @@ function buildPanel(node) {
                     holdPromptSplitFit();
                 },
             },
-        ),
-        negative.row,
-        createHeightSplitGrip(
+        );
+    const negativeDetailGrip = createHeightSplitGrip(
             () => promptRowBottomTarget(negative.row),
             negativeTagPanel,
             () => promptRowBottomKey(negative.row),
@@ -14173,13 +14293,59 @@ function buildPanel(node) {
                 onDragMove: () => markPromptInnerManualResize(),
                 onDragEnd: () => markPromptInnerManualResize({ commit: true }),
             },
-        ),
+        );
+    let activePromptWorkspace = readLocalString(PROMPT_WORKSPACE_ACTIVE_KEY, "positive");
+    if (!new Set(["positive", "negative"]).has(activePromptWorkspace)) activePromptWorkspace = "positive";
+    const promptWorkspaceButtons = new Map();
+    const applyPromptWorkspace = (workspace, { persist = true, relayout = true } = {}) => {
+        activePromptWorkspace = workspace === "negative" ? "negative" : "positive";
+        if (persist) writeLocalString(PROMPT_WORKSPACE_ACTIVE_KEY, activePromptWorkspace);
+        promptsColumn?.classList?.toggle("show-negative-workspace", activePromptWorkspace === "negative");
+        for (const [key, button] of promptWorkspaceButtons) {
+            const active = key === activePromptWorkspace;
+            button.classList.toggle("active", active);
+            button.setAttribute("aria-selected", active ? "true" : "false");
+            button.tabIndex = active ? 0 : -1;
+        }
+        const target = activePromptWorkspace === "negative" ? negative.textarea : positive.textarea;
+        state.activeTextarea = target;
+        positive.row.classList.toggle("active", activePromptWorkspace === "positive");
+        negative.row.classList.toggle("active", activePromptWorkspace === "negative");
+        applyTopRowCollapsedState(
+            promptsColumn?.closest?.(".webui-bridge-toprow"),
+            negative.row.classList.contains("collapsed"),
+        );
+        if (relayout) scheduleAdaptiveLayout();
+    };
+    const promptWorkspaceTabs = el("div", { class: "webui-bridge-prompt-workspace-tabs", role: "tablist", "aria-label": "提示词类型" }, [
+        ["positive", "正向提示词"],
+        ["negative", "反向提示词"],
+    ].map(([key, label]) => {
+        const button = el("button", {
+            type: "button",
+            role: "tab",
+            "aria-selected": key === activePromptWorkspace ? "true" : "false",
+            onclick: () => applyPromptWorkspace(key),
+        }, label);
+        promptWorkspaceButtons.set(key, button);
+        return button;
+    }));
+    const promptsColumn = el("div", { class: "webui-bridge-prompts" }, [
+        promptWorkspaceTabs,
+        positive.row,
+        positiveDetailGrip,
+        positiveTagPanel,
+        promptPolarityGrip,
+        negative.row,
+        negativeDetailGrip,
         negativeTagPanel,
     ]);
     positive.row.classList.add("webui-bridge-positive-prompt-row");
+    negative.row.classList.add("webui-bridge-negative-prompt-row");
+    applyPromptWorkspace(activePromptWorkspace, { persist: false, relayout: false });
     promptsColumn.classList.toggle("negative-collapsed", negative.row.classList.contains("collapsed"));
     const actionWidthOptions = {
-        defaultWidth: ACTION_SIDEBAR_DEFAULT_WIDTH,
+        defaultWidth: state.settings?.layout_preset === "compact" ? 320 : ACTION_SIDEBAR_DEFAULT_WIDTH,
         min: ACTION_SIDEBAR_MIN_WIDTH,
         max: ACTION_SIDEBAR_MAX_WIDTH,
         promptMin: ACTION_SIDEBAR_PROMPT_MIN_WIDTH,
@@ -14316,7 +14482,7 @@ function buildPanel(node) {
     networkControls.prepend(overlayClose);
     const extraSection = el("div", { class: "webui-bridge-extra webui-bridge-extra-compact" }, [
         el("div", { class: "webui-bridge-extra-head" }, [
-            el("span", {}, "Extra Networks"),
+            el("span", {}, "LoRA"),
             networkControls,
         ]),
         extraBody,
@@ -14590,8 +14756,6 @@ function buildPanel(node) {
         actionToggle,
         settingsButton,
         tutorialButton,
-        topControlButton("恢复尺寸", "恢复节点默认宽高并清理异常布局缓存，避免误点后缩成窄条", () => restoreDefaultNodeLayout()),
-        nodeWidthGrip,
         webuiButton,
         quickLoraOverlayButton,
         clipField,
@@ -14674,6 +14838,10 @@ function buildPanel(node) {
     const sidebarLayoutTools = el("details", { class: "webui-bridge-sidebar-layout-tools" }, [
         el("summary", {}, "布局与工具"),
         el("div", { class: "webui-bridge-sidebar-layout-body" }, [
+            el("div", { class: "webui-bridge-sidebar-layout-actions" }, [
+                topControlButton("恢复尺寸", "恢复节点默认宽高并清理异常布局缓存", () => restoreDefaultNodeLayout()),
+                nodeWidthGrip,
+            ]),
             createSidebarWidthButton(() => topRow, actionWidthKey, actionWidthOptions),
             bindVisibility(sizeControls, "size_controls"),
             bindVisibility(layoutPresetControls, "layout_presets"),
@@ -14955,7 +15123,7 @@ function buildPanel(node) {
             afterMax: getExtraResizeMaxHeight,
             afterFlex: "0 0 auto",
             label: "提示词 / LoRA",
-            title: "上下拖动分配提示词区域和 Extra Networks 高度，双击恢复",
+            title: "上下拖动分配提示词区域和 LoRA 高度，双击恢复",
             onDragStart: () => {
                 releaseFreshInitialLayout();
                 promptLoraSplitManual = true;
@@ -16420,6 +16588,43 @@ function addStyles() {
             overflow: hidden auto;
             overscroll-behavior: contain;
         }
+        .webui-bridge-prompt-workspace-tabs {
+            position: sticky;
+            top: 0;
+            z-index: 20;
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 5px;
+            padding: 3px;
+            border: 1px solid #3f526d;
+            border-radius: 7px;
+            background: rgba(19, 27, 39, .96);
+            box-shadow: 0 3px 10px rgba(0, 0, 0, .22);
+        }
+        .webui-bridge-prompt-workspace-tabs button {
+            min-height: 30px;
+            border: 1px solid transparent;
+            border-radius: 5px;
+            background: transparent;
+            color: #aebed4;
+            cursor: pointer;
+            font-weight: 700;
+        }
+        .webui-bridge-prompt-workspace-tabs button.active {
+            border-color: #6c9ee6;
+            background: #253c5d;
+            color: #fff;
+        }
+        .webui-bridge-prompts:not(.show-negative-workspace) > .webui-bridge-negative-main-resizer,
+        .webui-bridge-prompts:not(.show-negative-workspace) > .webui-bridge-negative-prompt-row,
+        .webui-bridge-prompts:not(.show-negative-workspace) > .webui-bridge-negative-detail-resizer,
+        .webui-bridge-prompts:not(.show-negative-workspace) > .webui-bridge-aio-negative,
+        .webui-bridge-prompts.show-negative-workspace > .webui-bridge-positive-prompt-row,
+        .webui-bridge-prompts.show-negative-workspace > .webui-bridge-positive-detail-resizer,
+        .webui-bridge-prompts.show-negative-workspace > .webui-bridge-aio-positive,
+        .webui-bridge-prompts.show-negative-workspace > .webui-bridge-negative-main-resizer {
+            display: none !important;
+        }
         .webui-bridge-prompts.negative-collapsed {
             overflow: hidden auto;
         }
@@ -17424,6 +17629,17 @@ function addStyles() {
             gap: 6px;
             padding: 0 6px 6px;
         }
+        .webui-bridge-sidebar-layout-actions {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 6px;
+        }
+        .webui-bridge-sidebar-layout-actions .webui-bridge-top-control,
+        .webui-bridge-sidebar-layout-actions .webui-bridge-node-width-resizer {
+            width: 100%;
+            min-width: 0;
+            justify-content: center;
+        }
         .webui-bridge-tools {
             display: grid;
             grid-template-columns: repeat(5, 1fr);
@@ -17892,6 +18108,10 @@ function addStyles() {
             gap: 5px;
             min-width: 0;
         }
+        .webui-bridge-network-controls:not(.has-selection) .webui-bridge-selection-action,
+        .webui-bridge-network-controls:not(.has-selection) > .webui-bridge-network-count:first-of-type {
+            display: none;
+        }
         .webui-bridge-search {
             min-width: 0;
             padding: 5px 8px;
@@ -17905,10 +18125,6 @@ function addStyles() {
             color: #8fa0b7;
             font-size: 11px;
             white-space: nowrap;
-        }
-        .webui-bridge-network-sort-label {
-            color: #8fa0b7;
-            font-size: 11px;
         }
         .webui-bridge-network-tool {
             min-width: 32px;
@@ -17928,6 +18144,15 @@ function addStyles() {
         .webui-bridge-page-size {
             height: 28px;
             min-width: 74px;
+            border: 1px solid #4d5666;
+            border-radius: 5px;
+            background: #202733;
+            color: #e5edf9;
+            font-size: 11px;
+        }
+        .webui-bridge-network-sort {
+            height: 28px;
+            min-width: 84px;
             border: 1px solid #4d5666;
             border-radius: 5px;
             background: #202733;
@@ -18865,6 +19090,9 @@ function addStyles() {
             opacity: .58;
             filter: none;
         }
+        .webui-bridge-settings-link-tools {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
         .webui-bridge-settings-asset-tools button.downloading,
         .webui-bridge-settings-asset-card button.downloading,
         .webui-bridge-module-button.downloading {
@@ -18988,6 +19216,56 @@ function addStyles() {
             font-size: 11px;
             line-height: 1.45;
         }
+        .webui-bridge-module-asset {
+            display: grid;
+            grid-template-columns: auto minmax(0, 1fr);
+            gap: 3px 8px;
+            align-items: baseline;
+            padding: 7px 8px;
+            border: 1px solid #3a4a61;
+            border-radius: 6px;
+            background: #0d1520;
+        }
+        .webui-bridge-module-asset b {
+            color: #dbe8fb;
+            font-size: 11px;
+        }
+        .webui-bridge-module-asset span {
+            min-width: 0;
+            color: #9fb1c9;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .webui-bridge-module-asset small {
+            grid-column: 1 / -1;
+            color: #aebed4;
+            font-size: 10px;
+            line-height: 1.4;
+        }
+        .webui-bridge-module-asset.ready {
+            border-color: #376b52;
+            background: #0f2019;
+        }
+        .webui-bridge-module-asset.ready b {
+            color: #8ee0ae;
+        }
+        .webui-bridge-module-asset.partial,
+        .webui-bridge-module-asset.audit {
+            border-color: #6f5c34;
+            background: #211b10;
+        }
+        .webui-bridge-module-asset.partial b,
+        .webui-bridge-module-asset.audit b {
+            color: #f0ca78;
+        }
+        .webui-bridge-module-asset.blocked {
+            border-color: #74424a;
+            background: #261418;
+        }
+        .webui-bridge-module-asset.blocked b {
+            color: #ff9aa8;
+        }
         .webui-bridge-module-button,
         .webui-bridge-preset-list button {
             min-height: 30px;
@@ -19037,7 +19315,7 @@ function addStyles() {
         }
         .webui-bridge-settings-panel .webui-bridge-config-actions {
             padding: 18px 24px 22px;
-            grid-template-columns: repeat(6, minmax(0, 1fr));
+            grid-template-columns: repeat(2, minmax(0, 1fr));
         }
         .webui-bridge-settings-panel .webui-bridge-config-actions button {
             min-height: 44px;
@@ -19152,7 +19430,7 @@ function addStyles() {
             grid-template-columns: 1fr;
         }
         .webui-bridge-settings-panel .webui-bridge-config-actions {
-            grid-template-columns: repeat(6, minmax(0, 1fr));
+            grid-template-columns: repeat(2, minmax(0, 1fr));
         }
         .webui-bridge-prompt-editor-mask {
             align-items: stretch;
@@ -19732,6 +20010,34 @@ function addStyles() {
             overflow: auto;
             padding-right: 2px;
         }
+        .webui-bridge-prompt-market-categories {
+            display: flex;
+            gap: 6px;
+            overflow-x: auto;
+            padding: 1px 0 3px;
+            scrollbar-width: thin;
+        }
+        .webui-bridge-prompt-market-categories button {
+            flex: 0 0 auto;
+            min-height: 30px;
+            padding: 5px 9px;
+            border: 1px solid #40516a;
+            border-radius: 6px;
+            background: #182231;
+            color: #b9c9dd;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        .webui-bridge-prompt-market-categories button:hover {
+            border-color: #6685ad;
+            color: #fff;
+        }
+        .webui-bridge-prompt-market-categories button.active {
+            border-color: #4f8bd8;
+            background: #23446c;
+            color: #fff;
+        }
         .webui-bridge-prompt-market-source {
             display: grid;
             grid-template-columns: minmax(0, 1fr) auto;
@@ -19746,6 +20052,27 @@ function addStyles() {
             display: grid;
             gap: 5px;
             min-width: 0;
+        }
+        .webui-bridge-prompt-market-title {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            min-width: 0;
+        }
+        .webui-bridge-prompt-market-title b {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .webui-bridge-prompt-market-main .webui-bridge-prompt-market-category {
+            flex: 0 0 auto;
+            padding: 2px 6px;
+            border: 1px solid #405a79;
+            border-radius: 999px;
+            background: #172b42;
+            color: #9fc8f4;
+            font-size: 10px;
+            line-height: 1.2;
         }
         .webui-bridge-prompt-market-main b,
         .webui-bridge-prompt-market-main span,

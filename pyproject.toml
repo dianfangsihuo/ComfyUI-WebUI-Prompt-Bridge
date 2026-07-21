@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-webui-prompt-bridge"
-description = "ComfyUI 的 WebUI 式提示词工作台：中文提示词、Tag 编辑、LoRA 管理、模型切换、图生图和生成参数控制。"
-version = "0.4.24"
+description = "在 ComfyUI 里获得 WebUI 式提示词体验：中文翻译、Tag 自动补全、LoRA 管理、提示词市场和高级模块接入。"
+version = "0.4.25"
 license = { file = "LICENSE" }
 dependencies = [
     "pyyaml",

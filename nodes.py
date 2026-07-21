@@ -191,6 +191,7 @@ PROMPT_MARKET_SOURCES = {
     "current_webui_library": {
         "label": "当前 WebUI / 本地词库",
         "description": "优先读已连接 WebUI / 本地数据包；没有时联网下载 WebUI 生态词库补导入。",
+        "category": "推荐",
         "license": "Local / MIT",
         "open_url": "",
         "format": "current_bridge_library",
@@ -200,6 +201,7 @@ PROMPT_MARKET_SOURCES = {
     "prompt_all_in_one_zh_cn": {
         "label": "Prompt All in One 中文分类词库",
         "description": "免费开源分组 tag，适合直接扩充提示词面板。",
+        "category": "分类词库",
         "license": "MIT",
         "open_url": "https://github.com/Physton/sd-webui-prompt-all-in-one/tree/main/group_tags",
         "download_url": "https://raw.githubusercontent.com/Physton/sd-webui-prompt-all-in-one/main/group_tags/zh_CN.yaml",
@@ -209,6 +211,7 @@ PROMPT_MARKET_SOURCES = {
     "tagcomplete_danbooru_top": {
         "label": "TagComplete Danbooru 热门 Tags",
         "description": "免费开源补全词库；导入前 1200 个高频 tag，并按类型自动分组。",
+        "category": "分类词库",
         "license": "MIT",
         "open_url": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/tree/main/tags",
         "download_url": "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/danbooru.csv",
@@ -220,6 +223,7 @@ PROMPT_MARKET_SOURCES = {
     "tagcomplete_quality": {
         "label": "TagComplete 质量词",
         "description": "常用质量相关 tag，体积小，适合作为基础增强/反向词补充。",
+        "category": "分类词库",
         "license": "MIT",
         "open_url": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/blob/main/tags/extra-quality-tags.csv",
         "download_url": "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/extra-quality-tags.csv",
@@ -228,9 +232,70 @@ PROMPT_MARKET_SOURCES = {
         "limit": 200,
         "importable": True,
     },
+    "tagcomplete_visual_styles": {
+        "label": "Danbooru 画风与绘画媒介精选",
+        "description": "从公开 TagComplete 词库筛出画风、艺术流派、绘画媒介与渲染技法相关 tag。",
+        "category": "画风精选",
+        "license": "MIT",
+        "open_url": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/blob/main/tags/danbooru.csv",
+        "download_url": "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/danbooru.csv",
+        "format": "tagcomplete_csv",
+        "group": "画风",
+        "limit": 600,
+        "importable": True,
+        "filter_profile": "画风 / 媒介 / 流派",
+        "include_any": (
+            "artstyle", "style parody", "painting", "watercolor", "gouache", "oil painting",
+            "acrylic paint", "ink", "pastel", "charcoal", "pencil", "sketch", "lineart",
+            "pixel art", "vector", "woodcut", "ukiyo-e", "impressionism", "surrealism",
+            "cubism", "art nouveau", "art deco", "pop art", "concept art", "digital art",
+            "cel shading", "flat color", "impasto", "pointillism", "photorealistic",
+        ),
+    },
+    "krea_art_style_prompts": {
+        "label": "Krea 艺术画风 Prompt 精选",
+        "description": "从 1k 公开完整 Prompt 中筛选绘画媒介、艺术流派、插画与概念设计案例。",
+        "category": "画风精选",
+        "license": "Public GitHub sample",
+        "open_url": "https://github.com/krea-ai/prompt-search/blob/master/1k.csv",
+        "download_url": "https://raw.githubusercontent.com/krea-ai/prompt-search/master/1k.csv",
+        "format": "prompt_csv",
+        "group": "画风 Prompt 案例",
+        "subgroup": "艺术流派与绘画媒介",
+        "limit": 350,
+        "importable": True,
+        "filter_profile": "绘画 / 插画 / 艺术流派",
+        "include_any": (
+            "painting", "watercolor", "gouache", "oil paint", "acrylic", "ink drawing",
+            "illustration", "concept art", "digital art", "pixel art", "anime", "manga",
+            "comic", "surreal", "impressionist", "expressionist", "art nouveau", "art deco",
+            "ukiyo", "pop art", "sketch", "line art", "pastel", "charcoal",
+        ),
+    },
+    "krea_cinematic_photo_prompts": {
+        "label": "Krea 摄影与电影感 Prompt 精选",
+        "description": "从公开完整 Prompt 中筛选摄影、镜头、布光、电影感与写实视觉案例。",
+        "category": "画风精选",
+        "license": "Public GitHub sample",
+        "open_url": "https://github.com/krea-ai/prompt-search/blob/master/1k.csv",
+        "download_url": "https://raw.githubusercontent.com/krea-ai/prompt-search/master/1k.csv",
+        "format": "prompt_csv",
+        "group": "画风 Prompt 案例",
+        "subgroup": "摄影与电影感",
+        "limit": 350,
+        "importable": True,
+        "filter_profile": "摄影 / 镜头 / 灯光",
+        "include_any": (
+            "photograph", "photography", "photo of", "cinematic", "film still", "35mm",
+            "50mm", "85mm", "wide angle", "macro lens", "depth of field", "bokeh",
+            "studio lighting", "dramatic lighting", "volumetric lighting", "golden hour",
+            "photorealistic", "hyperrealistic", "editorial", "fashion shoot",
+        ),
+    },
     "tagcomplete_danbooru_e621_merged": {
         "label": "TagComplete Danbooru + e621 合并 Tags",
         "description": "TagComplete 官方合并词库，覆盖二次元、拟人、兽耳/兽人等更多角色与物种特征 tag。",
+        "category": "分类词库",
         "license": "MIT",
         "open_url": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/blob/main/tags/danbooru_e621_merged.csv",
         "download_url": "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/danbooru_e621_merged.csv",
@@ -242,6 +307,7 @@ PROMPT_MARKET_SOURCES = {
     "tagcomplete_e621_sfw": {
         "label": "TagComplete e621 SFW 拟人 Tags",
         "description": "e621 SFW 词库，偏拟人、兽耳、兽人和物种特征，适合安全内容分类。",
+        "category": "分类词库",
         "license": "MIT",
         "open_url": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/blob/main/tags/e621_sfw.csv",
         "download_url": "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/e621_sfw.csv",
@@ -253,6 +319,7 @@ PROMPT_MARKET_SOURCES = {
     "tagcomplete_e621_adult_raw": {
         "label": "NSFW 专项：e621 零过滤 Tags",
         "description": "18+ 成人向 tag 扩展包；不筛普通成人词，按原始热度尽量多导入。",
+        "category": "成人专项",
         "license": "MIT / 18+",
         "open_url": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/blob/main/tags/e621.csv",
         "download_url": "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/e621.csv",
@@ -271,6 +338,7 @@ PROMPT_MARKET_SOURCES = {
     "tagcomplete_e621_adult_light": {
         "label": "NSFW 专项：e621 微过滤 Tags",
         "description": "18+ 成人向 tag 扩展包；保留常规 NSFW，额外过滤极端、重口和争议词。",
+        "category": "成人专项",
         "license": "MIT / 18+",
         "open_url": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/blob/main/tags/e621.csv",
         "download_url": "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/e621.csv",
@@ -291,6 +359,7 @@ PROMPT_MARKET_SOURCES = {
     "tagcomplete_derpibooru": {
         "label": "TagComplete Derpibooru 角色 Tags",
         "description": "Derpibooru 标签源，适合角色、作品、风格和分类 tag 补充。",
+        "category": "分类词库",
         "license": "MIT",
         "open_url": "https://github.com/DominikDoom/a1111-sd-webui-tagcomplete/blob/main/tags/derpibooru.csv",
         "download_url": "https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/derpibooru.csv",
@@ -302,6 +371,7 @@ PROMPT_MARKET_SOURCES = {
     "krea_prompt_examples": {
         "label": "Krea / Open Prompts 完整案例",
         "description": "Krea prompt-search 的 1k 公开 prompt 样例，导入为完整 prompt 案例。",
+        "category": "完整 Prompt",
         "license": "Public GitHub sample",
         "open_url": "https://github.com/krea-ai/prompt-search/blob/master/1k.csv",
         "download_url": "https://raw.githubusercontent.com/krea-ai/prompt-search/master/1k.csv",
@@ -314,6 +384,7 @@ PROMPT_MARKET_SOURCES = {
     "public_prompts": {
         "label": "Public Prompts",
         "description": "免费提示词案例站，适合打开后挑选完整 prompt；暂不做批量抓取。",
+        "category": "案例网站",
         "license": "Free website",
         "open_url": "https://www.publicprompts.art/",
         "importable": False,
@@ -321,6 +392,7 @@ PROMPT_MARKET_SOURCES = {
     "prompthero_stable_diffusion": {
         "label": "PromptHero Stable Diffusion",
         "description": "热门 Stable Diffusion prompt 案例页，适合按作品手动挑完整 prompt。",
+        "category": "案例网站",
         "license": "Website",
         "open_url": "https://prompthero.com/stable-diffusion-prompts",
         "importable": False,
@@ -328,6 +400,7 @@ PROMPT_MARKET_SOURCES = {
     "civitai_images": {
         "label": "Civitai 图片 Prompt 案例",
         "description": "模型社区图片案例页，常带完整 prompt / negative / 参数，适合手动筛选。",
+        "category": "案例网站",
         "license": "Website",
         "open_url": "https://civitai.com/images",
         "importable": False,
@@ -335,6 +408,7 @@ PROMPT_MARKET_SOURCES = {
     "lexica_prompt_search": {
         "label": "Lexica Prompt Search",
         "description": "Stable Diffusion 图片与 prompt 搜索站，适合查风格词和构图案例。",
+        "category": "案例网站",
         "license": "Website",
         "open_url": "https://lexica.art/",
         "importable": False,
@@ -342,6 +416,7 @@ PROMPT_MARKET_SOURCES = {
     "openart_prompt_book": {
         "label": "OpenArt Prompt Book",
         "description": "Prompt 教程和案例库，适合手动学习结构化 prompt 写法。",
+        "category": "案例网站",
         "license": "Website",
         "open_url": "https://openart.ai/promptbook",
         "importable": False,
@@ -349,6 +424,7 @@ PROMPT_MARKET_SOURCES = {
     "diffusiondb": {
         "label": "DiffusionDB",
         "description": "Hugging Face 上的 CC0 大型 prompt 数据集，适合研究和抽样，不建议整库导入。",
+        "category": "完整 Prompt",
         "license": "CC0",
         "open_url": "https://huggingface.co/datasets/poloclub/diffusiondb",
         "importable": False,
@@ -3432,6 +3508,7 @@ def _prompt_market_sources_response():
             "id": source_id,
             "label": source["label"],
             "description": source.get("description", ""),
+            "category": source.get("category", "其他"),
             "license": source.get("license", ""),
             "filter_profile": source.get("filter_profile", ""),
             "open_url": source.get("open_url", ""),
@@ -3803,10 +3880,26 @@ def _safe_model_list(kind):
 
 def _model_group_status(kind, aliases=()):
     names = []
+    seen = set()
+
+    def append_name(value):
+        name = str(value or "").strip().replace("\\", "/")
+        if not name:
+            return
+        filename = Path(name).name.casefold()
+        if filename.startswith("put_") or filename.endswith((
+            ".corrupted", ".download", ".part", ".tmp", ".aria2",
+        )):
+            return
+        key = name.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        names.append(name)
+
     for model_kind in (kind, *aliases):
         for name in _safe_model_list(model_kind):
-            if name not in names:
-                names.append(name)
+            append_name(name)
     try:
         models_dir = Path(getattr(folder_paths, "models_dir", Path("models")))
         for relative in (kind, *aliases):
@@ -3819,11 +3912,9 @@ def _model_group_status(kind, aliases=()):
                 if file.name.casefold().startswith("put_"):
                     continue
                 rel = file.relative_to(root).as_posix()
-                if rel not in names:
-                    names.append(rel)
+                append_name(rel)
     except Exception:
         pass
-    names = [name for name in names if not Path(str(name)).name.casefold().startswith("put_")]
     return {
         "kind": kind,
         "aliases": list(aliases),
@@ -3857,8 +3948,8 @@ def _module_asset_status():
         "impact_pack": _custom_node_dir_status("ComfyUI Impact Pack", ["impact-pack", "impact_pack", "impactpack"]),
         "impact_subpack": _custom_node_dir_status("ComfyUI Impact Subpack", ["impact-subpack", "impact_subpack", "impactsubpack"]),
         "controlnet_aux": _custom_node_dir_status("ControlNet Auxiliary Preprocessors", ["controlnet_aux", "controlnet-aux", "auxiliary"]),
-        "segment_anything": _custom_node_dir_status("Segment Anything / SAM", ["segment-anything", "segment_anything", "sam"]),
-        "ultimate_upscale": _custom_node_dir_status("Ultimate SD Upscale", ["ultimate", "upscale"]),
+        "segment_anything": _custom_node_dir_status("Segment Anything / SAM", ["segment-anything", "segment_anything", "easy-sam", "sam2", "sam3"]),
+        "ultimate_upscale": _custom_node_dir_status("Ultimate SD Upscale", ["ultimatesdupscale", "ultimate_sd_upscale", "ultimate-sd-upscale"]),
     }
     for key, package in node_packages.items():
         spec = MODULE_NODE_ASSETS.get(key)
@@ -3872,9 +3963,66 @@ def _module_asset_status():
         "sams": _model_group_status("sams", aliases=("sam", "SAM")),
         "ultralytics": _model_group_status("ultralytics", aliases=("bbox", "segm")),
     }
+    adetailer_ready = (
+        node_packages["impact_pack"]["installed"]
+        and node_packages["impact_subpack"]["installed"]
+        and models["ultralytics"]["count"] > 0
+    )
+    controlnet_ready = models["controlnet"]["count"] > 0
+    sam_assets_ready = node_packages["segment_anything"]["installed"] and models["sams"]["count"] > 0
+    readiness = {
+        "img2img": {
+            "level": "ready",
+            "label": "接入节点可用",
+            "detail": "上传图片后仍需可用的 VAE / KSampler 主链路。",
+        },
+        "mask": {
+            "level": "ready",
+            "label": "接入节点可用",
+            "detail": "需要外部 IMAGE、VAE、MASK 或 LATENT 输入。",
+        },
+        "adetailer": {
+            "level": "ready" if adetailer_ready else "blocked",
+            "label": "检测修复可用" if adetailer_ready else "缺少检测节点或模型",
+            "detail": (
+                "Impact Pack、Impact Subpack 与 Ultralytics 检测模型均已就绪。"
+                if adetailer_ready else
+                "需要 Impact Pack、Impact Subpack 和至少一个可用 Ultralytics 模型。"
+            ),
+        },
+        "controlnet": {
+            "level": "ready" if controlnet_ready else "blocked",
+            "label": "控制模型可用" if controlnet_ready else "缺少 ControlNet 模型",
+            "detail": (
+                "可构建 Apply 节点；仍需接入 CONTROL_NET 与控制图。"
+                if controlnet_ready else
+                "预处理器已经安装，但不能代替 ControlNet 模型。请先放入控制模型。"
+            ),
+        },
+        "sam": {
+            "level": "partial" if sam_assets_ready else "blocked",
+            "label": "Inpaint 接入可用" if sam_assets_ready else "缺少 SAM 节点或模型",
+            "detail": (
+                "当前一键构建只负责 Mask/Inpaint 接入；SAM 分割节点需按所装插件手动连接。"
+                if sam_assets_ready else
+                "需要 SAM 节点包和至少一个 SAM 模型。"
+            ),
+        },
+        "upscale": {
+            "level": "partial",
+            "label": "Hires.fix 接入可用",
+            "detail": "一键构建使用内置 Latent/Image Upscale；Ultimate SD Upscale 需要手动接外置节点。",
+        },
+        "regional_lora": {
+            "level": "audit",
+            "label": "仅审计，不隔离",
+            "detail": "只统计区域 Prompt 中的 LoRA；普通 LoRA 仍会全局加载。",
+        },
+    }
     return {
         "node_packages": node_packages,
         "models": models,
+        "readiness": readiness,
         "capabilities": {
             "controlnet_apply": True,
             "image_upscale": True,

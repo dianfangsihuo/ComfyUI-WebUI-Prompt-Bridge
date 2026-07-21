@@ -18,6 +18,86 @@ SPEC.loader.exec_module(NODES)
 
 
 class PromptLibraryTests(unittest.TestCase):
+    def test_model_group_status_deduplicates_paths_and_ignores_incomplete_assets(self):
+        listed = {
+            "ultralytics": [
+                "bbox\\face_yolov8m.pt",
+                "bbox/face_yolov8m.pt",
+                "BBOX/FACE_YOLOV8M.PT",
+                "segm/person.pt.corrupted",
+                "segm/downloading.pt.part",
+                "put_models_here.txt",
+            ],
+            "bbox": ["bbox/hand_yolov8s.pt"],
+            "segm": ["segm/person_yolov8m-seg.pt"],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            NODES,
+            "_safe_model_list",
+            side_effect=lambda kind: listed.get(kind, []),
+        ), mock.patch.object(
+            NODES.folder_paths,
+            "models_dir",
+            Path(temp_dir),
+        ):
+            status = NODES._model_group_status("ultralytics", aliases=("bbox", "segm"))
+
+        self.assertEqual(status["count"], 3)
+        self.assertEqual(
+            status["items"],
+            [
+                "bbox/face_yolov8m.pt",
+                "bbox/hand_yolov8s.pt",
+                "segm/person_yolov8m-seg.pt",
+            ],
+        )
+
+    def test_module_asset_readiness_distinguishes_blocked_partial_and_audit_modules(self):
+        package_state = {
+            "ComfyUI Impact Pack": True,
+            "ComfyUI Impact Subpack": True,
+            "ControlNet Auxiliary Preprocessors": True,
+            "Segment Anything / SAM": True,
+            "Ultimate SD Upscale": True,
+        }
+        model_counts = {
+            "controlnet": 0,
+            "upscale_models": 2,
+            "sams": 1,
+            "ultralytics": 0,
+        }
+
+        def package_status(name, _patterns):
+            return {"name": name, "installed": package_state[name], "paths": []}
+
+        def model_status(kind, aliases=()):
+            return {
+                "kind": kind,
+                "aliases": list(aliases),
+                "count": model_counts[kind],
+                "items": [],
+                "truncated": False,
+            }
+
+        with mock.patch.object(
+            NODES,
+            "_custom_node_dir_status",
+            side_effect=package_status,
+        ), mock.patch.object(
+            NODES,
+            "_model_group_status",
+            side_effect=model_status,
+        ):
+            readiness = NODES._module_asset_status()["readiness"]
+
+        self.assertEqual(readiness["controlnet"]["level"], "blocked")
+        self.assertIn("不能代替 ControlNet 模型", readiness["controlnet"]["detail"])
+        self.assertEqual(readiness["adetailer"]["level"], "blocked")
+        self.assertEqual(readiness["sam"]["level"], "partial")
+        self.assertIn("只负责 Mask/Inpaint 接入", readiness["sam"]["detail"])
+        self.assertEqual(readiness["regional_lora"]["level"], "audit")
+        self.assertIn("只统计", readiness["regional_lora"]["detail"])
+
     def test_bundled_autocomplete_works_offline_on_a_clean_install(self):
         bundled_dir = REPO_ROOT / "data" / "a1111-sd-webui-tagcomplete"
         tag_file = bundled_dir / "tags" / "danbooru.csv"

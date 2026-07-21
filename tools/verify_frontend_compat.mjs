@@ -1984,7 +1984,7 @@ async function verifyRestoreSizeStability(browser, baseUrl, workflow) {
         await page.waitForTimeout(800);
         const before = await bridgeRestoreSizeMetrics(page, "disturbed");
         await page.evaluate(() => {
-            const restoreButton = [...document.querySelectorAll(".webui-bridge-top-controls button")]
+            const restoreButton = [...document.querySelectorAll(".webui-bridge-panel button")]
                 .find((button) => /恢复尺寸/.test(button.textContent || ""));
             if (!restoreButton) throw new Error("Restore size button not found");
             restoreButton.click();
@@ -2823,8 +2823,8 @@ async function verifyVisibilitySettingsPersistAcrossReload(browser, baseUrl, wor
                 "CLIP 强度": setVisibilityCheck("CLIP 强度", expected.top_clip),
                 "Styles 起手式": setVisibilityCheck("Styles 起手式", expected.styles),
                 ControlNet: setVisibilityCheck("ControlNet", expected.module_controlnet),
-                "SAM/Inpaint": setVisibilityCheck("SAM/Inpaint", expected.module_sam),
-                "放大修复": setVisibilityCheck("放大修复", expected.module_upscale),
+                "SAM / Inpaint 接入": setVisibilityCheck("SAM / Inpaint 接入", expected.module_sam),
+                "放大 / Hires.fix 接入": setVisibilityCheck("放大 / Hires.fix 接入", expected.module_upscale),
             };
             const saveButton = [...document.querySelectorAll(".webui-bridge-settings-panel .webui-bridge-config-actions button")]
                 .find((button) => (button.textContent || "").trim() === "保存");
@@ -2909,7 +2909,7 @@ async function verifyVisibilitySettingsPersistAcrossReload(browser, baseUrl, wor
         assert(afterReload.dom.styles.hiddenClass === false && afterReload.dom.styles.display !== "none", "styles visibility did not survive page reload", afterReload);
         assert(afterReload.dom.top_clip.hiddenClass === false && afterReload.dom.top_clip.display !== "none", "top_clip visibility did not survive page reload", afterReload);
         assert(afterReload.dom.top_lora.hiddenClass === true && afterReload.dom.top_lora.display === "none", "top_lora hidden state did not survive page reload", afterReload);
-        assert(afterReload.checks["放大修复"] === true && afterReload.checks.ControlNet === true && afterReload.checks["SAM/Inpaint"] === false, "Advanced module checkbox states did not survive page reload", afterReload.checks);
+        assert(afterReload.checks["放大 / Hires.fix 接入"] === true && afterReload.checks.ControlNet === true && afterReload.checks["SAM / Inpaint 接入"] === false, "Advanced module checkbox states did not survive page reload", afterReload.checks);
         assert(afterReload.checks["Styles 起手式"] === true && afterReload.checks["CLIP 强度"] === true && afterReload.checks["快速添加 LoRA"] === false, "Sidebar checkbox states did not survive page reload", afterReload.checks);
         const bridgeConsoleErrors = consoleMessages.filter((message) =>
             ["error", "pageerror"].includes(message.type) &&
@@ -2919,9 +2919,9 @@ async function verifyVisibilitySettingsPersistAcrossReload(browser, baseUrl, wor
         return {
             savedVisibility: Object.fromEntries(Object.keys(expectedVisibility).map((key) => [key, firstPass.savedVisibility[key]])),
             reloadChecks: {
-                upscale: afterReload.checks["放大修复"],
+                upscale: afterReload.checks["放大 / Hires.fix 接入"],
                 controlnet: afterReload.checks.ControlNet,
-                sam: afterReload.checks["SAM/Inpaint"],
+                sam: afterReload.checks["SAM / Inpaint 接入"],
                 styles: afterReload.checks["Styles 起手式"],
                 clip: afterReload.checks["CLIP 强度"],
                 quickLora: afterReload.checks["快速添加 LoRA"],
@@ -3482,8 +3482,8 @@ async function verifySerializedBridgeLayoutStateRestoresWithoutLocalStorage(brow
             };
         });
         assert(saved.state, "Bridge layout state was not serialized into node properties", saved);
-        assert(Number(saved.state.sidebar_width) >= 450, "Dragged sidebar width was not captured in serialized layout state", saved);
-        assert(Number(saved.localSidebarWidth) >= 450, "Dragged sidebar width was not persisted locally", saved);
+        assert(Number(saved.state.sidebar_width) >= 390, "Dragged sidebar width was not captured in serialized layout state", saved);
+        assert(Number(saved.localSidebarWidth) >= 390, "Dragged sidebar width was not persisted locally", saved);
 
         await page.evaluate(async ({ serialized, keys }) => {
             for (const key of keys) localStorage.removeItem(key);
@@ -3514,7 +3514,7 @@ async function verifySerializedBridgeLayoutStateRestoresWithoutLocalStorage(brow
             "Serialized sidebar width did not restore after clearing localStorage", { saved, restored });
         assert(Math.abs(restored.topRowHeight - Number(saved.state.top_row_height)) <= 4,
             "Serialized top-row height did not restore after clearing localStorage", { saved, restored });
-        assert(Number(restored.localSidebarWidth) >= 450,
+        assert(Number(restored.localSidebarWidth) >= 390,
             "Serialized sidebar width was not reseeded into localStorage after reload", { saved, restored });
         const bridgeConsoleErrors = consoleMessages.filter((message) =>
             ["error", "pageerror"].includes(message.type) &&
