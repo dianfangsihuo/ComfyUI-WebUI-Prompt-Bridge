@@ -1763,6 +1763,75 @@ async function verifyExactPromptTagToggle(browser, baseUrl) {
     }
 }
 
+async function verifyUnlimitedFavoriteListDeletion(browser, baseUrl) {
+    const consoleMessages = [];
+    let favorites = Array.from({ length: 300 }, (_, index) => ({
+        id: `favorite-${index}`,
+        name: `Favorite ${index}`,
+        prompt: `favorite_tag_${index}`,
+        tags: [{ prompt: `favorite_tag_${index}`, local: `Favorite ${index}` }],
+    }));
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1200, height: 900 }, async (newPage) => {
+        await newPage.route("**/webui_prompt_bridge/prompt_all_in_one?lang=zh_CN", async (route) => {
+            await route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({
+                    group_tags: [],
+                    favorites: { positive: favorites, negative: [] },
+                }),
+            });
+        });
+        await newPage.route("**/webui_prompt_bridge/prompt_all_in_one/storage", async (route) => {
+            const data = route.request().postDataJSON();
+            if (data.action === "delete_favorite") {
+                favorites = favorites.filter((item) => item.id !== data.id);
+            }
+            await route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({
+                    success: true,
+                    favorites: { positive: favorites, negative: [] },
+                }),
+            });
+        });
+    });
+    try {
+        await page.evaluate(() => {
+            window.confirm = () => true;
+            window.app.graph.clear();
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            bridge.id = 950022;
+            bridge.pos = [60, 40];
+            window.app.graph.add(bridge);
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForFunction(() => document.querySelector(".webui-bridge-panel")?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
+        const positivePanel = page.locator(".webui-bridge-aio-positive");
+        await positivePanel.locator(".webui-bridge-aio-tabs button", { hasText: "收藏列表" }).click();
+        const favoriteTags = positivePanel.locator(".webui-bridge-aio-tag");
+        await favoriteTags.nth(299).waitFor({ state: "visible", timeout: 20000 });
+        const before = await favoriteTags.count();
+        const target = positivePanel.locator('.webui-bridge-aio-tag[data-prompt="favorite_tag_280"]');
+        const removeOpacity = await target.locator(".webui-bridge-aio-fav-remove").evaluate((element) => getComputedStyle(element).opacity);
+        await target.locator(".webui-bridge-aio-fav-remove").click();
+        await page.waitForFunction(() => !document.querySelector('.webui-bridge-aio-positive .webui-bridge-aio-tag[data-prompt="favorite_tag_280"]'));
+        const after = await favoriteTags.count();
+        assert(before === 300, "Favorite list still has a frontend rendering cap", { before });
+        assert(Number(removeOpacity) > 0, "Favorite removal control is hidden until hover", { removeOpacity });
+        assert(after === 299, "Favorite deletion did not immediately rebuild the list", { before, after });
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(!bridgeConsoleErrors.length, "Favorite list deletion emitted console errors", bridgeConsoleErrors);
+        return { before, after, removeOpacity, bridgeConsoleErrors: bridgeConsoleErrors.length };
+    } finally {
+        await context.close();
+    }
+}
+
 async function verifyFullNegativeCollapseReclaimsLoraSpace(browser, baseUrl, workflow) {
     const consoleMessages = [];
     const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1900, height: 1500 });
@@ -3809,6 +3878,7 @@ async function main() {
             fullPromptLibraryAndBulkClear: await verifyFullPromptLibraryAndBulkClear(browser, options.baseUrl),
             maskEditorLoadGuardsAndCanvasBudget: await verifyMaskEditorLoadGuardsAndCanvasBudget(browser, options.baseUrl),
             compactSidebarTabsAndLowZoomSummary: await verifyCompactSidebarTabsAndLowZoomSummary(browser, options.baseUrl),
+            unlimitedFavoriteListDeletion: await verifyUnlimitedFavoriteListDeletion(browser, options.baseUrl),
         } : {
             bridgeEventFix: await verifyBridgeDoesNotCancelCanvasWidgets(browser, options.baseUrl),
             freshBridgeStartsAtStablePresetSize: await verifyFreshBridgeStartsAtStablePresetSize(browser, options.baseUrl),
@@ -3825,6 +3895,7 @@ async function main() {
             maskEditorLoadGuardsAndCanvasBudget: await verifyMaskEditorLoadGuardsAndCanvasBudget(browser, options.baseUrl),
             compactSidebarTabsAndLowZoomSummary: await verifyCompactSidebarTabsAndLowZoomSummary(browser, options.baseUrl),
             exactPromptTagToggle: await verifyExactPromptTagToggle(browser, options.baseUrl),
+            unlimitedFavoriteListDeletion: await verifyUnlimitedFavoriteListDeletion(browser, options.baseUrl),
             fullNegativeCollapseReclaimsLoraSpace: await verifyFullNegativeCollapseReclaimsLoraSpace(browser, options.baseUrl, workflow),
             sectionResizeBlankRecovery: await verifySectionResizeBlankRecovery(browser, options.baseUrl, workflow),
             restoreSizeStability: await verifyRestoreSizeStability(browser, options.baseUrl, workflow),

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -174,6 +175,34 @@ class PromptLibraryTests(unittest.TestCase):
         self.assertEqual(negative_class().output(negative_prompt="tag_a, tag_b"), ("tag_a, tag_b",))
         self.assertEqual(negative_class().output(negative_prompt="tag_a,\ntag_b"), ("tag_a,\ntag_b",))
 
+    def test_favorites_are_not_capped_and_can_be_deleted_by_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage_path = Path(temp_dir) / "favorite.txt2img.json"
+            items = [
+                {
+                    "id": f"favorite-{index}",
+                    "name": f"Favorite {index}",
+                    "prompt": f"tag_{index}",
+                    "tags": [{"value": f"tag_{index}", "disabled": False}],
+                }
+                for index in range(300)
+            ]
+            storage_path.write_text(json.dumps(items), encoding="utf-8")
+
+            with mock.patch.object(NODES, "_storage_path", return_value=storage_path):
+                favorites = NODES._load_prompt_all_in_one_favorites("positive")
+                removed = NODES._delete_prompt_all_in_one_item(
+                    "favorite",
+                    "positive",
+                    item_id="favorite-280",
+                )
+                remaining = NODES._load_prompt_all_in_one_favorites("positive")
+
+        self.assertEqual(len(favorites), 300)
+        self.assertTrue(removed)
+        self.assertEqual(len(remaining), 299)
+        self.assertNotIn("favorite-280", {item["id"] for item in remaining})
+
     def test_positive_prompt_node_applies_lora_to_connected_model_and_clip(self):
         node = NODES.WebUIPromptBridgePositivePrompt()
         with (
@@ -247,6 +276,20 @@ class PromptLibraryTests(unittest.TestCase):
                 )
             self.assertEqual(prompt_path, local_prompt)
             self.assertEqual(tag_path, local_tags)
+
+    def test_webui_detection_accepts_lora_directory_and_nested_ai_tools_layout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            drive_root = Path(temp_dir)
+            webui_root = drive_root / "AI" / "Tools" / "sd-webui-aki-v4.9"
+            lora_dir = webui_root / "models" / "Lora"
+            lora_dir.mkdir(parents=True)
+            (webui_root / "launch.py").write_text("", encoding="utf-8")
+
+            resolved = NODES._webui_root_from_candidate(lora_dir)
+            candidates = NODES._webui_candidates_under(drive_root)
+
+        self.assertEqual(resolved, webui_root)
+        self.assertIn(webui_root, candidates)
 
     def test_forced_missing_webui_source_is_reported_unavailable(self):
         with tempfile.TemporaryDirectory() as temp_dir:

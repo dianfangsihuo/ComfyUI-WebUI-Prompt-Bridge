@@ -1033,11 +1033,23 @@ def _looks_like_webui_root(root):
     return root.is_dir() and (root / "models").is_dir() and ((root / "webui.py").exists() or (root / "launch.py").exists() or (root / "modules").is_dir())
 
 
+def _webui_root_from_candidate(value):
+    path = _existing_path(value)
+    if not path:
+        return None
+    candidates = [path]
+    candidates.extend(list(path.parents)[:4])
+    for candidate in candidates:
+        if _looks_like_webui_root(candidate):
+            return candidate
+    return None
+
+
 def _build_webui_config(webui_root):
     root_text = _truncate_text(webui_root, MAX_WEBUI_ROOT_LENGTH)
-    root = _existing_path(root_text)
-    if not root or not _looks_like_webui_root(root):
-        raise ValueError("WebUI 根目录不存在或结构不完整，请选择包含 models 且带 webui.py、launch.py 或 modules 的 WebUI 根目录")
+    root = _webui_root_from_candidate(root_text)
+    if not root:
+        raise ValueError("WebUI 目录不存在或结构不完整；可选择 WebUI 根目录，也可直接选择 models/Lora 目录")
     extensions = root / "extensions"
     detected = _detect_webui_paths(root)
     model_paths = {
@@ -1243,7 +1255,7 @@ def _apply_local_config(config):
 
 
 def _webui_integration_status(webui_root=None):
-    root = _existing_path(webui_root) or WEBUI_ROOT
+    root = _webui_root_from_candidate(webui_root) or WEBUI_ROOT
     config = {}
     error = ""
     if root:
@@ -1276,6 +1288,7 @@ _WEBUI_ROOT_DIR_NAMES = (
     "stable-diffusion-webui",
     "sd-webui",
 )
+_WEBUI_SEARCH_RELATIVE_BASES = ("", "AI", "AI/Tools", "Tools")
 
 
 def _local_drive_letters():
@@ -1313,6 +1326,19 @@ def _dedupe_root_texts(values):
     return result
 
 
+def _webui_candidates_under(drive_root):
+    candidates = []
+    for relative in _WEBUI_SEARCH_RELATIVE_BASES:
+        base = drive_root / Path(relative) if relative else drive_root
+        for name in _WEBUI_ROOT_DIR_NAMES:
+            candidates.append(base / name)
+        try:
+            candidates.extend(base.glob("sd-webui-aki*"))
+        except Exception:
+            pass
+    return candidates
+
+
 def _guess_webui_roots(preferred=None, use_cache=True):
     now = time.monotonic()
     preferred_values = _dedupe_root_texts([preferred])
@@ -1321,8 +1347,8 @@ def _guess_webui_roots(preferred=None, use_cache=True):
     if use_cache and preferred_values and now - float(_WEBUI_ROOT_GUESS_CACHE.get("time") or 0) < _WEBUI_ROOT_GUESS_TTL:
         preferred_found = []
         for value in preferred_values:
-            path = _existing_path(value)
-            if path and ((path / "webui.py").exists() or (path / "launch.py").exists() or (path / "models").exists()):
+            path = _webui_root_from_candidate(value)
+            if path:
                 preferred_found.append(_path_text(path))
         return _dedupe_root_texts([*preferred_found, *(_WEBUI_ROOT_GUESS_CACHE.get("roots") or [])])[:12]
     candidates = []
@@ -1342,24 +1368,17 @@ def _guess_webui_roots(preferred=None, use_cache=True):
         if value:
             candidates.append(value)
     for drive in _local_drive_letters():
-        for name in _WEBUI_ROOT_DIR_NAMES:
-            candidates.append(f"{drive}:/{name}")
         drive_root = Path(f"{drive}:/")
-        try:
-            for child in drive_root.glob("sd-webui-aki*"):
-                candidates.append(child)
-        except Exception:
-            pass
+        candidates.extend(_webui_candidates_under(drive_root))
     seen = set()
     found = []
     for candidate in _dedupe_root_texts(candidates):
-        path = _existing_path(candidate)
+        path = _webui_root_from_candidate(candidate)
         key = _path_text(path).lower() if path else ""
         if not path or key in seen:
             continue
-        if (path / "webui.py").exists() or (path / "launch.py").exists() or (path / "models").exists():
-            seen.add(key)
-            found.append(_path_text(path))
+        seen.add(key)
+        found.append(_path_text(path))
     found = found[:12]
     if use_cache and not preferred_values:
         _WEBUI_ROOT_GUESS_CACHE["time"] = now
@@ -6514,8 +6533,8 @@ def _register_routes():
             return rejected
         data = await request.json()
         root = _truncate_text(data.get("webui_root") or data.get("root") or "", MAX_WEBUI_ROOT_LENGTH)
-        if not root and data.get("auto_detect"):
-            guesses = _guess_webui_roots()
+        if data.get("auto_detect"):
+            guesses = _guess_webui_roots(root, use_cache=False)
             root = guesses[0] if guesses else ""
         if not root:
             return web.json_response({
@@ -6526,6 +6545,7 @@ def _register_routes():
         try:
             config = dict(LOCAL_CONFIG)
             config.update(_build_webui_config(root))
+            root = config["webui_root"]
             settings = dict(_bridge_settings())
             settings["data_source"] = "auto"
             settings["show_startup_wizard"] = False

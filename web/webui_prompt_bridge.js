@@ -9255,7 +9255,9 @@ function createPromptAllInOnePanel(kind, title, textarea, state, sync) {
             body.append(el("div", { class: "webui-bridge-aio-empty" }, q ? "没有匹配的标签" : "这个分组目前没有标签"));
             return;
         }
-        tags.slice(0, 260).forEach((tag) => body.append(createTagButton(tag, textarea, sync, renderBody, isNegative, state)));
+        const visibleTags = activeGroupItem?.type === "favorite" ? tags : tags.slice(0, 260);
+        const rerenderTags = activeGroupItem?.type === "favorite" ? render : renderBody;
+        visibleTags.forEach((tag) => body.append(createTagButton(tag, textarea, sync, rerenderTags, isNegative, state)));
     }
 
     function render() {
@@ -11599,7 +11601,7 @@ function buildPanel(node) {
         const statusLine = el("div", { class: "webui-bridge-config-status" }, "正在读取配置...");
         const rootInput = el("input", {
             class: "webui-bridge-config-input",
-            placeholder: "例如 H:/sd-webui-aki-v4.9",
+            placeholder: "例如 F:/AI/Tools/sd-webui-aki-v4.9，或直接粘贴 models/Lora",
             spellcheck: "false",
         });
         const guessSelect = el("select", { class: "webui-bridge-config-input" }, [
@@ -11666,7 +11668,7 @@ function buildPanel(node) {
                         return;
                     }
                 }
-                const info = await connectWebUIRoot(root, autoDetect, { signal: controller.signal });
+                const info = await connectWebUIRoot(autoDetect ? "" : root, autoDetect, { signal: controller.signal });
                 if (isStale()) return;
                 renderInfo(info);
                 const data = await refreshBridgeData({
@@ -17427,7 +17429,7 @@ function addStyles() {
             color: #ffc1c1;
             font-size: 12px;
             line-height: 15px;
-            opacity: 0;
+            opacity: .82;
         }
         .webui-bridge-aio-tag:hover .webui-bridge-aio-fav-remove {
             opacity: 1;
