@@ -2032,6 +2032,8 @@ def _load_prompt_all_in_one_favorites(kind):
                 "name": item.get("name") or prompt,
                 "prompt": prompt,
                 "tags": tags or [{"prompt": prompt, "local": item.get("name") or ""}],
+                "category": item.get("category") or "",
+                "subCategory": item.get("subCategory") or "",
             })
     return items
 
@@ -2234,26 +2236,44 @@ def _prompt_to_storage_tags(prompt, lang="zh_CN"):
     return tags
 
 
-def _make_prompt_item(prompt, name="", lang="zh_CN"):
+def _make_prompt_item(prompt, name="", lang="zh_CN", category="", sub_category=""):
     return {
         "id": str(uuid.uuid1()),
         "time": int(time.time()),
         "name": name or prompt[:60],
         "tags": _prompt_to_storage_tags(prompt, lang),
         "prompt": prompt,
+        "category": category or "",
+        "subCategory": sub_category or "",
     }
 
 
-def _push_prompt_all_in_one_item(collection, kind, prompt, name="", lang="zh_CN"):
+def _push_prompt_all_in_one_item(collection, kind, prompt, name="", lang="zh_CN", category="", sub_category=""):
     key = _storage_key(collection, kind)
     items = _storage_get(key, [])
     if not isinstance(items, list):
         items = []
     if collection == "history" and len(items) >= PROMPT_ALL_IN_ONE_HISTORY_MAX:
         items = items[-(PROMPT_ALL_IN_ONE_HISTORY_MAX - 1):]
-    item = _make_prompt_item(prompt, name, lang)
-    items.append(item)
-    _storage_set(key, items)
+    # 收藏去重：同一 category + sub_category 下 prompt 相同时跳过（空值等同于默认值）
+    item_prompt = str(prompt or "").strip()
+    item_category = str(category or "").strip() or "新增提示词"
+    item_sub_category = str(sub_category or "").strip() or "未分类"
+    skip = False
+    if collection == "favorite":
+        for existing in items:
+            existing_prompt = str(existing.get("prompt") or "").strip()
+            existing_cat = str(existing.get("category") or "").strip() or "新增提示词"
+            existing_sub = str(existing.get("subCategory") or "").strip() or "未分类"
+            if existing_prompt == item_prompt and existing_cat == item_category and existing_sub == item_sub_category:
+                skip = True
+                break
+    if not skip:
+        item = _make_prompt_item(prompt, name, lang, category, sub_category)
+        items.append(item)
+        _storage_set(key, items)
+    else:
+        item = None
     return item
 
 
@@ -2283,6 +2303,30 @@ def _delete_prompt_all_in_one_item(collection, kind, item_id="", prompt=""):
     del next_items[remove_index]
     _storage_set(key, next_items)
     return True
+
+
+def _update_prompt_all_in_one_favorite(kind, item_id, name="", category="", sub_category=""):
+    key = _storage_key("favorite", kind)
+    items = _storage_get(key, [])
+    if not isinstance(items, list):
+        return False
+    item_id = str(item_id or "")
+    if not item_id:
+        return False
+    updated = False
+    for index, item in enumerate(items):
+        if _prompt_all_in_one_item_id(item, index) == item_id:
+            if name is not None and name != "":
+                item["name"] = name
+            if category is not None and category != "":
+                item["category"] = category
+            if sub_category is not None and sub_category != "":
+                item["subCategory"] = sub_category
+            updated = True
+            break
+    if updated:
+        _storage_set(key, items)
+    return updated
 
 
 def _get_prompt_all_in_one_items(collection, kind):
@@ -6857,12 +6901,14 @@ def _register_routes():
         prompt = _truncate_text(data.get("prompt", ""), MAX_PROMPT_TEXT_LENGTH)
         name = _truncate_text(data.get("name", ""), MAX_STYLE_NAME_LENGTH)
         item_id = _truncate_text(data.get("id", ""), MAX_STYLE_NAME_LENGTH)
+        category = _truncate_text(data.get("category", ""), MAX_STYLE_NAME_LENGTH)
+        sub_category = _truncate_text(data.get("subCategory", ""), MAX_STYLE_NAME_LENGTH)
 
         if action == "push_history":
             item = _push_prompt_all_in_one_item("history", kind, prompt, name, lang)
             return web.json_response({"success": True, "item": item})
         if action == "push_favorite":
-            item = _push_prompt_all_in_one_item("favorite", kind, prompt, name, lang)
+            item = _push_prompt_all_in_one_item("favorite", kind, prompt, name, lang, category, sub_category)
             return web.json_response({
                 "success": True,
                 "item": item,
@@ -6875,6 +6921,15 @@ def _register_routes():
             removed = _delete_prompt_all_in_one_item("favorite", kind, item_id, prompt)
             return web.json_response({
                 "success": removed,
+                "favorites": {
+                    "positive": _load_prompt_all_in_one_favorites("positive"),
+                    "negative": _load_prompt_all_in_one_favorites("negative"),
+                },
+            })
+        if action == "update_favorite":
+            updated = _update_prompt_all_in_one_favorite(kind, item_id, name, category, sub_category)
+            return web.json_response({
+                "success": updated,
                 "favorites": {
                     "positive": _load_prompt_all_in_one_favorites("positive"),
                     "negative": _load_prompt_all_in_one_favorites("negative"),
