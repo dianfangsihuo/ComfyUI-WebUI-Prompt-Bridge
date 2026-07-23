@@ -1,0 +1,36 @@
+name: 功能建议
+description: 提议一个边界清楚、可验证的新功能
+title: "[Feature] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 先描述使用场景和痛点，不要只描述按钮或实现方式。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围与不包含内容
+      description: 说明涉及哪些节点、数据或工作流，以及明确不应改变什么。
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: 兼容性与替代方案
+      description: 是否影响旧收藏、Prompt、模型、连线、布局或浏览器缓存？目前如何绕过？
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: 参与方式
+      options:
+        - label: 我愿意提供复现工作流或测试数据。
+        - label: 我愿意在维护者确认方案后提交 PR。

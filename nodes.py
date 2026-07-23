@@ -48,6 +48,7 @@ MAX_IMAGE_FRAME_PIXELS = 40_000_000
 MAX_IMAGE_TOTAL_PIXELS = 80_000_000
 MAX_IMAGE_FRAMES = 32
 MAX_AI_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_FAVORITE_BATCH_ITEMS = 5000
 DEFAULT_ZOOM_SUMMARY_THRESHOLD = 0.5
 MIN_ZOOM_SUMMARY_THRESHOLD = 0.0
 MAX_ZOOM_SUMMARY_THRESHOLD = 1.0
@@ -2012,8 +2013,7 @@ def _prompt_all_in_one_item_id(item, index):
     return f"legacy-{digest[:16]}"
 
 
-def _load_prompt_all_in_one_favorites(kind):
-    data = _storage_get(_storage_key("favorite", kind), [])
+def _serialize_prompt_all_in_one_favorites(data):
     items = []
     for index, item in enumerate(data if isinstance(data, list) else []):
         if not isinstance(item, dict):
@@ -2032,8 +2032,16 @@ def _load_prompt_all_in_one_favorites(kind):
                 "name": item.get("name") or prompt,
                 "prompt": prompt,
                 "tags": tags or [{"prompt": prompt, "local": item.get("name") or ""}],
+                "category": item.get("category") or "",
+                "subCategory": item.get("subCategory") or "",
             })
     return items
+
+
+def _load_prompt_all_in_one_favorites(kind):
+    return _serialize_prompt_all_in_one_favorites(
+        _storage_get(_storage_key("favorite", kind), [])
+    )
 
 
 def _storage_key(collection, kind):
@@ -2234,30 +2242,235 @@ def _prompt_to_storage_tags(prompt, lang="zh_CN"):
     return tags
 
 
-def _make_prompt_item(prompt, name="", lang="zh_CN"):
+def _make_prompt_item(prompt, name="", lang="zh_CN", category="", sub_category=""):
     return {
         "id": str(uuid.uuid1()),
         "time": int(time.time()),
         "name": name or prompt[:60],
         "tags": _prompt_to_storage_tags(prompt, lang),
         "prompt": prompt,
+        "category": category or "",
+        "subCategory": sub_category or "",
     }
 
 
-def _push_prompt_all_in_one_item(collection, kind, prompt, name="", lang="zh_CN"):
+def _favorite_category_value(item):
+    value = item.get("category") if isinstance(item, dict) else ""
+    return str(value or "").strip() or "新增提示词"
+
+
+def _favorite_sub_category_value(item):
+    value = item.get("subCategory") if isinstance(item, dict) else ""
+    return str(value or "").strip() or "未分类"
+
+
+def _mutate_prompt_all_in_one_favorites(
+    kind,
+    operation,
+    *,
+    entries=None,
+    item_ids=None,
+    prompt="",
+    name=None,
+    category=None,
+    sub_category=None,
+    source_category=None,
+    source_sub_category=None,
+    lang="zh_CN",
+):
+    """Apply one favorite transaction with at most one read and one write."""
+    key = _storage_key("favorite", kind)
+    stored = _storage_get(key, [])
+    if not isinstance(stored, list):
+        stored = []
+    items = [dict(item) if isinstance(item, dict) else item for item in stored]
+    changed = 0
+    last_item = None
+    raw_item_ids = item_ids if isinstance(item_ids, (list, tuple, set)) else []
+    requested_ids = {
+        str(value or "").strip()
+        for value in list(raw_item_ids)[:MAX_FAVORITE_BATCH_ITEMS]
+        if str(value or "").strip()
+    }
+
+    if operation == "push":
+        normalized_entries = list(entries)[:MAX_FAVORITE_BATCH_ITEMS] if isinstance(entries, (list, tuple)) else []
+        existing_keys = {
+            (
+                _prompt_all_in_one_item_prompt(item).strip(),
+                _favorite_category_value(item),
+                _favorite_sub_category_value(item),
+            )
+            for item in items
+            if isinstance(item, dict)
+        }
+        for entry in normalized_entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_prompt = _truncate_text(entry.get("prompt", ""), MAX_PROMPT_TEXT_LENGTH).strip()
+            if not entry_prompt:
+                continue
+            entry_name = _truncate_text(entry.get("name", ""), MAX_STYLE_NAME_LENGTH)
+            entry_category = _truncate_text(entry.get("category", ""), MAX_STYLE_NAME_LENGTH).strip()
+            entry_sub_category = _truncate_text(entry.get("subCategory", ""), MAX_STYLE_NAME_LENGTH).strip()
+            identity = (
+                entry_prompt,
+                entry_category or "新增提示词",
+                entry_sub_category or "未分类",
+            )
+            if identity in existing_keys:
+                continue
+            last_item = _make_prompt_item(
+                entry_prompt,
+                entry_name,
+                lang,
+                entry_category,
+                entry_sub_category,
+            )
+            items.append(last_item)
+            existing_keys.add(identity)
+            changed += 1
+
+    elif operation == "update":
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or _prompt_all_in_one_item_id(item, index) not in requested_ids:
+                continue
+            item_changed = False
+            if name is not None and item.get("name") != name:
+                item["name"] = name
+                item_changed = True
+            if category is not None and item.get("category", "") != category:
+                item["category"] = category
+                item_changed = True
+            if sub_category is not None and item.get("subCategory", "") != sub_category:
+                item["subCategory"] = sub_category
+                item_changed = True
+            if item_changed:
+                changed += 1
+
+    elif operation == "rename_category":
+        source = str(source_category or "").strip() or "新增提示词"
+        target = str(category or "").strip()
+        if target:
+            for item in items:
+                if isinstance(item, dict) and _favorite_category_value(item) == source and item.get("category", "") != target:
+                    item["category"] = target
+                    changed += 1
+
+    elif operation == "rename_sub_category":
+        parent = str(source_category or category or "").strip() or "新增提示词"
+        source = str(source_sub_category or "").strip() or "未分类"
+        target = str(sub_category or "").strip()
+        if target:
+            for item in items:
+                if (
+                    isinstance(item, dict)
+                    and _favorite_category_value(item) == parent
+                    and _favorite_sub_category_value(item) == source
+                    and item.get("subCategory", "") != target
+                ):
+                    item["subCategory"] = target
+                    changed += 1
+
+    elif operation in {"delete", "delete_category", "delete_sub_category"}:
+        remove_indexes = set()
+        if operation == "delete":
+            if requested_ids:
+                remove_indexes = {
+                    index
+                    for index, item in enumerate(items)
+                    if isinstance(item, dict) and _prompt_all_in_one_item_id(item, index) in requested_ids
+                }
+            else:
+                target_prompt = str(prompt or "").strip()
+                matches = [
+                    index
+                    for index, item in enumerate(items)
+                    if isinstance(item, dict) and _prompt_all_in_one_item_prompt(item).strip() == target_prompt
+                ]
+                if len(matches) == 1:
+                    remove_indexes.add(matches[0])
+        elif operation == "delete_category":
+            source = str(source_category or category or "").strip() or "新增提示词"
+            remove_indexes = {
+                index
+                for index, item in enumerate(items)
+                if isinstance(item, dict) and _favorite_category_value(item) == source
+            }
+        else:
+            parent = str(source_category or category or "").strip() or "新增提示词"
+            source = str(source_sub_category or sub_category or "").strip() or "未分类"
+            remove_indexes = {
+                index
+                for index, item in enumerate(items)
+                if (
+                    isinstance(item, dict)
+                    and _favorite_category_value(item) == parent
+                    and _favorite_sub_category_value(item) == source
+                )
+            }
+        if remove_indexes:
+            items = [item for index, item in enumerate(items) if index not in remove_indexes]
+            changed = len(remove_indexes)
+
+    else:
+        raise ValueError("Unknown favorite operation")
+
+    if changed:
+        _storage_set(key, items)
+    return {
+        "success": True,
+        "changed": changed,
+        "item": last_item,
+        "items": items,
+    }
+
+
+def _favorite_collections_payload(kind, current_items):
+    current = _serialize_prompt_all_in_one_favorites(current_items)
+    other_kind = "positive" if kind == "negative" else "negative"
+    other = _load_prompt_all_in_one_favorites(other_kind)
+    return {
+        kind: current,
+        other_kind: other,
+    }
+
+
+def _push_prompt_all_in_one_item(collection, kind, prompt, name="", lang="zh_CN", category="", sub_category=""):
+    if collection == "favorite":
+        result = _mutate_prompt_all_in_one_favorites(
+            kind,
+            "push",
+            entries=[{
+                "prompt": prompt,
+                "name": name,
+                "category": category,
+                "subCategory": sub_category,
+            }],
+            lang=lang,
+        )
+        return result["item"]
     key = _storage_key(collection, kind)
     items = _storage_get(key, [])
     if not isinstance(items, list):
         items = []
     if collection == "history" and len(items) >= PROMPT_ALL_IN_ONE_HISTORY_MAX:
         items = items[-(PROMPT_ALL_IN_ONE_HISTORY_MAX - 1):]
-    item = _make_prompt_item(prompt, name, lang)
+    item = _make_prompt_item(prompt, name, lang, category, sub_category)
     items.append(item)
     _storage_set(key, items)
     return item
 
 
 def _delete_prompt_all_in_one_item(collection, kind, item_id="", prompt=""):
+    if collection == "favorite":
+        result = _mutate_prompt_all_in_one_favorites(
+            kind,
+            "delete",
+            item_ids=[item_id] if item_id else [],
+            prompt=prompt,
+        )
+        return bool(result["changed"])
     key = _storage_key(collection, kind)
     items = _storage_get(key, [])
     if not isinstance(items, list):
@@ -2283,6 +2496,18 @@ def _delete_prompt_all_in_one_item(collection, kind, item_id="", prompt=""):
     del next_items[remove_index]
     _storage_set(key, next_items)
     return True
+
+
+def _update_prompt_all_in_one_favorite(kind, item_id, name="", category="", sub_category=""):
+    result = _mutate_prompt_all_in_one_favorites(
+        kind,
+        "update",
+        item_ids=[item_id] if item_id else [],
+        name=name if name not in (None, "") else None,
+        category=category if category not in (None, "") else None,
+        sub_category=sub_category if sub_category not in (None, "") else None,
+    )
+    return bool(result["changed"])
 
 
 def _get_prompt_all_in_one_items(collection, kind):
@@ -2811,6 +3036,214 @@ def _parse_generation_parameters(text):
     if "Hires negative prompt" not in result:
         result["Hires negative prompt"] = ""
     return result
+
+
+class _PromptMetadataNotFoundError(ValueError):
+    pass
+
+
+def _decode_image_metadata_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        raw = value
+        if raw.startswith(b"ASCII\x00\x00\x00"):
+            raw = raw[8:]
+        elif raw.startswith(b"UNICODE\x00"):
+            raw = raw[8:]
+            for encoding in ("utf-16", "utf-16-le", "utf-16-be"):
+                try:
+                    return raw.decode(encoding).rstrip("\x00")
+                except UnicodeDecodeError:
+                    continue
+        elif raw.startswith(b"JIS\x00\x00\x00\x00\x00"):
+            raw = raw[8:]
+        return raw.decode("utf-8", errors="replace").rstrip("\x00")
+    return str(value)
+
+
+def _decode_image_metadata_json(value, label, warnings):
+    if isinstance(value, dict):
+        return value
+    text = _decode_image_metadata_text(value).strip()
+    if not text:
+        return {}
+    try:
+        loaded = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        warnings.append(f"{label} metadata is not valid JSON")
+        return {}
+    if not isinstance(loaded, dict):
+        warnings.append(f"{label} metadata is not a JSON object")
+        return {}
+    return loaded
+
+
+def _workflow_prompt_node_labels(workflow):
+    labels = {}
+    for node in workflow.get("nodes") or []:
+        if not isinstance(node, dict) or node.get("id") is None:
+            continue
+        properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        label = (
+            node.get("title")
+            or properties.get("Node name for S&R")
+            or node.get("type")
+            or f"Node {node.get('id')}"
+        )
+        labels[str(node.get("id"))] = _truncate_text(str(label), MAX_STYLE_NAME_LENGTH)
+    return labels
+
+
+def _bridge_prompt_value(inputs, name):
+    if name not in inputs:
+        return None
+    value = inputs.get(name)
+    if not isinstance(value, str):
+        return None
+    return _truncate_text(value, MAX_PROMPT_TEXT_LENGTH)
+
+
+def _extract_bridge_prompt_candidates(prompt, workflow=None, warnings=None):
+    warnings = warnings if warnings is not None else []
+    labels = _workflow_prompt_node_labels(workflow or {})
+    main_candidates = []
+    positive_nodes = []
+    negative_nodes = []
+
+    for node_id, node in (prompt or {}).items():
+        if not isinstance(node, dict):
+            continue
+        class_type = str(node.get("class_type") or "")
+        if class_type not in {
+            "WebUIPromptBridge",
+            "WebUIPromptBridgePositivePrompt",
+            "WebUIPromptBridgeNegativePrompt",
+        }:
+            continue
+        inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+        meta = node.get("_meta") if isinstance(node.get("_meta"), dict) else {}
+        node_key = str(node_id)
+        label = _truncate_text(
+            str(meta.get("title") or labels.get(node_key) or class_type),
+            MAX_STYLE_NAME_LENGTH,
+        )
+        candidate = {
+            "node_id": node_key,
+            "label": label,
+            "positive_prompt": None,
+            "negative_prompt": None,
+        }
+        if class_type == "WebUIPromptBridge":
+            candidate["positive_prompt"] = _bridge_prompt_value(inputs, "positive_prompt")
+            candidate["negative_prompt"] = _bridge_prompt_value(inputs, "negative_prompt")
+            if candidate["positive_prompt"] is not None or candidate["negative_prompt"] is not None:
+                main_candidates.append(candidate)
+        elif class_type == "WebUIPromptBridgePositivePrompt":
+            candidate["positive_prompt"] = _bridge_prompt_value(inputs, "positive_prompt")
+            if candidate["positive_prompt"] is not None:
+                positive_nodes.append(candidate)
+        else:
+            candidate["negative_prompt"] = _bridge_prompt_value(inputs, "negative_prompt")
+            if candidate["negative_prompt"] is not None:
+                negative_nodes.append(candidate)
+
+    small_candidates = []
+    if len(positive_nodes) == 1 and len(negative_nodes) == 1:
+        positive = positive_nodes[0]
+        negative = negative_nodes[0]
+        small_candidates.append({
+            "node_id": f"{positive['node_id']}+{negative['node_id']}",
+            "label": f"{positive['label']} + {negative['label']}",
+            "positive_prompt": positive["positive_prompt"],
+            "negative_prompt": negative["negative_prompt"],
+        })
+    else:
+        small_candidates.extend(positive_nodes)
+        small_candidates.extend(negative_nodes)
+
+    candidates = []
+    seen = set()
+    duplicate_count = 0
+    for candidate in [*main_candidates, *small_candidates]:
+        key = (candidate["positive_prompt"], candidate["negative_prompt"])
+        if key in seen:
+            duplicate_count += 1
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+    if duplicate_count:
+        warnings.append(f"Merged {duplicate_count} duplicate Bridge prompt candidate(s)")
+    return candidates
+
+
+def _metadata_image_extension(filename, image_bytes):
+    suffix = Path(str(filename or "")).suffix.lower()
+    if suffix in _IMAGE_SIGNATURES:
+        return suffix
+    if image_bytes.startswith(_IMAGE_SIGNATURES[".png"][0]):
+        return ".png"
+    if image_bytes.startswith(_IMAGE_SIGNATURES[".jpg"][0]):
+        return ".jpg"
+    if image_bytes.startswith(_IMAGE_SIGNATURES[".webp"][0]) and image_bytes[8:12] == b"WEBP":
+        return ".webp"
+    raise ValueError("Unsupported image type")
+
+
+def _parse_image_generation_metadata(image_bytes, filename=""):
+    if len(image_bytes or b"") > MAX_IMAGE_UPLOAD_BYTES:
+        raise ValueError("Image file is too large")
+    extension = _metadata_image_extension(filename, image_bytes)
+    _validate_preview_image(image_bytes, extension)
+
+    warnings = []
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        info = dict(image.info or {})
+        try:
+            exif = image.getexif()
+        except Exception:
+            exif = {}
+
+    prompt = _decode_image_metadata_json(info.get("prompt"), "Comfy prompt", warnings)
+    workflow = _decode_image_metadata_json(info.get("workflow"), "Comfy workflow", warnings)
+    candidates = _extract_bridge_prompt_candidates(prompt, workflow, warnings)
+    if candidates:
+        return {
+            "source": "comfy_prompt",
+            "candidates": candidates,
+            "warnings": warnings,
+        }
+
+    parameter_value = info.get("parameters")
+    if not parameter_value:
+        for key in ("comment", "Comment", "Description", "description"):
+            if info.get(key):
+                parameter_value = info.get(key)
+                break
+    if not parameter_value and exif:
+        parameter_value = exif.get(0x9286) or exif.get(0x010E)
+    parameter_text = _decode_image_metadata_text(parameter_value).strip()
+    if parameter_text:
+        parsed = _parse_generation_parameters(parameter_text)
+        positive = parsed.get("Prompt")
+        negative = parsed.get("Negative prompt") if "Negative prompt:" in parameter_text else None
+        if positive is not None or negative is not None:
+            return {
+                "source": "a1111_parameters",
+                "candidates": [{
+                    "node_id": None,
+                    "label": "A1111 / WebUI parameters",
+                    "positive_prompt": _truncate_text(positive or "", MAX_PROMPT_TEXT_LENGTH),
+                    "negative_prompt": None if negative is None else _truncate_text(negative, MAX_PROMPT_TEXT_LENGTH),
+                }],
+                "warnings": warnings,
+            }
+
+    if prompt:
+        warnings.append("Comfy metadata does not contain a WebUI Prompt Bridge node")
+    raise _PromptMetadataNotFoundError("No supported Bridge prompt metadata was found in this image")
 
 
 def _resolve_lora_name(requested):
@@ -6344,6 +6777,44 @@ def _register_routes():
         relative_name = f"webui_prompt_bridge/{safe_name}"
         return web.json_response({"name": relative_name, "kind": kind})
 
+    @protected_route("post", "/webui_prompt_bridge/parse_image_metadata")
+    async def parse_image_metadata(request):
+        rejected = reject_cross_origin(request)
+        if rejected is not None:
+            return rejected
+        if request.content_length and request.content_length > MAX_IMAGE_UPLOAD_BYTES + 1024 * 1024:
+            return web.json_response({"error": "Image file is too large"}, status=413)
+        reader = await request.multipart()
+        image_bytes = b""
+        filename = ""
+        image_field_seen = False
+        field = await reader.next()
+        while field:
+            if field.name == "image":
+                if image_field_seen:
+                    return web.json_response({"error": "Only one image file is allowed"}, status=400)
+                image_field_seen = True
+                filename = field.filename or ""
+                try:
+                    image_bytes = await read_multipart_field_limited(field, MAX_IMAGE_UPLOAD_BYTES)
+                except ValueError as exc:
+                    return web.json_response({"error": str(exc)}, status=413)
+            field = await reader.next()
+        if not image_bytes:
+            return web.json_response({"error": "Image file is required"}, status=400)
+        try:
+            parsed = await run_blocking(_parse_image_generation_metadata, image_bytes, filename)
+        except _PromptMetadataNotFoundError as exc:
+            return web.json_response({
+                "error": str(exc),
+                "source": None,
+                "candidates": [],
+                "warnings": [],
+            }, status=422)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(parsed)
+
     @protected_route("get", "/webui_prompt_bridge/settings")
     async def bridge_settings_get(request):
         return web.json_response(_settings_response())
@@ -6857,29 +7328,107 @@ def _register_routes():
         prompt = _truncate_text(data.get("prompt", ""), MAX_PROMPT_TEXT_LENGTH)
         name = _truncate_text(data.get("name", ""), MAX_STYLE_NAME_LENGTH)
         item_id = _truncate_text(data.get("id", ""), MAX_STYLE_NAME_LENGTH)
+        category = _truncate_text(data.get("category", ""), MAX_STYLE_NAME_LENGTH)
+        sub_category = _truncate_text(data.get("subCategory", ""), MAX_STYLE_NAME_LENGTH)
+
+        def favorite_response(result, *, require_change=False):
+            return web.json_response({
+                "success": bool(result.get("changed")) if require_change else True,
+                "changed": int(result.get("changed") or 0),
+                "item": result.get("item"),
+                "favorites": _favorite_collections_payload(kind, result.get("items") or []),
+            })
 
         if action == "push_history":
             item = _push_prompt_all_in_one_item("history", kind, prompt, name, lang)
             return web.json_response({"success": True, "item": item})
         if action == "push_favorite":
-            item = _push_prompt_all_in_one_item("favorite", kind, prompt, name, lang)
-            return web.json_response({
-                "success": True,
-                "item": item,
-                "favorites": {
-                    "positive": _load_prompt_all_in_one_favorites("positive"),
-                    "negative": _load_prompt_all_in_one_favorites("negative"),
-                },
-            })
+            result = _mutate_prompt_all_in_one_favorites(
+                kind,
+                "push",
+                entries=[{
+                    "prompt": prompt,
+                    "name": name,
+                    "category": category,
+                    "subCategory": sub_category,
+                }],
+                lang=lang,
+            )
+            return favorite_response(result)
+        if action == "push_favorites":
+            result = _mutate_prompt_all_in_one_favorites(
+                kind,
+                "push",
+                entries=data.get("items") if isinstance(data.get("items"), list) else [],
+                lang=lang,
+            )
+            return favorite_response(result)
+        if action == "update_favorite":
+            result = _mutate_prompt_all_in_one_favorites(
+                kind,
+                "update",
+                item_ids=[item_id] if item_id else [],
+                name=name if name else None,
+                category=category if category else None,
+                sub_category=sub_category if sub_category else None,
+            )
+            return favorite_response(result, require_change=True)
+        if action == "move_favorites":
+            result = _mutate_prompt_all_in_one_favorites(
+                kind,
+                "update",
+                item_ids=data.get("ids") if isinstance(data.get("ids"), list) else [],
+                category=category if "category" in data else None,
+                sub_category=sub_category if "subCategory" in data else None,
+            )
+            return favorite_response(result)
+        if action == "rename_favorite_category":
+            result = _mutate_prompt_all_in_one_favorites(
+                kind,
+                "rename_category",
+                source_category=_truncate_text(data.get("fromCategory", ""), MAX_STYLE_NAME_LENGTH),
+                category=category,
+            )
+            return favorite_response(result)
+        if action == "rename_favorite_subcategory":
+            result = _mutate_prompt_all_in_one_favorites(
+                kind,
+                "rename_sub_category",
+                source_category=category,
+                source_sub_category=_truncate_text(data.get("fromSubCategory", ""), MAX_STYLE_NAME_LENGTH),
+                sub_category=sub_category,
+            )
+            return favorite_response(result)
         if action == "delete_favorite":
-            removed = _delete_prompt_all_in_one_item("favorite", kind, item_id, prompt)
-            return web.json_response({
-                "success": removed,
-                "favorites": {
-                    "positive": _load_prompt_all_in_one_favorites("positive"),
-                    "negative": _load_prompt_all_in_one_favorites("negative"),
-                },
-            })
+            result = _mutate_prompt_all_in_one_favorites(
+                kind,
+                "delete",
+                item_ids=[item_id] if item_id else [],
+                prompt=prompt,
+            )
+            return favorite_response(result, require_change=True)
+        if action == "delete_favorites":
+            result = _mutate_prompt_all_in_one_favorites(
+                kind,
+                "delete",
+                item_ids=data.get("ids") if isinstance(data.get("ids"), list) else [],
+            )
+            return favorite_response(result)
+        if action == "delete_favorite_category":
+            result = _mutate_prompt_all_in_one_favorites(
+                kind,
+                "delete_category",
+                source_category=category,
+            )
+            return favorite_response(result)
+        if action == "delete_favorite_subcategory":
+            result = _mutate_prompt_all_in_one_favorites(
+                kind,
+                "delete_sub_category",
+                source_category=category,
+                source_sub_category=sub_category,
+            )
+            return favorite_response(result)
         if action == "latest_history":
             return web.json_response({"success": True, "item": _latest_prompt_all_in_one_history(kind)})
         if action == "clear_history":

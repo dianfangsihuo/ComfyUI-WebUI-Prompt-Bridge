@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 使用说明与常见问题
+    url: https://github.com/dianfangsihuo/ComfyUI-WebUI-Prompt-Bridge#readme
+    about: 提交 Issue 前请先查看安装、模型兼容和常见问题说明。

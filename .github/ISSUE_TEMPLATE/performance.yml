@@ -1,0 +1,51 @@
+name: 性能问题
+description: 报告大量收藏、Tag、LoRA 或复杂工作流下的卡顿
+title: "[Performance] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        性能问题需要数据规模和可重复操作。请使用合成数据，不要上传真实收藏文件。
+  - type: input
+    id: version
+    attributes:
+      label: Bridge / ComfyUI / 浏览器版本
+      placeholder: v0.4.28 / ComfyUI SHA / Chrome 140
+    validations:
+      required: true
+  - type: textarea
+    id: scale
+    attributes:
+      label: 数据规模
+      placeholder: 例如正向收藏 2100 条、已输入 Tag 120 个、LoRA 800 个
+    validations:
+      required: true
+  - type: textarea
+    id: operation
+    attributes:
+      label: 触发卡顿的操作
+      placeholder: 请逐步说明搜索、切换分类、拖动、排序或删除过程。
+    validations:
+      required: true
+  - type: textarea
+    id: measurement
+    attributes:
+      label: 测量结果
+      placeholder: 首次渲染耗时、五次操作耗时、浏览器 Performance 截图或录屏
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望体验
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已确认卡顿可以重复出现。
+          required: true
+        - label: 我没有上传真实收藏、密钥或本机敏感路径。
+          required: true
