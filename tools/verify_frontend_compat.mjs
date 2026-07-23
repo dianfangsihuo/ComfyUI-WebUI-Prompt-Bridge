@@ -46,6 +46,7 @@ function parseArgs() {
         queue: false,
         headed: false,
         focusedFixes: false,
+        newFeatures: false,
     };
     for (const arg of process.argv.slice(2)) {
         if (arg === "--queue") {
@@ -54,6 +55,8 @@ function parseArgs() {
             options.headed = true;
         } else if (arg === "--focused-fixes") {
             options.focusedFixes = true;
+        } else if (arg === "--new-features") {
+            options.newFeatures = true;
         } else if (arg.startsWith("--url=")) {
             options.baseUrl = arg.slice("--url=".length);
         } else {
@@ -1827,6 +1830,431 @@ async function verifyUnlimitedFavoriteListDeletion(browser, baseUrl) {
         );
         assert(!bridgeConsoleErrors.length, "Favorite list deletion emitted console errors", bridgeConsoleErrors);
         return { before, after, removeOpacity, bridgeConsoleErrors: bridgeConsoleErrors.length };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifySplitUnetSelectionIsTopologySafe(browser, baseUrl) {
+    const consoleMessages = [];
+    const modelNames = ["mock/anima-a.safetensors", "mock/anima-b.safetensors"];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1400, height: 1000 }, async (newPage) => {
+        await newPage.route("**/webui_prompt_bridge/models", async (route) => {
+            await route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({
+                    checkpoints: ["mock/anima-a.safetensors"],
+                    unets: modelNames,
+                    clips: [],
+                    vaes: [],
+                    embeddings: [],
+                }),
+            });
+        });
+    });
+    try {
+        const setup = await page.evaluate((names) => {
+            window.app.graph.clear();
+            const unet = window.LiteGraph.createNode("UNETLoader");
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            if (!unet || !bridge) return { error: "UNETLoader or WebUIPromptBridge is not registered" };
+            unet.id = 951001;
+            bridge.id = 951002;
+            unet.pos = [40, 40];
+            bridge.pos = [400, 40];
+            const widget = unet.widgets?.find((item) => item.name === "unet_name");
+            if (!widget) return { error: "UNETLoader has no unet_name widget" };
+            window.app.graph.add(unet);
+            window.app.graph.add(bridge);
+            widget.options = { ...(widget.options || {}), values: [...names] };
+            widget.value = names[0];
+            const outputSlot = (unet.outputs || []).findIndex((output) => output.type === "MODEL");
+            const inputSlot = (bridge.inputs || []).findIndex((input) => input.name === "model");
+            if (outputSlot < 0 || inputSlot < 0) return { error: "MODEL slots are unavailable" };
+            unet.connect(outputSlot, bridge, inputSlot);
+            window.app.canvas.setDirty(true, true);
+            return { unetId: unet.id, bridgeId: bridge.id };
+        }, modelNames);
+        assert(!setup.error, "Unable to construct split UNET verification graph", setup);
+        await page.waitForFunction(() => document.querySelector(".webui-bridge-panel")?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
+        const before = await page.evaluate(({ unetId, target, names }) => {
+            const panel = [...document.querySelectorAll(".webui-bridge-panel")].at(-1);
+            const select = panel?.querySelector(".webui-bridge-model-select");
+            const option = [...(select?.options || [])].find((item) => item.dataset.modelKind === "unet" && item.dataset.modelName === target);
+            const widget = window.app.graph.getNodeById(unetId)?.widgets?.find((item) => item.name === "unet_name");
+            widget.options = { ...(widget.options || {}), values: [...names] };
+            widget.value = names[0];
+            const graph = window.app.graph.serialize();
+            const value = widget.value;
+            if (option) select.value = option.value;
+            const selectedKind = select?.selectedOptions?.[0]?.dataset?.modelKind || "";
+            const selectedName = select?.selectedOptions?.[0]?.dataset?.modelName || "";
+            if (option) select.dispatchEvent(new Event("change", { bubbles: true }));
+            return {
+                hasOption: Boolean(option),
+                groups: [...(select?.querySelectorAll("optgroup") || [])].map((group) => group.label),
+                selectedKind,
+                selectedName,
+                value,
+                widgetOptions: window.app.graph.getNodeById(unetId)?.widgets?.find((item) => item.name === "unet_name")?.options?.values || [],
+                nodeCount: graph.nodes?.length || 0,
+                links: JSON.stringify(graph.links || []),
+            };
+        }, { unetId: setup.unetId, target: modelNames[1], names: modelNames });
+        assert(before.hasOption, "diffusion_models UNET option was not rendered", before);
+        assert(before.groups.includes("分体 UNET（diffusion_models）") && before.groups.includes("整合 Checkpoint"), "Model selector optgroups are missing", before);
+        await page.waitForTimeout(250);
+        const after = await page.evaluate((unetId) => {
+            const graph = window.app.graph.serialize();
+            return {
+                value: window.app.graph.getNodeById(unetId)?.widgets?.find((item) => item.name === "unet_name")?.value,
+                nodeCount: graph.nodes?.length || 0,
+                links: JSON.stringify(graph.links || []),
+                status: [...document.querySelectorAll(".webui-bridge-status")].at(-1)?.textContent || "",
+            };
+        }, setup.unetId);
+        assert(after.value === modelNames[1], "Selected UNET was not applied", { before, after });
+        assert(after.nodeCount === before.nodeCount && after.links === before.links, "UNET selection changed graph topology", { before, after });
+
+        const splitBranch = await page.evaluate(({ names, otherNames }) => {
+            window.app.graph.clear();
+            const branch = window.LiteGraph.createNode("UNETLoader");
+            const unrelated = window.LiteGraph.createNode("UNETLoader");
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            const mode = window.LiteGraph.createNode("ImpactBoolean");
+            if (!branch || !unrelated || !bridge || !mode) return { error: "Split-branch verification nodes are unavailable" };
+            branch.id = 951020;
+            unrelated.id = 951021;
+            bridge.id = 951022;
+            mode.id = 951023;
+            branch.title = "Anima split model source";
+            unrelated.title = "Unrelated UNET";
+            mode.title = "模型模式：分体 / Checkpoint";
+            window.app.graph.add(branch);
+            window.app.graph.add(unrelated);
+            window.app.graph.add(mode);
+            window.app.graph.add(bridge);
+            const branchWidget = branch.widgets?.find((item) => item.name === "unet_name");
+            const unrelatedWidget = unrelated.widgets?.find((item) => item.name === "unet_name");
+            const modeWidget = mode.widgets?.[0];
+            branchWidget.options = { ...(branchWidget.options || {}), values: [...names] };
+            branchWidget.value = names[0];
+            unrelatedWidget.options = { ...(unrelatedWidget.options || {}), values: [...otherNames] };
+            unrelatedWidget.value = otherNames[0];
+            modeWidget.value = false;
+            window.app.canvas.setDirty(true, true);
+            return { branchId: branch.id, unrelatedId: unrelated.id, modeId: mode.id };
+        }, { names: modelNames, otherNames: ["mock/other-a.safetensors", "mock/other-b.safetensors"] });
+        assert(!splitBranch.error, "Unable to construct Checkpoint-mode split branch verification graph", splitBranch);
+        await page.waitForFunction(() => [...document.querySelectorAll(".webui-bridge-panel")].at(-1)?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
+        const splitBranchBefore = await page.evaluate(({ ids, names, otherNames, target }) => {
+            const branchWidget = window.app.graph.getNodeById(ids.branchId)?.widgets?.find((item) => item.name === "unet_name");
+            const unrelatedWidget = window.app.graph.getNodeById(ids.unrelatedId)?.widgets?.find((item) => item.name === "unet_name");
+            branchWidget.options = { ...(branchWidget.options || {}), values: [...names] };
+            branchWidget.value = names[0];
+            unrelatedWidget.options = { ...(unrelatedWidget.options || {}), values: [...otherNames] };
+            unrelatedWidget.value = otherNames[0];
+            const panel = [...document.querySelectorAll(".webui-bridge-panel")].at(-1);
+            const select = panel.querySelector(".webui-bridge-model-select");
+            const option = [...select.options].find((item) => item.dataset.modelKind === "unet" && item.dataset.modelName === target);
+            const graph = window.app.graph.serialize();
+            select.value = option.value;
+            select.dispatchEvent(new Event("change", { bubbles: true }));
+            return { nodeCount: graph.nodes?.length || 0, links: JSON.stringify(graph.links || []) };
+        }, {
+            ids: splitBranch,
+            names: modelNames,
+            otherNames: ["mock/other-a.safetensors", "mock/other-b.safetensors"],
+            target: modelNames[1],
+        });
+        await page.waitForTimeout(200);
+        const splitBranchAfter = await page.evaluate((ids) => {
+            const graph = window.app.graph.serialize();
+            return {
+                branch: window.app.graph.getNodeById(ids.branchId)?.widgets?.find((item) => item.name === "unet_name")?.value,
+                unrelated: window.app.graph.getNodeById(ids.unrelatedId)?.widgets?.find((item) => item.name === "unet_name")?.value,
+                mode: window.app.graph.getNodeById(ids.modeId)?.widgets?.[0]?.value,
+                nodeCount: graph.nodes?.length || 0,
+                links: JSON.stringify(graph.links || []),
+            };
+        }, splitBranch);
+        assert(splitBranchAfter.branch === modelNames[1] && splitBranchAfter.unrelated === "mock/other-a.safetensors", "Checkpoint-mode split branch selected the wrong UNETLoader", splitBranchAfter);
+        assert(splitBranchAfter.mode === true, "Checkpoint-mode UNET selection did not enable the split branch", splitBranchAfter);
+        assert(splitBranchAfter.nodeCount === splitBranchBefore.nodeCount && splitBranchAfter.links === splitBranchBefore.links, "Checkpoint-mode UNET selection changed graph topology", { splitBranchBefore, splitBranchAfter });
+
+        const ambiguous = await page.evaluate((names) => {
+            window.app.graph.clear();
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            bridge.id = 951010;
+            bridge.pos = [420, 40];
+            window.app.graph.add(bridge);
+            const ids = [951011, 951012];
+            for (const [offset, id] of ids.entries()) {
+                const loader = window.LiteGraph.createNode("UNETLoader");
+                loader.id = id;
+                loader.pos = [40, 40 + offset * 180];
+                const widget = loader.widgets?.find((item) => item.name === "unet_name");
+                window.app.graph.add(loader);
+                widget.options = { ...(widget.options || {}), values: [...names] };
+                widget.value = names[0];
+            }
+            window.app.canvas.setDirty(true, true);
+            return ids;
+        }, modelNames);
+        await page.waitForFunction(() => [...document.querySelectorAll(".webui-bridge-panel")].at(-1)?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
+        await page.evaluate(({ target, names, ids }) => {
+            for (const id of ids) {
+                const widget = window.app.graph.getNodeById(id)?.widgets?.find((item) => item.name === "unet_name");
+                widget.options = { ...(widget.options || {}), values: [...names] };
+                widget.value = names[0];
+            }
+            const panel = [...document.querySelectorAll(".webui-bridge-panel")].at(-1);
+            const select = panel.querySelector(".webui-bridge-model-select");
+            const option = [...select.options].find((item) => item.dataset.modelKind === "unet" && item.dataset.modelName === target);
+            select.value = option.value;
+            select.dispatchEvent(new Event("change", { bubbles: true }));
+        }, { target: modelNames[1], names: modelNames, ids: ambiguous });
+        await page.waitForTimeout(200);
+        const ambiguousAfter = await page.evaluate((ids) => ({
+            values: ids.map((id) => window.app.graph.getNodeById(id)?.widgets?.find((item) => item.name === "unet_name")?.value),
+            status: [...document.querySelectorAll(".webui-bridge-status")].at(-1)?.textContent || "",
+        }), ambiguous);
+        assert(ambiguousAfter.values.every((value) => value === modelNames[0]), "Ambiguous UNET selection modified a loader", ambiguousAfter);
+        assert(/多个|无法安全/.test(ambiguousAfter.status), "Ambiguous UNET selection did not explain why it was rejected", ambiguousAfter);
+        return { before, after, splitBranchAfter, ambiguousAfter };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifyImagePromptImportRequiresConfirmation(browser, baseUrl) {
+    const consoleMessages = [];
+    const responseBody = {
+        source: "comfy_prompt",
+        candidates: [
+            { node_id: "1", label: "First Bridge", positive_prompt: "first positive", negative_prompt: "first negative" },
+            { node_id: "2", label: "Second Bridge", positive_prompt: "second positive", negative_prompt: "second negative" },
+        ],
+        warnings: [],
+    };
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1300, height: 950 }, async (newPage) => {
+        await newPage.route("**/webui_prompt_bridge/parse_image_metadata", async (route) => {
+            await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(responseBody) });
+        });
+    });
+    const tinyPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+    try {
+        await page.evaluate(() => {
+            window.app.graph.clear();
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            bridge.id = 952001;
+            bridge.pos = [60, 40];
+            window.app.graph.add(bridge);
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForFunction(() => document.querySelector(".webui-bridge-panel")?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
+        await page.evaluate(() => {
+            const positive = document.querySelector(".webui-bridge-positive-prompt-row textarea");
+            const negative = document.querySelector(".webui-bridge-prompt-row:not(.webui-bridge-positive-prompt-row) textarea");
+            positive.value = "original positive";
+            negative.value = "original negative";
+            positive.dispatchEvent(new Event("input", { bubbles: true }));
+            negative.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        const input = page.locator('.webui-bridge-tools input[type="file"][accept*="image/png"]');
+        await input.setInputFiles({ name: "prompt.png", mimeType: "image/png", buffer: tinyPng });
+        await page.waitForSelector(".webui-bridge-image-prompt-dialog");
+        const beforeConfirm = await page.evaluate(() => ({
+            positive: document.querySelector(".webui-bridge-positive-prompt-row textarea")?.value,
+            negative: document.querySelector(".webui-bridge-prompt-row:not(.webui-bridge-positive-prompt-row) textarea")?.value,
+        }));
+        assert(beforeConfirm.positive === "original positive" && beforeConfirm.negative === "original negative", "Image import changed prompts before confirmation", beforeConfirm);
+        await page.getByRole("button", { name: "取消" }).last().click();
+        await page.waitForTimeout(80);
+        const afterCancel = await page.evaluate(() => ({
+            positive: document.querySelector(".webui-bridge-positive-prompt-row textarea")?.value,
+            negative: document.querySelector(".webui-bridge-prompt-row:not(.webui-bridge-positive-prompt-row) textarea")?.value,
+        }));
+        assert(JSON.stringify(afterCancel) === JSON.stringify(beforeConfirm), "Cancelling image import changed prompts", { beforeConfirm, afterCancel });
+
+        await input.setInputFiles({ name: "prompt.png", mimeType: "image/png", buffer: tinyPng });
+        await page.waitForSelector(".webui-bridge-image-prompt-dialog");
+        const dialog = page.locator(".webui-bridge-image-prompt-dialog");
+        await dialog.locator("select").selectOption("1");
+        const checks = dialog.locator('input[type="checkbox"]');
+        await checks.nth(1).uncheck();
+        await dialog.getByRole("button", { name: "确认覆盖所选内容" }).click();
+        await page.waitForTimeout(100);
+        const afterApply = await page.evaluate(() => ({
+            positive: document.querySelector(".webui-bridge-positive-prompt-row textarea")?.value,
+            negative: document.querySelector(".webui-bridge-prompt-row:not(.webui-bridge-positive-prompt-row) textarea")?.value,
+        }));
+        assert(afterApply.positive === "second positive", "Selected image Prompt candidate was not applied", afterApply);
+        assert(afterApply.negative === "original negative", "Unchecked negative Prompt was overwritten", afterApply);
+        return { beforeConfirm, afterCancel, afterApply };
+    } finally {
+        await context.close();
+    }
+}
+
+async function verifyWrappedPromptPositionEditing(browser, baseUrl) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1400, height: 1050 });
+    try {
+        await page.evaluate(() => {
+            window.app.graph.clear();
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            bridge.id = 953001;
+            bridge.pos = [40, 40];
+            window.app.graph.add(bridge);
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForFunction(() => document.querySelector(".webui-bridge-panel")?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
+        const dragReport = await page.evaluate(() => {
+            const textarea = document.querySelector(".webui-bridge-positive-prompt-row textarea");
+            const chips = document.querySelector(".webui-bridge-positive-prompt-row .webui-bridge-prompt-chips");
+            const values = Array.from({ length: 120 }, (_, index) => `wrapped_position_tag_${String(index).padStart(3, "0")}`);
+            textarea.value = values.join(", ");
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+            const cards = [...chips.querySelectorAll(".webui-bridge-prompt-chip[data-prompt-index]")];
+            const initialRowCount = new Set(cards.map((card) => Math.round(card.getBoundingClientRect().top))).size;
+            const firstTop = cards[0].getBoundingClientRect().top;
+            const secondRow = cards.find((card) => card.getBoundingClientRect().top > firstTop + 6);
+            if (!secondRow) return { error: "Prompt tags did not wrap to a second row", cardCount: cards.length };
+            const previousRow = cards.filter((card) => Math.abs(card.getBoundingClientRect().top - firstTop) <= 6);
+            const previousBottom = Math.max(...previousRow.map((card) => card.getBoundingClientRect().bottom));
+            const secondRect = secondRow.getBoundingClientRect();
+            const transfer = new DataTransfer();
+            cards[0].dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer: transfer }));
+            chips.dispatchEvent(new DragEvent("dragover", {
+                bubbles: true,
+                cancelable: true,
+                clientX: secondRect.left + 2,
+                clientY: previousBottom + (secondRect.top - previousBottom) / 2,
+                dataTransfer: transfer,
+            }));
+            const horizontal = Boolean(chips.querySelector(".webui-bridge-prompt-drop-indicator.horizontal"));
+            chips.dispatchEvent(new DragEvent("dragover", {
+                bubbles: true,
+                cancelable: true,
+                clientX: secondRect.left + 1,
+                clientY: secondRect.top + secondRect.height / 2,
+                dataTransfer: transfer,
+            }));
+            const vertical = Boolean(chips.querySelector(".webui-bridge-prompt-drop-indicator.vertical"));
+            const toIndex = chips.__webuiBridgeDropSlot?.toIndex;
+            chips.dispatchEvent(new DragEvent("drop", {
+                bubbles: true,
+                cancelable: true,
+                clientX: secondRect.left + 1,
+                clientY: secondRect.top + secondRect.height / 2,
+                dataTransfer: transfer,
+            }));
+            cards[0].dispatchEvent(new DragEvent("dragend", { bubbles: true, dataTransfer: transfer }));
+            const reordered = textarea.value.split(",").map((value) => value.trim());
+            return {
+                horizontal,
+                vertical,
+                toIndex,
+                movedIndex: reordered.indexOf(values[0]),
+                sameValues: [...reordered].sort().join("|") === [...values].sort().join("|"),
+                indicatorCleared: !chips.querySelector(".webui-bridge-prompt-drop-indicator"),
+                initialRowCount,
+            };
+        });
+        assert(!dragReport.error, "Unable to exercise wrapped Prompt drag", dragReport);
+        assert(dragReport.initialRowCount > 1, "120 Prompt tags did not produce a wrapped multi-row layout", dragReport);
+        assert(dragReport.horizontal && dragReport.vertical, "Two-dimensional drop indicator did not distinguish row gap and in-row slots", dragReport);
+        assert(dragReport.movedIndex === dragReport.toIndex - 1 && dragReport.sameValues && dragReport.indicatorCleared, "Wrapped Prompt drop produced the wrong order or stale indicator", dragReport);
+
+        await page.waitForTimeout(300);
+        const mainStep = await page.evaluate(() => {
+            const textarea = document.querySelector(".webui-bridge-positive-prompt-row textarea");
+            const chips = document.querySelector(".webui-bridge-positive-prompt-row .webui-bridge-prompt-chips");
+            textarea.value = "a, b, c, d, e";
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+            const existingSelection = [...chips.querySelectorAll(".webui-bridge-prompt-chip.selected")]
+                .map((chip) => Number(chip.dataset.promptIndex));
+            for (const index of existingSelection) {
+                chips.querySelector(`[data-prompt-index="${index}"]`)?.dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true }));
+            }
+            chips.querySelector('[data-prompt-index="1"]')?.dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true }));
+            const selectedAfterFirst = [...chips.querySelectorAll(".webui-bridge-prompt-chip.selected")].map((chip) => Number(chip.dataset.promptIndex));
+            chips.querySelector('[data-prompt-index="2"]')?.dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true }));
+            const selectedBeforeMove = [...chips.querySelectorAll(".webui-bridge-prompt-chip.selected")].map((chip) => Number(chip.dataset.promptIndex));
+            chips.querySelector('[data-prompt-index="1"] .webui-bridge-chip-move-tool')?.click();
+            const valueAfterButton = textarea.value;
+            const selectedAfterButton = [...chips.querySelectorAll(".webui-bridge-prompt-chip.selected")].map((chip) => Number(chip.dataset.promptIndex));
+            chips.querySelector(`[data-prompt-index="${selectedAfterButton[0]}"]`)?.dispatchEvent(new KeyboardEvent("keydown", {
+                bubbles: true,
+                cancelable: true,
+                altKey: true,
+                key: "ArrowRight",
+            }));
+            return {
+                value: valueAfterButton,
+                selected: selectedAfterButton,
+                selectedAfterFirst,
+                selectedBeforeMove,
+                afterKeyboard: {
+                    value: textarea.value,
+                    selected: [...chips.querySelectorAll(".webui-bridge-prompt-chip.selected")].map((chip) => Number(chip.dataset.promptIndex)),
+                },
+            };
+        });
+        assert(JSON.stringify(mainStep.selectedBeforeMove) === JSON.stringify([1, 2]), "Main-node Ctrl multi-selection was not established", mainStep);
+        assert(mainStep.value === "b, c, a, d, e", "Main-node multi-select step movement failed", mainStep);
+        assert(JSON.stringify(mainStep.selected) === JSON.stringify([0, 1]), "Moved main-node selection was not preserved", mainStep);
+        assert(mainStep.afterKeyboard.value === "a, b, c, d, e" && JSON.stringify(mainStep.afterKeyboard.selected) === JSON.stringify([1, 2]), "Main-node Alt+Arrow multi-select movement failed", mainStep);
+
+        const separatorStep = await page.evaluate(() => {
+            const row = document.querySelector(".webui-bridge-prompt-row:not(.webui-bridge-positive-prompt-row)");
+            const textarea = row.querySelector("textarea");
+            const chips = row.querySelector(".webui-bridge-prompt-chips");
+            textarea.value = "(line_a:1.2),\nline_b, line_c";
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+            const buttons = chips.querySelectorAll('[data-prompt-index="0"] .webui-bridge-chip-move-tool');
+            buttons[1]?.click();
+            return textarea.value;
+        });
+        assert(separatorStep === "line_b, (line_a:1.2),\nline_c", "Tag step movement changed its weight or newline separator", { separatorStep });
+
+        await page.evaluate(() => {
+            const node = window.LiteGraph.createNode("WebUIPromptBridgePositivePrompt");
+            node.id = 953010;
+            node.pos = [980, 40];
+            window.app.graph.add(node);
+            window.app.canvas.setDirty(true, true);
+        });
+        await page.waitForSelector(".webui-bridge-prompt-only-panel");
+        const smallStep = await page.evaluate(() => {
+            const panel = [...document.querySelectorAll(".webui-bridge-prompt-only-panel")].at(-1);
+            const textarea = panel.querySelector(".webui-bridge-prompt-only-textarea");
+            textarea.value = "one, two, three";
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+            panel.querySelector('[data-prompt-index="1"] .webui-bridge-prompt-only-chip-content')?.click();
+            panel.querySelector('[data-prompt-index="1"] .webui-bridge-prompt-only-chip-move.previous')?.click();
+            const valueAfterButton = textarea.value;
+            const activeAfterButton = Number(panel.querySelector(".webui-bridge-prompt-only-chip.active")?.dataset.promptIndex);
+            panel.querySelector('[data-prompt-index="0"] .webui-bridge-prompt-only-chip-content')?.dispatchEvent(new KeyboardEvent("keydown", {
+                bubbles: true,
+                cancelable: true,
+                altKey: true,
+                key: "ArrowRight",
+            }));
+            return {
+                value: valueAfterButton,
+                active: activeAfterButton,
+                afterKeyboard: {
+                    value: textarea.value,
+                    active: Number(panel.querySelector(".webui-bridge-prompt-only-chip.active")?.dataset.promptIndex),
+                },
+            };
+        });
+        assert(smallStep.value === "two, one, three" && smallStep.active === 0, "Prompt-only node step movement failed", smallStep);
+        assert(smallStep.afterKeyboard.value === "one, two, three" && smallStep.afterKeyboard.active === 1, "Prompt-only Alt+Arrow movement failed", smallStep);
+        return { dragReport, mainStep, separatorStep, smallStep };
     } finally {
         await context.close();
     }
@@ -3870,7 +4298,11 @@ async function main() {
     const browser = await chromium.launch({ headless: !options.headed });
     const workflow = await loadWorkflow();
     try {
-        const results = options.focusedFixes ? {
+        const results = options.newFeatures ? {
+            splitUnetSelectionIsTopologySafe: await verifySplitUnetSelectionIsTopologySafe(browser, options.baseUrl),
+            imagePromptImportRequiresConfirmation: await verifyImagePromptImportRequiresConfirmation(browser, options.baseUrl),
+            wrappedPromptPositionEditing: await verifyWrappedPromptPositionEditing(browser, options.baseUrl),
+        } : options.focusedFixes ? {
             freshBridgeStartsAtStablePresetSize: await verifyFreshBridgeStartsAtStablePresetSize(browser, options.baseUrl),
             narrowBridgeWidthLayout: await verifyNarrowBridgeWidthLayout(browser, options.baseUrl),
             bridgeNodeDragCrossesDomPanel: await verifyBridgeNodeDragCrossesDomPanel(browser, options.baseUrl),
@@ -3879,6 +4311,9 @@ async function main() {
             maskEditorLoadGuardsAndCanvasBudget: await verifyMaskEditorLoadGuardsAndCanvasBudget(browser, options.baseUrl),
             compactSidebarTabsAndLowZoomSummary: await verifyCompactSidebarTabsAndLowZoomSummary(browser, options.baseUrl),
             unlimitedFavoriteListDeletion: await verifyUnlimitedFavoriteListDeletion(browser, options.baseUrl),
+            splitUnetSelectionIsTopologySafe: await verifySplitUnetSelectionIsTopologySafe(browser, options.baseUrl),
+            imagePromptImportRequiresConfirmation: await verifyImagePromptImportRequiresConfirmation(browser, options.baseUrl),
+            wrappedPromptPositionEditing: await verifyWrappedPromptPositionEditing(browser, options.baseUrl),
         } : {
             bridgeEventFix: await verifyBridgeDoesNotCancelCanvasWidgets(browser, options.baseUrl),
             freshBridgeStartsAtStablePresetSize: await verifyFreshBridgeStartsAtStablePresetSize(browser, options.baseUrl),
@@ -3896,6 +4331,9 @@ async function main() {
             compactSidebarTabsAndLowZoomSummary: await verifyCompactSidebarTabsAndLowZoomSummary(browser, options.baseUrl),
             exactPromptTagToggle: await verifyExactPromptTagToggle(browser, options.baseUrl),
             unlimitedFavoriteListDeletion: await verifyUnlimitedFavoriteListDeletion(browser, options.baseUrl),
+            splitUnetSelectionIsTopologySafe: await verifySplitUnetSelectionIsTopologySafe(browser, options.baseUrl),
+            imagePromptImportRequiresConfirmation: await verifyImagePromptImportRequiresConfirmation(browser, options.baseUrl),
+            wrappedPromptPositionEditing: await verifyWrappedPromptPositionEditing(browser, options.baseUrl),
             fullNegativeCollapseReclaimsLoraSpace: await verifyFullNegativeCollapseReclaimsLoraSpace(browser, options.baseUrl, workflow),
             sectionResizeBlankRecovery: await verifySectionResizeBlankRecovery(browser, options.baseUrl, workflow),
             restoreSizeStability: await verifyRestoreSizeStability(browser, options.baseUrl, workflow),

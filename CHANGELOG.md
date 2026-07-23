@@ -1,5 +1,15 @@
 # 更新日志
 
+## 0.4.27 - 2026-07-23
+
+- 模型下拉新增 `diffusion_models` / UNET 分组，并保留整合 Checkpoint 和当前分体链路入口；UNET 切换只修改当前 Bridge 可安全定位的唯一 `UNETLoader.unet_name`，Text Encoder、VAE、节点和连线保持不变。
+- 修正分体模型的 LoRA 家族识别：仅在当前 UNET 文件名可识别为 Anima 时返回 Anima，其他无法判断的分体模型标记为 `unknown`。
+- 主节点新增“从图片读取提示词”，可从 PNG/JPEG/WebP 的 ComfyUI metadata 读取 Bridge 正反 Prompt，并兼容 A1111 parameters；应用前必须选择候选和覆盖方向，不恢复模型、Seed、采样器或工作流。
+- 主节点和正反提示词小节点共用多行二维拖放定位；新增前移/后移按钮与 `Alt+←/→`，主节点 Ctrl 多选可保持相对顺序整体移动。
+- 新增图片 metadata、UNET 拓扑保护、覆盖确认和多行 Tag 排序回归测试。
+- 新增中文贡献指南、结构化 Bug/性能/功能 Issue 模板、PR 检查清单和基础 GitHub Actions；聚焦单元测试可在不下载完整 GPU 运行时的干净环境中执行。
+- 本版本未修改收藏分页、收藏缓存、收藏文件格式或收藏列表性能实现；相关优化留待后续单独审查。
+
 ## 0.4.26 - 2026-07-23
 
 - 修复收藏列表只显示前 260 条的问题；收藏项现在不再受标签库渲染上限影响。

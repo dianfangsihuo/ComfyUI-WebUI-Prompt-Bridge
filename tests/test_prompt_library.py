@@ -1,11 +1,15 @@
 import importlib.util
+import io
 import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from PIL import Image, PngImagePlugin
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -13,12 +17,180 @@ COMFY_ROOT = REPO_ROOT.parents[1]
 if str(COMFY_ROOT) not in sys.path:
     sys.path.insert(0, str(COMFY_ROOT))
 
+
+def _install_ci_runtime_stubs():
+    """Provide the tiny ComfyUI surface used by these unit tests.
+
+    A normal custom-node checkout imports the real ComfyUI and torch modules.
+    GitHub Actions checks out this repository on its own, so the focused tests
+    use lightweight fallbacks instead of downloading a full GPU runtime.
+    """
+    try:
+        import comfy.sd  # noqa: F401
+    except ModuleNotFoundError as error:
+        if not error.name or not (error.name == "comfy" or error.name.startswith("comfy.")):
+            raise
+        comfy_module = types.ModuleType("comfy")
+        comfy_module.__path__ = []
+        sd_module = types.ModuleType("comfy.sd")
+        sd_module.load_lora_for_models = lambda model, clip, _lora, _model_strength, _clip_strength: (model, clip)
+        samplers_module = types.ModuleType("comfy.samplers")
+        samplers_module.KSampler = types.SimpleNamespace(SAMPLERS=("euler",), SCHEDULERS=("normal",))
+        utils_module = types.ModuleType("comfy.utils")
+        utils_module.load_torch_file = lambda *_args, **_kwargs: {}
+        model_management_module = types.ModuleType("comfy.model_management")
+        model_management_module.intermediate_dtype = lambda: None
+        model_management_module.intermediate_device = lambda: None
+        comfy_module.sd = sd_module
+        comfy_module.samplers = samplers_module
+        comfy_module.utils = utils_module
+        comfy_module.model_management = model_management_module
+        sys.modules.update({
+            "comfy": comfy_module,
+            "comfy.sd": sd_module,
+            "comfy.samplers": samplers_module,
+            "comfy.utils": utils_module,
+            "comfy.model_management": model_management_module,
+        })
+
+    try:
+        import folder_paths  # noqa: F401
+    except ModuleNotFoundError as error:
+        if error.name != "folder_paths":
+            raise
+        folder_paths_module = types.ModuleType("folder_paths")
+        folder_paths_module.models_dir = Path(tempfile.gettempdir())
+        folder_paths_module.filename_list_cache = {}
+        folder_paths_module.add_model_folder_path = lambda *_args, **_kwargs: None
+        folder_paths_module.get_filename_list = lambda _kind: []
+        folder_paths_module.get_full_path = lambda *_args, **_kwargs: None
+        folder_paths_module.get_full_path_or_raise = lambda *_args, **_kwargs: ""
+        folder_paths_module.get_input_directory = tempfile.gettempdir
+        sys.modules["folder_paths"] = folder_paths_module
+
+    try:
+        import torch  # noqa: F401
+    except ModuleNotFoundError as error:
+        if error.name != "torch":
+            raise
+        torch_module = types.ModuleType("torch")
+        torch_module.nn = types.SimpleNamespace(functional=types.SimpleNamespace())
+        sys.modules["torch"] = torch_module
+
+
+_install_ci_runtime_stubs()
+
 SPEC = importlib.util.spec_from_file_location("webui_prompt_bridge_nodes_test", REPO_ROOT / "nodes.py")
 NODES = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(NODES)
 
 
 class PromptLibraryTests(unittest.TestCase):
+    @staticmethod
+    def _png_bytes(metadata=None):
+        output = io.BytesIO()
+        pnginfo = PngImagePlugin.PngInfo()
+        for key, value in (metadata or {}).items():
+            pnginfo.add_text(key, value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))
+        Image.new("RGB", (8, 8), (20, 30, 40)).save(output, format="PNG", pnginfo=pnginfo)
+        return output.getvalue()
+
+    def test_image_metadata_reads_main_bridge_prompt_and_preserves_empty_negative(self):
+        image_bytes = self._png_bytes({
+            "prompt": {
+                "12": {
+                    "class_type": "WebUIPromptBridge",
+                    "inputs": {
+                        "positive_prompt": "masterpiece, 1girl",
+                        "negative_prompt": "",
+                    },
+                },
+            },
+            "workflow": {
+                "nodes": [{"id": 12, "type": "WebUIPromptBridge", "title": "My Bridge"}],
+            },
+        })
+
+        with mock.patch.object(Path, "write_bytes") as write_bytes:
+            result = NODES._parse_image_generation_metadata(image_bytes, "result.png")
+
+        self.assertEqual(result["source"], "comfy_prompt")
+        self.assertEqual(result["candidates"], [{
+            "node_id": "12",
+            "label": "My Bridge",
+            "positive_prompt": "masterpiece, 1girl",
+            "negative_prompt": "",
+        }])
+        write_bytes.assert_not_called()
+
+    def test_image_metadata_pairs_prompt_only_nodes_and_deduplicates_candidates(self):
+        image_bytes = self._png_bytes({
+            "prompt": {
+                "1": {
+                    "class_type": "WebUIPromptBridge",
+                    "inputs": {"positive_prompt": "solo", "negative_prompt": "blurry"},
+                },
+                "2": {
+                    "class_type": "WebUIPromptBridgePositivePrompt",
+                    "inputs": {"positive_prompt": "solo"},
+                },
+                "3": {
+                    "class_type": "WebUIPromptBridgeNegativePrompt",
+                    "inputs": {"negative_prompt": "blurry"},
+                },
+            },
+        })
+
+        result = NODES._parse_image_generation_metadata(image_bytes, "result.png")
+
+        self.assertEqual(len(result["candidates"]), 1)
+        self.assertEqual(result["candidates"][0]["positive_prompt"], "solo")
+        self.assertEqual(result["candidates"][0]["negative_prompt"], "blurry")
+        self.assertTrue(any("duplicate" in warning.lower() for warning in result["warnings"]))
+
+    def test_image_metadata_keeps_multiple_distinct_bridge_candidates(self):
+        image_bytes = self._png_bytes({
+            "prompt": {
+                "10": {
+                    "class_type": "WebUIPromptBridge",
+                    "_meta": {"title": "First"},
+                    "inputs": {"positive_prompt": "first", "negative_prompt": "bad first"},
+                },
+                "20": {
+                    "class_type": "WebUIPromptBridge",
+                    "_meta": {"title": "Second"},
+                    "inputs": {"positive_prompt": "second", "negative_prompt": "bad second"},
+                },
+            },
+        })
+
+        result = NODES._parse_image_generation_metadata(image_bytes, "result.png")
+
+        self.assertEqual([item["label"] for item in result["candidates"]], ["First", "Second"])
+
+    def test_image_metadata_falls_back_to_a1111_parameters(self):
+        image_bytes = self._png_bytes({
+            "prompt": "{broken-json",
+            "parameters": "best quality, 1girl\nNegative prompt: blurry, bad hands\nSteps: 20, Sampler: Euler, CFG scale: 7",
+        })
+
+        result = NODES._parse_image_generation_metadata(image_bytes, "result.png")
+
+        self.assertEqual(result["source"], "a1111_parameters")
+        self.assertEqual(result["candidates"][0]["positive_prompt"], "best quality, 1girl")
+        self.assertEqual(result["candidates"][0]["negative_prompt"], "blurry, bad hands")
+        self.assertTrue(result["warnings"])
+
+    def test_image_metadata_rejects_missing_invalid_and_oversized_images(self):
+        empty_metadata = self._png_bytes()
+        with self.assertRaises(NODES._PromptMetadataNotFoundError):
+            NODES._parse_image_generation_metadata(empty_metadata, "empty.png")
+        with self.assertRaises(ValueError):
+            NODES._parse_image_generation_metadata(b"not an image", "bad.png")
+        with mock.patch.object(NODES, "MAX_IMAGE_UPLOAD_BYTES", 4):
+            with self.assertRaisesRegex(ValueError, "too large"):
+                NODES._parse_image_generation_metadata(b"12345", "large.png")
+
     def test_model_group_status_deduplicates_paths_and_ignores_incomplete_assets(self):
         listed = {
             "ultralytics": [

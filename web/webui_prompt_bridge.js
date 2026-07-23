@@ -429,7 +429,7 @@ const WEBUI_CHECK_LABELS = {
     controlnet: "ControlNet",
 };
 const SPLIT_ANIMA_MODEL_VALUE = "__webui_bridge_split_anima_qwen__";
-const SPLIT_ANIMA_MODEL_LABEL = "分体 Anima/Qwen（Anima UNET + Text Encoder + VAE）";
+const SPLIT_ANIMA_MODEL_LABEL = "保持当前分体链路（不更换 UNET / Text Encoder / VAE）";
 const DEFAULT_QUALITY_TAGS = [
     "masterpiece",
     "best quality",
@@ -4611,6 +4611,169 @@ function movePromptTagsAt(textarea, fromIndexes, toIndex) {
     return true;
 }
 
+function movedPromptTagIndexes(fromIndexes, toIndex, tagCount) {
+    const selected = [...new Set((fromIndexes || []).map(Number).filter(Number.isInteger))].sort((a, b) => a - b);
+    if (!selected.length) return [];
+    let insertIndex = Math.max(0, Math.min(Number(toIndex), tagCount));
+    insertIndex -= selected.filter((index) => index < insertIndex).length;
+    const remainingCount = Math.max(0, tagCount - selected.length);
+    insertIndex = Math.max(0, Math.min(insertIndex, remainingCount));
+    return selected.map((_, offset) => insertIndex + offset);
+}
+
+function movePromptTagsAtDetailed(textarea, fromIndexes, toIndex) {
+    const tagCount = splitPromptTags(textarea.value).length;
+    const newIndexes = movedPromptTagIndexes(fromIndexes, toIndex, tagCount);
+    if (!newIndexes.length || !movePromptTagsAt(textarea, fromIndexes, toIndex)) {
+        return { changed: false, newIndexes: [] };
+    }
+    return { changed: true, newIndexes };
+}
+
+function movePromptTagsByStep(textarea, fromIndexes, direction) {
+    const tags = splitPromptTags(textarea.value);
+    const selected = [...new Set((fromIndexes || []).map(Number).filter((index) => Number.isInteger(index) && tags[index]))].sort((a, b) => a - b);
+    if (!selected.length) return { changed: false, newIndexes: [] };
+    const step = Number(direction) < 0 ? -1 : 1;
+    if ((step < 0 && selected[0] === 0) || (step > 0 && selected[selected.length - 1] === tags.length - 1)) {
+        return { changed: false, newIndexes: selected };
+    }
+    const toIndex = step < 0 ? selected[0] - 1 : selected[selected.length - 1] + 2;
+    return movePromptTagsAtDetailed(textarea, selected, toIndex);
+}
+
+function promptDropRows(container, selector) {
+    const items = [...container.querySelectorAll(selector)]
+        .map((element) => ({
+            element,
+            index: Number(element.dataset.promptIndex),
+            rect: element.getBoundingClientRect(),
+        }))
+        .filter((item) => Number.isInteger(item.index) && item.rect.width > 0 && item.rect.height > 0)
+        .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
+    const rows = [];
+    for (const item of items) {
+        let row = rows.find((candidate) => Math.abs(candidate.top - item.rect.top) <= 6);
+        if (!row) {
+            row = { top: item.rect.top, bottom: item.rect.bottom, items: [] };
+            rows.push(row);
+        }
+        row.top = Math.min(row.top, item.rect.top);
+        row.bottom = Math.max(row.bottom, item.rect.bottom);
+        row.items.push(item);
+    }
+    for (const row of rows) row.items.sort((left, right) => left.rect.left - right.rect.left);
+    return rows.sort((left, right) => left.top - right.top);
+}
+
+function resolvePromptDropSlot(container, selector, clientX, clientY) {
+    const rows = promptDropRows(container, selector);
+    const containerRect = container.getBoundingClientRect();
+    if (!rows.length) {
+        return { toIndex: 0, orientation: "horizontal", x: containerRect.left + 8, y: containerRect.top + 8 };
+    }
+    const firstRow = rows[0];
+    const lastRow = rows[rows.length - 1];
+    if (clientY < firstRow.top) {
+        return { toIndex: firstRow.items[0].index, orientation: "horizontal", x: containerRect.left + 8, y: firstRow.top };
+    }
+    if (clientY > lastRow.bottom) {
+        const lastItem = lastRow.items[lastRow.items.length - 1];
+        return { toIndex: lastItem.index + 1, orientation: "horizontal", x: containerRect.left + 8, y: lastRow.bottom };
+    }
+    for (let index = 0; index < rows.length - 1; index += 1) {
+        const row = rows[index];
+        const nextRow = rows[index + 1];
+        if (clientY > row.bottom && clientY < nextRow.top) {
+            return {
+                toIndex: nextRow.items[0].index,
+                orientation: "horizontal",
+                x: containerRect.left + 8,
+                y: row.bottom + (nextRow.top - row.bottom) / 2,
+            };
+        }
+    }
+    const row = rows.reduce((best, candidate) => {
+        const distance = clientY < candidate.top
+            ? candidate.top - clientY
+            : clientY > candidate.bottom
+                ? clientY - candidate.bottom
+                : 0;
+        return !best || distance < best.distance ? { row: candidate, distance } : best;
+    }, null).row;
+    const target = row.items.find((item) => clientX < item.rect.left + item.rect.width / 2);
+    if (target) {
+        return {
+            toIndex: target.index,
+            orientation: "vertical",
+            x: target.rect.left,
+            y: row.top,
+            bottom: row.bottom,
+        };
+    }
+    const lastItem = row.items[row.items.length - 1];
+    return {
+        toIndex: lastItem.index + 1,
+        orientation: "vertical",
+        x: lastItem.rect.right,
+        y: row.top,
+        bottom: row.bottom,
+    };
+}
+
+function clearPromptDropIndicator(container) {
+    container.__webuiBridgeDropSlot = null;
+    container.querySelector(":scope > .webui-bridge-prompt-drop-indicator")?.remove();
+}
+
+function showPromptDropIndicator(container, slot) {
+    clearPromptDropIndicator(container);
+    if (!slot) return;
+    const containerRect = container.getBoundingClientRect();
+    const indicator = el("div", {
+        class: `webui-bridge-prompt-drop-indicator ${slot.orientation}`,
+        "aria-hidden": "true",
+    });
+    if (slot.orientation === "vertical") {
+        indicator.style.left = `${Math.round(slot.x - containerRect.left + container.scrollLeft)}px`;
+        indicator.style.top = `${Math.round(slot.y - containerRect.top + container.scrollTop)}px`;
+        indicator.style.height = `${Math.max(20, Math.round((slot.bottom || slot.y + 40) - slot.y))}px`;
+    } else {
+        indicator.style.left = `${Math.round(container.scrollLeft + 8)}px`;
+        indicator.style.top = `${Math.round(slot.y - containerRect.top + container.scrollTop)}px`;
+        indicator.style.width = `${Math.max(24, container.clientWidth - 16)}px`;
+    }
+    container.__webuiBridgeDropSlot = slot;
+    container.append(indicator);
+}
+
+function configurePromptDropTarget(container, options) {
+    container.__webuiBridgeDropOptions = options;
+    if (container.__webuiBridgeDropTargetInstalled) return;
+    container.__webuiBridgeDropTargetInstalled = true;
+    container.addEventListener("dragover", (event) => {
+        const current = container.__webuiBridgeDropOptions;
+        const dragging = current?.getDragging?.();
+        if (!dragging) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        showPromptDropIndicator(container, resolvePromptDropSlot(container, current.selector, event.clientX, event.clientY));
+    });
+    container.addEventListener("dragleave", (event) => {
+        if (!container.contains(event.relatedTarget)) clearPromptDropIndicator(container);
+    });
+    container.addEventListener("drop", (event) => {
+        const current = container.__webuiBridgeDropOptions;
+        const dragging = current?.getDragging?.();
+        const slot = container.__webuiBridgeDropSlot;
+        if (!dragging || !slot) return;
+        event.preventDefault();
+        event.stopPropagation();
+        clearPromptDropIndicator(container);
+        current.onDrop?.(slot.toIndex, dragging);
+    });
+}
+
 function normalizeAttentionValue(value) {
     const raw = String(value || "").trim();
     const lora = parseLoraTag(raw);
@@ -4714,13 +4877,40 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
     const translatableChips = [];
     if (!row.__webuiBridgeSelectedTags) row.__webuiBridgeSelectedTags = new Set();
     const selectedTags = row.__webuiBridgeSelectedTags;
+    const parsedTags = splitPromptTags(textarea.value);
     for (const index of [...selectedTags]) {
-        if (index >= splitPromptTags(textarea.value).length) selectedTags.delete(index);
+        if (index >= parsedTags.length) selectedTags.delete(index);
     }
     chips.classList.remove("drag-active");
     chips.innerHTML = "";
     if (!row.__webuiBridgeDisabledTags) row.__webuiBridgeDisabledTags = [];
-    const tags = splitPromptTags(textarea.value).slice(0, 160);
+    const tags = parsedTags.slice(0, 160);
+    const focusMovedTag = (index) => window.requestAnimationFrame?.(() => {
+        chips.querySelector(`.webui-bridge-prompt-chip[data-prompt-index="${index}"]`)?.focus();
+    });
+    const applyTagMove = (fromIndexes, toIndex) => {
+        const result = movePromptTagsAtDetailed(textarea, fromIndexes, toIndex);
+        if (!result.changed) return result;
+        selectedTags.clear();
+        result.newIndexes.forEach((index) => selectedTags.add(index));
+        afterChange?.();
+        focusMovedTag(result.newIndexes[0]);
+        return result;
+    };
+    const applyTagStep = (fromIndexes, direction) => {
+        const result = movePromptTagsByStep(textarea, fromIndexes, direction);
+        if (!result.changed) return result;
+        selectedTags.clear();
+        result.newIndexes.forEach((index) => selectedTags.add(index));
+        afterChange?.();
+        focusMovedTag(result.newIndexes[0]);
+        return result;
+    };
+    configurePromptDropTarget(chips, {
+        selector: ".webui-bridge-prompt-chip[data-prompt-index]",
+        getDragging: () => row.__webuiBridgeDragging,
+        onDrop: (toIndex, dragging) => applyTagMove(dragging.fromIndexes, toIndex),
+    });
     const visibleTags = [
         ...tags.map((tag, index) => ({ ...tag, index, disabled: false })),
         ...row.__webuiBridgeDisabledTags.map((tag, index) => ({ ...tag, index, disabled: true })),
@@ -4759,6 +4949,7 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             role: "button",
             tabindex: "0",
             "aria-label": `${tag.value}${local ? `，${local}` : ""}`,
+            "data-prompt-index": tag.disabled ? null : String(tag.index),
             draggable: tag.disabled ? "false" : "true",
             onmouseenter: () => {
                 window.clearTimeout(chip.__webuiBridgeHideToolsTimer);
@@ -4812,6 +5003,10 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
                     if (chip.classList.contains("show-tools")) {
                         requestAnimationFrame(() => positionChipTools(chips, chip, tools));
                     }
+                } else if (!tag.disabled && event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+                    event.preventDefault();
+                    const indexes = selectedTags.has(tag.index) ? [...selectedTags] : [tag.index];
+                    applyTagStep(indexes, event.key === "ArrowLeft" ? -1 : 1);
                 }
             },
             ondragstart: (event) => {
@@ -4830,33 +5025,10 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
                 event.dataTransfer.effectAllowed = "move";
                 event.dataTransfer.setData("text/plain", [...selectedTags].join(","));
             },
-            ondragover: (event) => {
-                if (tag.disabled || !row.__webuiBridgeDragging) return;
-                event.preventDefault();
-                event.dataTransfer.dropEffect = "move";
-                const rect = chip.getBoundingClientRect();
-                const after = event.clientX > rect.left + rect.width / 2;
-                chip.classList.toggle("drop-before", !after);
-                chip.classList.toggle("drop-after", after);
-            },
-            ondragleave: () => {
-                chip.classList.remove("drop-before", "drop-after");
-            },
-            ondrop: (event) => {
-                if (tag.disabled || !row.__webuiBridgeDragging) return;
-                event.preventDefault();
-                const rect = chip.getBoundingClientRect();
-                const after = event.clientX > rect.left + rect.width / 2;
-                const toIndex = tag.index + (after ? 1 : 0);
-                if (movePromptTagsAt(textarea, row.__webuiBridgeDragging.fromIndexes, toIndex)) {
-                    selectedTags.clear();
-                    afterChange?.();
-                }
-                chip.classList.remove("drop-before", "drop-after");
-            },
             ondragend: () => {
-                chip.classList.remove("dragging", "drop-before", "drop-after");
+                chip.classList.remove("dragging");
                 chips.classList.remove("drag-active");
+                clearPromptDropIndicator(chips);
                 row.__webuiBridgeDragging = null;
                 row.__webuiBridgeDragJustEnded = true;
                 window.setTimeout(() => {
@@ -4904,7 +5076,23 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
                 if (!tag.disabled && replacePromptTagAt(textarea, tag.index, setTagNumericWeight(tag.value, event.currentTarget.value))) afterChange?.();
             },
         });
+        const movementIndexes = selectedTags.has(tag.index)
+            ? [...selectedTags].sort((left, right) => left - right)
+            : [tag.index];
+        const moveTool = (text, label, direction, disabled) => el("button", {
+            class: "webui-bridge-chip-tool webui-bridge-chip-move-tool",
+            type: "button",
+            title: label,
+            disabled: disabled ? "disabled" : null,
+            onclick: (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (!disabled) applyTagStep(movementIndexes, direction);
+            },
+        }, text);
         tools = el("div", { class: "webui-bridge-chip-tools" }, [
+            moveTool("←", selectedTags.has(tag.index) ? "选中 Tag 整体前移一位（Alt+←）" : "当前 Tag 前移一位（Alt+←）", -1, tag.disabled || movementIndexes[0] <= 0),
+            moveTool("→", selectedTags.has(tag.index) ? "选中 Tag 整体后移一位（Alt+→）" : "当前 Tag 后移一位（Alt+→）", 1, tag.disabled || movementIndexes[movementIndexes.length - 1] >= tags.length - 1),
             tool("-", "降低权重 0.1", () => !tag.disabled && replacePromptTagAt(textarea, tag.index, changeTagNumericWeight(tag.value, -0.1))),
             weightInput,
             tool("+", "提高权重 0.1", () => !tag.disabled && replacePromptTagAt(textarea, tag.index, changeTagNumericWeight(tag.value, 0.1))),
@@ -5020,7 +5208,7 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
                 } else if (!info.found && !locallyResolved) {
                     return;
                 }
-                const compatible = loraFamilyCompatibleWithCurrentModel(info.family);
+                const compatible = loraFamilyCompatibleWithCurrentModel(info.family, state.bridgeNode);
                 if (info.warning && !compatible) {
                     chip.classList.add("warning");
                     localNode.textContent = `可能不兼容: ${info.family || "unknown"} -> ${currentModelFamily()}`;
@@ -6247,6 +6435,68 @@ function findCheckpointLoaderNodes() {
     return getGraphNodes().filter((graphNode) => graphNode.type === "CheckpointLoaderSimple");
 }
 
+function findUnetLoaderNodes() {
+    return getGraphNodes().filter((graphNode) => graphNode.type === "UNETLoader" && getWidget(graphNode, "unet_name"));
+}
+
+function collectUpstreamMatchingNodes(startNodes, predicate) {
+    const found = [];
+    const seen = new Set();
+    const visit = (graphNode) => {
+        if (!graphNode || seen.has(graphNode.id)) return;
+        seen.add(graphNode.id);
+        if (predicate(graphNode)) found.push(graphNode);
+        for (const input of graphNode.inputs || []) {
+            const link = getGraphLink(input.link);
+            visit(getGraphNodeById(linkOriginId(link)));
+        }
+    };
+    for (const graphNode of startNodes || []) visit(graphNode);
+    return found;
+}
+
+function bridgeUpstreamUnetLoaders(bridgeNode) {
+    return collectUpstreamMatchingNodes(
+        [inputSourceNode(bridgeNode, "model")],
+        (graphNode) => graphNode.type === "UNETLoader" && Boolean(getWidget(graphNode, "unet_name")),
+    );
+}
+
+function resolveBridgeUnetLoader(bridgeNode) {
+    const directCandidates = bridgeUpstreamUnetLoaders(bridgeNode);
+    if (directCandidates.length === 1) return { loader: directCandidates[0], source: "bridge-upstream" };
+    if (directCandidates.length > 1) {
+        return { loader: null, error: "当前 Bridge 上游存在多个 UNETLoader，无法安全判断要修改哪一个" };
+    }
+
+    const rankedSplitSources = scoredSplitModelSources("MODEL");
+    const bestSplitScore = rankedSplitSources[0]?.score;
+    const splitSources = rankedSplitSources
+        .filter((item) => item.score === bestSplitScore)
+        .map((item) => item.graphNode);
+    if (splitSources.length > 1) {
+        return { loader: null, error: "分体模型支路存在多个同等候选，无法安全判断要修改哪一个 UNETLoader" };
+    }
+    const splitCandidates = collectUpstreamMatchingNodes(
+        splitSources,
+        (graphNode) => graphNode.type === "UNETLoader" && Boolean(getWidget(graphNode, "unet_name")),
+    );
+    if (splitCandidates.length === 1) return { loader: splitCandidates[0], source: "split-source" };
+    if (splitCandidates.length > 1) {
+        return { loader: null, error: "分体模型支路存在多个 UNETLoader，无法安全判断要修改哪一个" };
+    }
+
+    const allCandidates = findUnetLoaderNodes();
+    if (allCandidates.length === 1) return { loader: allCandidates[0], source: "unique-workflow-loader" };
+    if (!allCandidates.length) return { loader: null, error: "工作流中没有可用的 UNETLoader" };
+    return { loader: null, error: "工作流中存在多个未连接的 UNETLoader，请先连接或明确分体模型支路" };
+}
+
+function currentUnetName(bridgeNode = findBridgeNodes()[0]) {
+    const { loader } = resolveBridgeUnetLoader(bridgeNode);
+    return String(getNodeWidgetValue(loader, "unet_name") || "");
+}
+
 function checkpointWidgetLooksLikeCheckpoint(graphNode, widget) {
     const widgetName = String(widget?.name || "").toLowerCase();
     const nodeText = `${graphNode?.type || ""} ${graphNode?.title || ""} ${graphNode?.properties?.["Node name for S&R"] || ""}`.toLowerCase();
@@ -6278,10 +6528,10 @@ function nodeHasOutputType(graphNode, outputType) {
     return (graphNode?.outputs || []).some((output) => String(output?.type || "").toUpperCase() === outputType);
 }
 
-function findSplitModelSource(outputType) {
+function scoredSplitModelSources(outputType) {
     const type = String(outputType || "").toUpperCase();
     const candidates = getGraphNodes().filter((graphNode) => nodeHasOutputType(graphNode, type));
-    const scored = candidates
+    return candidates
         .map((graphNode) => {
             const text = nodeSearchText(graphNode);
             let score = 0;
@@ -6294,7 +6544,10 @@ function findSplitModelSource(outputType) {
         })
         .filter((item) => item.score > 0)
         .sort((a, b) => b.score - a.score);
-    return scored[0]?.graphNode || null;
+}
+
+function findSplitModelSource(outputType) {
+    return scoredSplitModelSources(outputType)[0]?.graphNode || null;
 }
 
 function findCheckpointSource(outputType) {
@@ -6634,6 +6887,37 @@ function collectCheckpointOptions(models = {}) {
     return options;
 }
 
+function collectUnetOptions(models = {}) {
+    const seen = new Set();
+    const options = [];
+    const add = (value) => {
+        const text = String(value || "").trim();
+        const key = text.replace(/\\/g, "/").toLowerCase();
+        if (!text || seen.has(key)) return;
+        seen.add(key);
+        options.push(text);
+    };
+    for (const unet of models.unets || []) add(unet);
+    if (!options.length) {
+        for (const loader of findUnetLoaderNodes()) {
+            const widget = getWidget(loader, "unet_name");
+            for (const value of widget?.options?.values || []) add(value);
+            add(widget?.value);
+        }
+    }
+    return options;
+}
+
+function validatedUnetWidgetValue(loader, requestedName) {
+    const widget = getWidget(loader, "unet_name");
+    const requested = String(requestedName || "").trim();
+    const requestedKey = requested.replace(/\\/g, "/").toLowerCase();
+    if (!widget || !requested) return null;
+    const values = widget.options?.values || [];
+    if (!values.length) return null;
+    return values.find((value) => String(value || "").trim().replace(/\\/g, "/").toLowerCase() === requestedKey) || null;
+}
+
 function checkpointLookupKeys(value) {
     const text = String(value || "").trim().replace(/\\/g, "/");
     if (!text) return [];
@@ -6762,7 +7046,17 @@ function installBridgeDebugHelpers() {
             title: graphNode.title,
             value: getNodeWidgetValue(graphNode, "ckpt_name"),
         })),
+        unetLoaders: () => findUnetLoaderNodes().map((graphNode) => ({
+            id: graphNode.id,
+            type: graphNode.type,
+            title: graphNode.title,
+            value: getNodeWidgetValue(graphNode, "unet_name"),
+        })),
         currentCheckpointName,
+        currentUnetName,
+        resolveBridgeUnetLoader,
+        applySplitUnetModel,
+        resolvePromptDropSlot,
         graphHits: (needle = "v1-5") => collectTextHits(safeGraphSerialization(), needle),
         graphSerialization: safeGraphSerialization,
         visibleMissingModelText,
@@ -6787,17 +7081,20 @@ function currentCheckpointName() {
     return String(getNodeWidgetValue(loader, "ckpt_name") || "");
 }
 
-function currentModelFamily() {
-    if (currentModelMode() === true) return "anima";
+function currentModelFamily(bridgeNode = findBridgeNodes()[0]) {
+    if (currentModelMode() === true) {
+        const name = currentUnetName(bridgeNode).toLowerCase();
+        return /anima|basev10/.test(name) ? "anima" : "unknown";
+    }
     const name = currentCheckpointName().toLowerCase();
     if (/\b(sd1|1\.5)\b|anything|counterfeit|realisticvision/.test(name)) return "sd1";
     if (/xl|sdxl|noob|illustrious|pony|wai|animagine|kohaku|prefectpony/.test(name)) return "sdxl/noob";
     return "unknown";
 }
 
-function loraFamilyCompatibleWithCurrentModel(family) {
+function loraFamilyCompatibleWithCurrentModel(family, bridgeNode = findBridgeNodes()[0]) {
     const loraFamily = String(family || "unknown").toLowerCase();
-    const modelFamily = currentModelFamily();
+    const modelFamily = currentModelFamily(bridgeNode);
     if (!loraFamily || loraFamily === "unknown" || modelFamily === "unknown") return true;
     if (modelFamily === "anima") return loraFamily === "anima";
     if (modelFamily === "sdxl/noob") return loraFamily.includes("sdxl") || loraFamily.includes("noob") || loraFamily.includes("pony");
@@ -6836,6 +7133,35 @@ function applySplitModelMode() {
     return {
         changed,
         message: "已切换到分体 Anima/Qwen 模式",
+    };
+}
+
+function applySplitUnetModel(bridgeNode, name) {
+    const modelName = String(name || "").trim();
+    if (!modelName) return { changed: false, message: "请选择分体 UNET" };
+    const resolved = resolveBridgeUnetLoader(bridgeNode);
+    if (!resolved.loader) return { changed: false, message: resolved.error || "未找到可安全修改的 UNETLoader" };
+    const widgetValue = validatedUnetWidgetValue(resolved.loader, modelName);
+    if (!widgetValue) {
+        return { changed: false, message: `UNETLoader 当前没有这个模型: ${modelName}；请刷新 ComfyUI 模型列表后重试` };
+    }
+
+    const switchNode = findModelModeSwitchNode();
+    const loaderIsUpstream = bridgeUpstreamUnetLoaders(bridgeNode).some((loader) => String(loader.id) === String(resolved.loader.id));
+    if (!switchNode && !loaderIsUpstream) {
+        return { changed: false, message: "已找到 UNETLoader，但当前 Bridge 未连接分体支路；为保护工作流连线，本次没有自动重连" };
+    }
+
+    let changed = false;
+    if (String(getNodeWidgetValue(resolved.loader, "unet_name") || "") !== String(widgetValue)) {
+        changed = setNodeWidgetValue(resolved.loader, "unet_name", widgetValue) || changed;
+    }
+    if (switchNode && getNodeWidgetValue(switchNode, "value") !== true) {
+        changed = setNodeWidgetValue(switchNode, "value", true) || changed;
+    }
+    return {
+        changed,
+        message: `${changed ? "已切换" : "当前已是"}分体 UNET: ${widgetValue}；Text Encoder / VAE 保持不变，请确认架构兼容`,
     };
 }
 
@@ -6890,6 +7216,16 @@ async function parseInfotext(text) {
         // The client parser keeps the paste button useful if ComfyUI was not restarted yet.
     }
     return parseInfotextClient(text);
+}
+
+async function parseImagePromptMetadata(file) {
+    const body = new FormData();
+    body.append("image", file, file?.name || "prompt-image.png");
+    const response = await api.fetchApi("/webui_prompt_bridge/parse_image_metadata", {
+        method: "POST",
+        body,
+    });
+    return bridgeJson(response, "图片中没有可读取的 Bridge Prompt");
 }
 
 async function updateStyle(action, name, positivePrompt = "", negativePrompt = "") {
@@ -7936,6 +8272,9 @@ function installPromptOnlyPanel(node, config, configuredData = null) {
     });
     let activeChunkIndex = -1;
     let chunkCommitQueue = Promise.resolve();
+    const focusChunk = (index) => window.requestAnimationFrame?.(() => {
+        chips.querySelector(`.webui-bridge-prompt-only-chip[data-prompt-index="${index}"] .webui-bridge-prompt-only-chip-content`)?.focus();
+    });
     const helpLine = el("div", { class: "webui-bridge-prompt-only-help" });
     const shortcutText = () => ({ ctrl_enter: "Ctrl+Enter", alt_t: "Alt+T", off: "" }[translateShortcut] || "Ctrl+Enter");
     const updateHelp = (message = "") => {
@@ -7943,7 +8282,7 @@ function installPromptOnlyPanel(node, config, configuredData = null) {
             shortcutText() ? `${shortcutText()} 翻译整段` : "",
             "↑↓ 选择",
             "Enter/Tab 确认",
-            "拖动排序",
+            "拖动精排 / Alt+←→ 微调",
             "↵ 分行",
             "Ctrl+↑↓ 调权重",
         ].filter(Boolean).join(" · ");
@@ -7976,10 +8315,18 @@ function installPromptOnlyPanel(node, config, configuredData = null) {
                     chunkInput.select();
                 },
                 onMove: (fromIndex, toIndex) => {
-                    if (!movePromptTagAt(textarea, fromIndex, toIndex)) return;
-                    const insertIndex = fromIndex < toIndex ? toIndex - 1 : toIndex;
-                    activeChunkIndex = Math.max(0, Math.min(insertIndex, splitPromptTags(textarea.value).length - 1));
+                    const result = movePromptTagsAtDetailed(textarea, [fromIndex], toIndex);
+                    if (!result.changed) return;
+                    activeChunkIndex = result.newIndexes[0];
                     sync();
+                    focusChunk(activeChunkIndex);
+                },
+                onStep: (index, direction) => {
+                    const result = movePromptTagsByStep(textarea, [index], direction);
+                    if (!result.changed) return;
+                    activeChunkIndex = result.newIndexes[0];
+                    sync();
+                    focusChunk(activeChunkIndex);
                 },
                 onToggleSeparator: (index) => {
                     const tag = splitPromptTags(textarea.value)[index];
@@ -8149,10 +8496,10 @@ function installPromptOnlyPanel(node, config, configuredData = null) {
         if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
             const tags = splitPromptTags(textarea.value);
             if (!tags[activeChunkIndex]) return;
-            const nextIndex = Math.max(0, Math.min(tags.length - 1, activeChunkIndex + (event.key === "ArrowLeft" ? -1 : 1)));
-            if (nextIndex !== activeChunkIndex && movePromptTagAt(textarea, activeChunkIndex, nextIndex + (nextIndex > activeChunkIndex ? 1 : 0))) {
+            const result = movePromptTagsByStep(textarea, [activeChunkIndex], event.key === "ArrowLeft" ? -1 : 1);
+            if (result.changed) {
                 event.preventDefault();
-                activeChunkIndex = nextIndex;
+                activeChunkIndex = result.newIndexes[0];
                 sync();
             }
         }
@@ -8454,7 +8801,10 @@ function createPromptRow(label, value, placeholder, onFocus, onInput, options = 
     const textareaHeightKey = options.textareaHeightKey || `webui-bridge-textarea-height-${baseKey}`;
     const chipHeightKey = options.sizeKey || `webui-bridge-chip-height-${baseKey}`;
     const collapseKey = options.collapseKey || `webui-bridge-collapse-${String(label || "prompt").toLowerCase().replace(/\W+/g, "-")}`;
-    const chips = el("div", { class: "webui-bridge-prompt-chips empty" });
+    const chips = el("div", {
+        class: "webui-bridge-prompt-chips empty",
+        title: "拖到卡片之间精确排序；Ctrl+点击可多选；聚焦 Tag 后按 Alt+←/→ 微调一位",
+    });
     textarea.__webuiBridgeHeightKey = textareaHeightKey;
     textarea.__webuiBridgeMinHeight = 48;
     textarea.__webuiBridgeMaxHeight = 520;
@@ -8519,7 +8869,10 @@ function createPromptRow(label, value, placeholder, onFocus, onInput, options = 
             lastObservedTextareaHeight = resizeTargetLayoutHeight(textarea);
         },
     }, "↺");
-    const labelTools = [resetButton];
+    const orderHint = label === "Prompt"
+        ? el("span", { class: "webui-bridge-prompt-order-hint" }, "Ctrl多选 · Alt+←→微调")
+        : null;
+    const labelTools = [orderHint, resetButton].filter(Boolean);
     let collapsed = options.collapsible ? readLocalBoolean(collapseKey, false) : false;
     let collapseButton = null;
     let row = null;
@@ -8720,6 +9073,13 @@ function renderPromptOnlyChunks(chips, textarea, state = null, options = {}) {
     const tags = splitPromptTags(textarea.value).slice(0, 160);
     const activeIndex = Number(options.activeIndex);
     const items = [];
+    configurePromptDropTarget(chips, {
+        selector: ".webui-bridge-prompt-only-chip[data-prompt-index]",
+        getDragging: () => Number.isInteger(chips.__webuiBridgeDraggingIndex)
+            ? { fromIndex: chips.__webuiBridgeDraggingIndex }
+            : null,
+        onDrop: (toIndex, dragging) => options.onMove?.(dragging.fromIndex, toIndex),
+    });
     for (let index = 0; index < tags.length; index += 1) {
         const tag = tags[index];
         const lora = parseLoraTag(tag.value);
@@ -8727,9 +9087,10 @@ function renderPromptOnlyChunks(chips, textarea, state = null, options = {}) {
         const chip = el("div", {
             class: `webui-bridge-prompt-only-chip${lora ? " lora" : ""}${index === activeIndex ? " active" : ""}`,
             title: local ? `${tag.value}\n${local}` : tag.value,
+            "data-prompt-index": String(index),
             draggable: "true",
             ondragstart: (event) => {
-                if (event.target.closest(".webui-bridge-prompt-only-chip-remove, .webui-bridge-prompt-only-chip-separator")) {
+                if (event.target.closest(".webui-bridge-prompt-only-chip-remove, .webui-bridge-prompt-only-chip-separator, .webui-bridge-prompt-only-chip-move")) {
                     event.preventDefault();
                     return;
                 }
@@ -8739,28 +9100,10 @@ function renderPromptOnlyChunks(chips, textarea, state = null, options = {}) {
                 event.dataTransfer.effectAllowed = "move";
                 event.dataTransfer.setData("text/plain", String(index));
             },
-            ondragover: (event) => {
-                if (!Number.isInteger(chips.__webuiBridgeDraggingIndex)) return;
-                event.preventDefault();
-                const rect = chip.getBoundingClientRect();
-                const after = event.clientX > rect.left + rect.width / 2;
-                chip.classList.toggle("drop-before", !after);
-                chip.classList.toggle("drop-after", after);
-            },
-            ondragleave: () => chip.classList.remove("drop-before", "drop-after"),
-            ondrop: (event) => {
-                const fromIndex = chips.__webuiBridgeDraggingIndex;
-                if (!Number.isInteger(fromIndex)) return;
-                event.preventDefault();
-                event.stopPropagation();
-                const rect = chip.getBoundingClientRect();
-                const after = event.clientX > rect.left + rect.width / 2;
-                options.onMove?.(fromIndex, index + (after ? 1 : 0));
-                chip.classList.remove("drop-before", "drop-after");
-            },
             ondragend: () => {
-                chip.classList.remove("dragging", "drop-before", "drop-after");
+                chip.classList.remove("dragging");
                 chips.classList.remove("drag-active");
+                clearPromptDropIndicator(chips);
                 chips.__webuiBridgeDraggingIndex = null;
             },
         }, [
@@ -8770,6 +9113,13 @@ function renderPromptOnlyChunks(chips, textarea, state = null, options = {}) {
                 draggable: "false",
                 title: "单击选择，双击编辑",
                 onclick: () => options.onSelect?.(index),
+                onkeydown: (event) => {
+                    if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        options.onStep?.(index, event.key === "ArrowLeft" ? -1 : 1);
+                    }
+                },
                 ondblclick: (event) => {
                     event.preventDefault();
                     options.onEdit?.(index);
@@ -8778,6 +9128,30 @@ function renderPromptOnlyChunks(chips, textarea, state = null, options = {}) {
                 el("span", { class: "webui-bridge-prompt-only-chip-main" }, tag.value),
                 local ? el("span", { class: "webui-bridge-prompt-only-chip-local" }, local) : null,
             ].filter(Boolean)),
+            el("button", {
+                type: "button",
+                class: "webui-bridge-prompt-only-chip-move previous",
+                draggable: "false",
+                title: "前移一位（Alt+←）",
+                disabled: index <= 0 ? "disabled" : null,
+                onclick: (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    options.onStep?.(index, -1);
+                },
+            }, "←"),
+            el("button", {
+                type: "button",
+                class: "webui-bridge-prompt-only-chip-move next",
+                draggable: "false",
+                title: "后移一位（Alt+→）",
+                disabled: index >= tags.length - 1 ? "disabled" : null,
+                onclick: (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    options.onStep?.(index, 1);
+                },
+            }, "→"),
             el("button", {
                 type: "button",
                 class: "webui-bridge-prompt-only-chip-remove",
@@ -9614,7 +9988,7 @@ function buildPanel(node) {
     const networkTree = el("div", { class: "webui-bridge-network-tree" });
     const networkPane = el("div", { class: "webui-bridge-network-pane" });
     const cards = el("div", { class: "webui-bridge-card-grid" });
-    const modelSelect = el("select", { class: "webui-bridge-model-select", title: "选择任意整合 checkpoint 模型" });
+    const modelSelect = el("select", { class: "webui-bridge-model-select", title: "选择分体 UNET 或整合 Checkpoint；切换 UNET 时保留当前 Text Encoder / VAE" });
     const modelModeBadge = el("span", { class: "webui-bridge-model-mode" }, "模型");
     const modelCount = el("span", { class: "webui-bridge-model-count" }, "0");
     const status = el("div", { class: "webui-bridge-status", role: "status", "aria-live": "polite" }, "");
@@ -13101,11 +13475,14 @@ function buildPanel(node) {
 
     const renderModelSwitch = () => {
         const current = currentCheckpointName();
+        const currentUnet = currentUnetName(node);
         const split = isSplitModelMode();
         BRIDGE_DEBUG.models = state.models;
         BRIDGE_DEBUG.currentCheckpoint = current;
+        BRIDGE_DEBUG.currentUnet = currentUnet;
         BRIDGE_DEBUG.splitModelMode = split;
         const checkpoints = collectCheckpointOptions(state.models);
+        const unets = collectUnetOptions(state.models);
         const availableCheckpoints = availableCheckpointLookupKeys(state.models);
         const syncTarget = current && checkpointLookupHas(availableCheckpoints, current)
             ? current
@@ -13117,31 +13494,62 @@ function buildPanel(node) {
             scheduleMissingModelRefresh("renderModelSwitch");
             setStatus(`已自动同步 ${autoSyncedMissing} 个缺失 CheckpointLoader 到可用模型`);
         }
-        const canUseSplit = split !== null || hasSplitAnimaModelSource();
+        const canUseSplit = split !== null || hasSplitAnimaModelSource() || findUnetLoaderNodes().length > 0;
         modelSelect.innerHTML = "";
+        let optionIndex = 0;
+        const typedOption = (kind, name, label = name) => {
+            const option = el("option", { value: `__webui_bridge_model_${kind}_${optionIndex++}` }, label);
+            option.dataset.modelKind = kind;
+            option.dataset.modelName = name;
+            return option;
+        };
         if (canUseSplit) {
-            modelSelect.append(el("option", { value: SPLIT_ANIMA_MODEL_VALUE }, SPLIT_ANIMA_MODEL_LABEL));
+            const keepSplit = typedOption("split", "", SPLIT_ANIMA_MODEL_LABEL);
+            keepSplit.value = SPLIT_ANIMA_MODEL_VALUE;
+            modelSelect.append(keepSplit);
         }
-        if (!checkpoints.length && !canUseSplit) {
+        if (unets.length) {
+            const group = el("optgroup", { label: "分体 UNET（diffusion_models）" });
+            for (const unet of unets) group.append(typedOption("unet", unet));
+            modelSelect.append(group);
+        }
+        if (checkpoints.length) {
+            const group = el("optgroup", { label: "整合 Checkpoint" });
+            for (const checkpoint of checkpoints) group.append(typedOption("checkpoint", checkpoint));
+            modelSelect.append(group);
+        }
+        if (!checkpoints.length && !unets.length && !canUseSplit) {
             modelSelect.append(el("option", { value: "" }, "No model source connected"));
             modelSelect.disabled = true;
         } else {
-            for (const checkpoint of checkpoints) {
-                modelSelect.append(el("option", { value: checkpoint }, checkpoint));
-            }
             modelSelect.disabled = false;
-            if (split === true && canUseSplit) modelSelect.value = SPLIT_ANIMA_MODEL_VALUE;
-            else if (current && checkpoints.includes(current)) modelSelect.value = current;
+            const options = [...modelSelect.options];
+            const matchingOption = (kind, name) => options.find((option) => (
+                option.dataset.modelKind === kind
+                && String(option.dataset.modelName || "").replace(/\\/g, "/").toLowerCase()
+                    === String(name || "").replace(/\\/g, "/").toLowerCase()
+            ));
+            if (split === true) {
+                modelSelect.value = matchingOption("unet", currentUnet)?.value || SPLIT_ANIMA_MODEL_VALUE;
+            } else {
+                const checkpointOption = matchingOption("checkpoint", current);
+                if (checkpointOption) modelSelect.value = checkpointOption.value;
+            }
         }
-        modelModeBadge.textContent = split === null ? "未连接模式开关" : split ? "分体 Anima/Qwen" : "整合 Checkpoint";
+        modelModeBadge.textContent = split === null ? "未连接模式开关" : split ? "分体 UNET + 当前 Encoder/VAE" : "整合 Checkpoint";
         modelModeBadge.classList.toggle("checkpoint", split === false);
-        modelCount.textContent = `${checkpoints.length + (canUseSplit ? 1 : 0)} models`;
+        modelCount.textContent = `${checkpoints.length + unets.length + (canUseSplit ? 1 : 0)} models`;
     };
 
     const applySelectedModel = () => {
-        const result = modelSelect.value === SPLIT_ANIMA_MODEL_VALUE
+        const selected = modelSelect.selectedOptions?.[0];
+        const kind = selected?.dataset?.modelKind || (modelSelect.value === SPLIT_ANIMA_MODEL_VALUE ? "split" : "checkpoint");
+        const name = selected?.dataset?.modelName || modelSelect.value;
+        const result = kind === "split"
             ? applySplitModelMode()
-            : applyCheckpointModel(modelSelect.value, state.models);
+            : kind === "unet"
+                ? applySplitUnetModel(node, name)
+                : applyCheckpointModel(name, state.models);
         renderModelSwitch();
         setStatus(result.message);
         scheduleManualResizeSettle();
@@ -13630,6 +14038,125 @@ function buildPanel(node) {
         document.body.append(mask);
     };
 
+    const promptImageInput = el("input", {
+        type: "file",
+        accept: "image/png,image/jpeg,image/webp",
+        style: { display: "none" },
+    });
+
+    const showImagePromptImportDialog = (data, fileName = "") => {
+        const candidates = (data?.candidates || []).filter((candidate) => (
+            candidate && (candidate.positive_prompt !== null || candidate.negative_prompt !== null)
+        ));
+        if (!candidates.length) throw new Error("图片中没有可读取的 Bridge Prompt");
+        const mask = el("div", { class: "webui-bridge-mask" });
+        const selection = el("select", { class: "webui-bridge-config-input" });
+        candidates.forEach((candidate, index) => {
+            const nodeSuffix = candidate.node_id ? ` · #${candidate.node_id}` : "";
+            selection.append(el("option", { value: String(index) }, `${candidate.label || "Prompt"}${nodeSuffix}`));
+        });
+        const positiveCheck = el("input", { type: "checkbox" });
+        const negativeCheck = el("input", { type: "checkbox" });
+        const positivePreview = el("textarea", {
+            class: "webui-bridge-style-dialog-textarea webui-bridge-image-prompt-preview",
+            readonly: "readonly",
+            rows: "5",
+        });
+        const negativePreview = el("textarea", {
+            class: "webui-bridge-style-dialog-textarea webui-bridge-image-prompt-preview",
+            readonly: "readonly",
+            rows: "4",
+        });
+        const close = () => mask.remove();
+        const applyButton = el("button", {
+            type: "button",
+            class: "primary",
+            onclick: () => {
+                const candidate = candidates[Number(selection.value) || 0];
+                const applied = [];
+                if (positiveCheck.checked && candidate.positive_prompt !== null) {
+                    positive.textarea.value = candidate.positive_prompt;
+                    applied.push("正向 Prompt");
+                }
+                if (negativeCheck.checked && candidate.negative_prompt !== null) {
+                    negative.textarea.value = candidate.negative_prompt;
+                    applied.push("反向 Prompt");
+                }
+                if (!applied.length) return;
+                sync();
+                renderPromptPanels();
+                close();
+                setStatus(`已从图片读取 ${applied.join("、")}`);
+            },
+        }, "确认覆盖所选内容");
+        const updateCandidate = () => {
+            const candidate = candidates[Number(selection.value) || 0];
+            const hasPositive = candidate.positive_prompt !== null;
+            const hasNegative = candidate.negative_prompt !== null;
+            positiveCheck.disabled = !hasPositive;
+            negativeCheck.disabled = !hasNegative;
+            positiveCheck.checked = hasPositive;
+            negativeCheck.checked = hasNegative;
+            positivePreview.value = hasPositive ? candidate.positive_prompt : "（该候选没有正向 Prompt）";
+            negativePreview.value = hasNegative ? candidate.negative_prompt : "（该候选没有反向 Prompt）";
+            applyButton.disabled = !hasPositive && !hasNegative;
+        };
+        selection.addEventListener("change", updateCandidate);
+        positiveCheck.addEventListener("change", () => {
+            applyButton.disabled = !positiveCheck.checked && !negativeCheck.checked;
+        });
+        negativeCheck.addEventListener("change", () => {
+            applyButton.disabled = !positiveCheck.checked && !negativeCheck.checked;
+        });
+        mask.addEventListener("mousedown", (event) => {
+            if (event.target === mask) close();
+        });
+        const sourceLabel = data.source === "comfy_prompt" ? "ComfyUI / Bridge prompt metadata" : "A1111 / WebUI parameters";
+        const warnings = (data.warnings || []).filter(Boolean).join("；");
+        mask.append(el("div", { class: "webui-bridge-config-panel webui-bridge-image-prompt-dialog" }, [
+            el("div", { class: "webui-bridge-config-head" }, [
+                el("span", {}, "从图片读取提示词"),
+                el("button", { type: "button", onclick: close }, "×"),
+            ]),
+            el("div", { class: "webui-bridge-config-body" }, [
+                el("div", { class: "webui-bridge-image-prompt-source" }, `${fileName || "图片"} · ${sourceLabel}`),
+                candidates.length > 1 ? el("label", {}, [el("span", {}, "选择 Prompt 节点"), selection]) : null,
+                el("label", { class: "webui-bridge-image-prompt-field" }, [
+                    el("span", {}, [positiveCheck, el("span", {}, "覆盖正向 Prompt")]),
+                    positivePreview,
+                ]),
+                el("label", { class: "webui-bridge-image-prompt-field" }, [
+                    el("span", {}, [negativeCheck, el("span", {}, "覆盖反向 Prompt")]),
+                    negativePreview,
+                ]),
+                warnings ? el("div", { class: "webui-bridge-config-note" }, warnings) : null,
+                el("div", { class: "webui-bridge-config-note" }, "只读取提示词；不会恢复模型、Seed、采样器、工作流节点或连线。"),
+            ].filter(Boolean)),
+            el("div", { class: "webui-bridge-config-actions" }, [
+                el("button", { type: "button", onclick: close }, "取消"),
+                applyButton,
+            ]),
+        ]));
+        document.body.append(mask);
+        updateCandidate();
+    };
+
+    const readPromptFromImage = () => promptImageInput.click();
+    promptImageInput.addEventListener("change", async () => {
+        const file = promptImageInput.files?.[0];
+        if (!file) return;
+        try {
+            setStatus("正在读取图片 Prompt...");
+            const parsed = await parseImagePromptMetadata(file);
+            showImagePromptImportDialog(parsed, file.name);
+            setStatus("已读取图片 metadata，请确认要覆盖的提示词");
+        } catch (error) {
+            setStatus(error?.message || "图片 Prompt 读取失败");
+        } finally {
+            promptImageInput.value = "";
+        }
+    });
+
     const pasteParams = async () => {
         const text = await navigator.clipboard.readText().catch(() => "");
         if (!text) {
@@ -14032,6 +14559,8 @@ function buildPanel(node) {
 
     const toolbar = el("div", { class: "webui-bridge-tools" }, [
         createToolButton("↙", "Read generation parameters from clipboard", pasteParams),
+        createToolButton("图", "从 PNG/JPEG/WebP 图片读取 Bridge 正向/反向 Prompt", readPromptFromImage),
+        promptImageInput,
         createToolButton("🗑", "Clear prompt", clearPrompts),
         createToolButton("⇅", "Switch prompt and negative prompt", swapPrompts),
         createToolButton("补", "补全质量词、LoRA触发词和推荐负面词", completePrompt),
@@ -14060,7 +14589,7 @@ function buildPanel(node) {
         el("div", { class: "webui-bridge-model-actions" }, [
             el("button", {
                 type: "button",
-                title: "应用当前下拉选择；选择 Anima 分体项会切回分体模型，选择 checkpoint 会切到整合模型",
+                title: "应用当前选择；UNET 只修改对应 UNETLoader，保留 Text Encoder / VAE 和工作流连线",
                 onclick: applySelectedModel,
             }, "应用选择"),
             el("button", {
@@ -16812,6 +17341,11 @@ function addStyles() {
             gap: 4px;
             flex: 0 0 auto;
         }
+        .webui-bridge-prompt-order-hint {
+            color: #8fa2ba;
+            font-size: 10px;
+            white-space: nowrap;
+        }
         .webui-bridge-prompt-label-btn {
             min-width: 24px;
             height: 22px;
@@ -16897,6 +17431,7 @@ function addStyles() {
             box-shadow: inset 0 0 0 1px #d84a4a;
         }
         .webui-bridge-prompt-chips {
+            position: relative;
             display: flex;
             flex: 0 0 auto;
             align-items: flex-start;
@@ -16928,6 +17463,22 @@ function addStyles() {
         }
         .webui-bridge-prompt-chips.drag-active {
             cursor: grabbing;
+        }
+        .webui-bridge-prompt-drop-indicator {
+            position: absolute;
+            z-index: 40;
+            pointer-events: none;
+            border-radius: 999px;
+            background: #75b7ff;
+            box-shadow: 0 0 0 1px rgba(8, 17, 30, .85), 0 0 10px rgba(79, 161, 255, .9);
+        }
+        .webui-bridge-prompt-drop-indicator.vertical {
+            width: 3px;
+            transform: translateX(-1px);
+        }
+        .webui-bridge-prompt-drop-indicator.horizontal {
+            height: 3px;
+            transform: translateY(-1px);
         }
         .webui-bridge-prompt-chip {
             position: relative;
@@ -17143,6 +17694,14 @@ function addStyles() {
         .webui-bridge-chip-tool:hover {
             border-color: #74a9ff;
             background: #2b3850;
+        }
+        .webui-bridge-chip-tool:disabled {
+            opacity: .35;
+            cursor: default;
+        }
+        .webui-bridge-chip-tool:disabled:hover {
+            border-color: #3a4658;
+            background: #202837;
         }
         .webui-bridge-chip-tool.favorite.active {
             color: #ffd26f;
@@ -18007,6 +18566,25 @@ function addStyles() {
             background: #090e16;
             color: #f3f6fb;
             font: 13px/1.45 Consolas, Monaco, monospace;
+        }
+        .webui-bridge-image-prompt-dialog {
+            width: min(760px, calc(100vw - 48px));
+        }
+        .webui-bridge-image-prompt-dialog .webui-bridge-config-body {
+            grid-template-columns: 1fr;
+        }
+        .webui-bridge-image-prompt-source {
+            color: #9fbee8;
+            overflow-wrap: anywhere;
+        }
+        .webui-bridge-image-prompt-field > span {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 700;
+        }
+        .webui-bridge-image-prompt-preview {
+            min-height: 86px;
         }
         .webui-bridge-status {
             max-width: 100%;
@@ -19568,6 +20146,7 @@ function addStyles() {
             display: none !important;
         }
         .webui-bridge-prompt-only-chips {
+            position: relative;
             box-sizing: border-box;
             display: flex;
             flex: 1 1 auto;
@@ -19672,6 +20251,41 @@ function addStyles() {
         .webui-bridge-prompt-only-chip-separator.active {
             background: #2a5683;
             color: #dcecff;
+        }
+        .webui-bridge-prompt-only-chip-move {
+            position: absolute;
+            bottom: 2px;
+            width: 18px;
+            height: 18px;
+            padding: 0;
+            border: 0;
+            border-radius: 3px;
+            background: rgba(30, 42, 60, .92);
+            color: #aecbfa;
+            cursor: pointer;
+            font: 700 12px/18px sans-serif;
+            opacity: 0;
+            pointer-events: none;
+        }
+        .webui-bridge-prompt-only-chip-move.previous {
+            right: 21px;
+        }
+        .webui-bridge-prompt-only-chip-move.next {
+            right: 2px;
+        }
+        .webui-bridge-prompt-only-chip:hover .webui-bridge-prompt-only-chip-move,
+        .webui-bridge-prompt-only-chip.active .webui-bridge-prompt-only-chip-move,
+        .webui-bridge-prompt-only-chip:focus-within .webui-bridge-prompt-only-chip-move {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .webui-bridge-prompt-only-chip-move:hover {
+            background: #315e94;
+            color: #fff;
+        }
+        .webui-bridge-prompt-only-chip-move:disabled {
+            opacity: .28 !important;
+            cursor: default;
         }
         .webui-bridge-prompt-only-separator-marker {
             flex: 0 0 25px;

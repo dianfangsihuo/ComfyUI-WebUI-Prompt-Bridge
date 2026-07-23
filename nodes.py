@@ -2813,6 +2813,214 @@ def _parse_generation_parameters(text):
     return result
 
 
+class _PromptMetadataNotFoundError(ValueError):
+    pass
+
+
+def _decode_image_metadata_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        raw = value
+        if raw.startswith(b"ASCII\x00\x00\x00"):
+            raw = raw[8:]
+        elif raw.startswith(b"UNICODE\x00"):
+            raw = raw[8:]
+            for encoding in ("utf-16", "utf-16-le", "utf-16-be"):
+                try:
+                    return raw.decode(encoding).rstrip("\x00")
+                except UnicodeDecodeError:
+                    continue
+        elif raw.startswith(b"JIS\x00\x00\x00\x00\x00"):
+            raw = raw[8:]
+        return raw.decode("utf-8", errors="replace").rstrip("\x00")
+    return str(value)
+
+
+def _decode_image_metadata_json(value, label, warnings):
+    if isinstance(value, dict):
+        return value
+    text = _decode_image_metadata_text(value).strip()
+    if not text:
+        return {}
+    try:
+        loaded = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        warnings.append(f"{label} metadata is not valid JSON")
+        return {}
+    if not isinstance(loaded, dict):
+        warnings.append(f"{label} metadata is not a JSON object")
+        return {}
+    return loaded
+
+
+def _workflow_prompt_node_labels(workflow):
+    labels = {}
+    for node in workflow.get("nodes") or []:
+        if not isinstance(node, dict) or node.get("id") is None:
+            continue
+        properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        label = (
+            node.get("title")
+            or properties.get("Node name for S&R")
+            or node.get("type")
+            or f"Node {node.get('id')}"
+        )
+        labels[str(node.get("id"))] = _truncate_text(str(label), MAX_STYLE_NAME_LENGTH)
+    return labels
+
+
+def _bridge_prompt_value(inputs, name):
+    if name not in inputs:
+        return None
+    value = inputs.get(name)
+    if not isinstance(value, str):
+        return None
+    return _truncate_text(value, MAX_PROMPT_TEXT_LENGTH)
+
+
+def _extract_bridge_prompt_candidates(prompt, workflow=None, warnings=None):
+    warnings = warnings if warnings is not None else []
+    labels = _workflow_prompt_node_labels(workflow or {})
+    main_candidates = []
+    positive_nodes = []
+    negative_nodes = []
+
+    for node_id, node in (prompt or {}).items():
+        if not isinstance(node, dict):
+            continue
+        class_type = str(node.get("class_type") or "")
+        if class_type not in {
+            "WebUIPromptBridge",
+            "WebUIPromptBridgePositivePrompt",
+            "WebUIPromptBridgeNegativePrompt",
+        }:
+            continue
+        inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+        meta = node.get("_meta") if isinstance(node.get("_meta"), dict) else {}
+        node_key = str(node_id)
+        label = _truncate_text(
+            str(meta.get("title") or labels.get(node_key) or class_type),
+            MAX_STYLE_NAME_LENGTH,
+        )
+        candidate = {
+            "node_id": node_key,
+            "label": label,
+            "positive_prompt": None,
+            "negative_prompt": None,
+        }
+        if class_type == "WebUIPromptBridge":
+            candidate["positive_prompt"] = _bridge_prompt_value(inputs, "positive_prompt")
+            candidate["negative_prompt"] = _bridge_prompt_value(inputs, "negative_prompt")
+            if candidate["positive_prompt"] is not None or candidate["negative_prompt"] is not None:
+                main_candidates.append(candidate)
+        elif class_type == "WebUIPromptBridgePositivePrompt":
+            candidate["positive_prompt"] = _bridge_prompt_value(inputs, "positive_prompt")
+            if candidate["positive_prompt"] is not None:
+                positive_nodes.append(candidate)
+        else:
+            candidate["negative_prompt"] = _bridge_prompt_value(inputs, "negative_prompt")
+            if candidate["negative_prompt"] is not None:
+                negative_nodes.append(candidate)
+
+    small_candidates = []
+    if len(positive_nodes) == 1 and len(negative_nodes) == 1:
+        positive = positive_nodes[0]
+        negative = negative_nodes[0]
+        small_candidates.append({
+            "node_id": f"{positive['node_id']}+{negative['node_id']}",
+            "label": f"{positive['label']} + {negative['label']}",
+            "positive_prompt": positive["positive_prompt"],
+            "negative_prompt": negative["negative_prompt"],
+        })
+    else:
+        small_candidates.extend(positive_nodes)
+        small_candidates.extend(negative_nodes)
+
+    candidates = []
+    seen = set()
+    duplicate_count = 0
+    for candidate in [*main_candidates, *small_candidates]:
+        key = (candidate["positive_prompt"], candidate["negative_prompt"])
+        if key in seen:
+            duplicate_count += 1
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+    if duplicate_count:
+        warnings.append(f"Merged {duplicate_count} duplicate Bridge prompt candidate(s)")
+    return candidates
+
+
+def _metadata_image_extension(filename, image_bytes):
+    suffix = Path(str(filename or "")).suffix.lower()
+    if suffix in _IMAGE_SIGNATURES:
+        return suffix
+    if image_bytes.startswith(_IMAGE_SIGNATURES[".png"][0]):
+        return ".png"
+    if image_bytes.startswith(_IMAGE_SIGNATURES[".jpg"][0]):
+        return ".jpg"
+    if image_bytes.startswith(_IMAGE_SIGNATURES[".webp"][0]) and image_bytes[8:12] == b"WEBP":
+        return ".webp"
+    raise ValueError("Unsupported image type")
+
+
+def _parse_image_generation_metadata(image_bytes, filename=""):
+    if len(image_bytes or b"") > MAX_IMAGE_UPLOAD_BYTES:
+        raise ValueError("Image file is too large")
+    extension = _metadata_image_extension(filename, image_bytes)
+    _validate_preview_image(image_bytes, extension)
+
+    warnings = []
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        info = dict(image.info or {})
+        try:
+            exif = image.getexif()
+        except Exception:
+            exif = {}
+
+    prompt = _decode_image_metadata_json(info.get("prompt"), "Comfy prompt", warnings)
+    workflow = _decode_image_metadata_json(info.get("workflow"), "Comfy workflow", warnings)
+    candidates = _extract_bridge_prompt_candidates(prompt, workflow, warnings)
+    if candidates:
+        return {
+            "source": "comfy_prompt",
+            "candidates": candidates,
+            "warnings": warnings,
+        }
+
+    parameter_value = info.get("parameters")
+    if not parameter_value:
+        for key in ("comment", "Comment", "Description", "description"):
+            if info.get(key):
+                parameter_value = info.get(key)
+                break
+    if not parameter_value and exif:
+        parameter_value = exif.get(0x9286) or exif.get(0x010E)
+    parameter_text = _decode_image_metadata_text(parameter_value).strip()
+    if parameter_text:
+        parsed = _parse_generation_parameters(parameter_text)
+        positive = parsed.get("Prompt")
+        negative = parsed.get("Negative prompt") if "Negative prompt:" in parameter_text else None
+        if positive is not None or negative is not None:
+            return {
+                "source": "a1111_parameters",
+                "candidates": [{
+                    "node_id": None,
+                    "label": "A1111 / WebUI parameters",
+                    "positive_prompt": _truncate_text(positive or "", MAX_PROMPT_TEXT_LENGTH),
+                    "negative_prompt": None if negative is None else _truncate_text(negative, MAX_PROMPT_TEXT_LENGTH),
+                }],
+                "warnings": warnings,
+            }
+
+    if prompt:
+        warnings.append("Comfy metadata does not contain a WebUI Prompt Bridge node")
+    raise _PromptMetadataNotFoundError("No supported Bridge prompt metadata was found in this image")
+
+
 def _resolve_lora_name(requested):
     available = folder_paths.get_filename_list("loras")
     if requested in available:
@@ -6343,6 +6551,44 @@ def _register_routes():
         target_path.write_bytes(image_bytes)
         relative_name = f"webui_prompt_bridge/{safe_name}"
         return web.json_response({"name": relative_name, "kind": kind})
+
+    @protected_route("post", "/webui_prompt_bridge/parse_image_metadata")
+    async def parse_image_metadata(request):
+        rejected = reject_cross_origin(request)
+        if rejected is not None:
+            return rejected
+        if request.content_length and request.content_length > MAX_IMAGE_UPLOAD_BYTES + 1024 * 1024:
+            return web.json_response({"error": "Image file is too large"}, status=413)
+        reader = await request.multipart()
+        image_bytes = b""
+        filename = ""
+        image_field_seen = False
+        field = await reader.next()
+        while field:
+            if field.name == "image":
+                if image_field_seen:
+                    return web.json_response({"error": "Only one image file is allowed"}, status=400)
+                image_field_seen = True
+                filename = field.filename or ""
+                try:
+                    image_bytes = await read_multipart_field_limited(field, MAX_IMAGE_UPLOAD_BYTES)
+                except ValueError as exc:
+                    return web.json_response({"error": str(exc)}, status=413)
+            field = await reader.next()
+        if not image_bytes:
+            return web.json_response({"error": "Image file is required"}, status=400)
+        try:
+            parsed = await run_blocking(_parse_image_generation_metadata, image_bytes, filename)
+        except _PromptMetadataNotFoundError as exc:
+            return web.json_response({
+                "error": str(exc),
+                "source": None,
+                "candidates": [],
+                "warnings": [],
+            }, status=422)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(parsed)
 
     @protected_route("get", "/webui_prompt_bridge/settings")
     async def bridge_settings_get(request):

@@ -1,0 +1,43 @@
+name: Quality
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install focused test dependencies
+        run: python -m pip install numpy pillow pyyaml
+      - name: Compile Python
+        run: python -m py_compile nodes.py tests/test_prompt_library.py
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+  javascript-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check JavaScript syntax
+        run: |
+          cp web/webui_prompt_bridge.js "$RUNNER_TEMP/webui_prompt_bridge.mjs"
+          node --check "$RUNNER_TEMP/webui_prompt_bridge.mjs"
+          node --check tools/verify_frontend_compat.mjs
