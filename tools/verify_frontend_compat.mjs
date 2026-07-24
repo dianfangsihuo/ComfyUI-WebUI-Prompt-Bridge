@@ -47,6 +47,12 @@ function parseArgs() {
         headed: false,
         focusedFixes: false,
         newFeatures: false,
+        loraCollapse: false,
+        promptEditors: false,
+        favoritePagination: false,
+        splitUnet: false,
+        restoreSize: false,
+        imagePrompt: false,
     };
     for (const arg of process.argv.slice(2)) {
         if (arg === "--queue") {
@@ -57,6 +63,18 @@ function parseArgs() {
             options.focusedFixes = true;
         } else if (arg === "--new-features") {
             options.newFeatures = true;
+        } else if (arg === "--lora-collapse") {
+            options.loraCollapse = true;
+        } else if (arg === "--prompt-editors") {
+            options.promptEditors = true;
+        } else if (arg === "--favorite-pagination") {
+            options.favoritePagination = true;
+        } else if (arg === "--split-unet") {
+            options.splitUnet = true;
+        } else if (arg === "--restore-size") {
+            options.restoreSize = true;
+        } else if (arg === "--image-prompt") {
+            options.imagePrompt = true;
         } else if (arg.startsWith("--url=")) {
             options.baseUrl = arg.slice("--url=".length);
         } else {
@@ -1816,6 +1834,23 @@ async function verifyFavoritePaginationAndBatchOperations(browser, baseUrl) {
                 }),
             });
         });
+        await newPage.route("**/webui_prompt_bridge/prompt_all_in_one/translate", async (route) => {
+            let payload = {};
+            try { payload = route.request().postDataJSON() || {}; } catch {}
+            const tags = String(payload.text || "")
+                .split(/[,\n，、]+/u)
+                .map((item) => item.trim())
+                .filter(Boolean);
+            await route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({
+                    prompt: String(payload.text || ""),
+                    matched: tags.length,
+                    tags: tags.map((prompt) => ({ prompt, local: `本地 ${prompt}` })),
+                }),
+            });
+        });
     });
     try {
         await page.evaluate(() => {
@@ -1888,16 +1923,25 @@ async function verifyFavoritePaginationAndBatchOperations(browser, baseUrl) {
         assert(performanceReport.median <= 250, "Five Prompt reorders exceeded the 250 ms median budget", performanceReport);
         assert(performanceReport.favoriteDomStable, "Prompt reorder rebuilt the favorite card DOM", performanceReport);
         assert(performanceReport.negativeDomStable, "Positive Prompt reorder rebuilt the negative Prompt chips", performanceReport);
+        await page.evaluate(() => {
+            const textarea = document.querySelector(".webui-bridge-positive-prompt-row textarea");
+            textarea.value = "girl, solo";
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await page.waitForFunction(() => {
+            const chips = document.querySelector(".webui-bridge-positive-prompt-row .webui-bridge-prompt-chips");
+            const values = [...(chips?.querySelectorAll(".webui-bridge-prompt-chip[data-prompt-index]") || [])]
+                .map((chip) => chip.querySelector(".webui-bridge-chip-main")?.textContent?.trim());
+            return values.length === 2 && values[0] === "girl" && values[1] === "solo";
+        }, null, { timeout: 10000 });
         const batchRequest = page.waitForRequest((request) => {
             if (!request.url().includes("/webui_prompt_bridge/prompt_all_in_one/storage")) return false;
             try { return request.postDataJSON()?.action === "push_favorites"; } catch { return false; }
         });
         const dragCleanupBeforeResponse = await page.evaluate(() => {
-            const textarea = document.querySelector(".webui-bridge-positive-prompt-row textarea");
             const chips = document.querySelector(".webui-bridge-positive-prompt-row .webui-bridge-prompt-chips");
             const targetTab = document.querySelector(".webui-bridge-aio-positive .webui-bridge-tab-favorite");
-            textarea.value = "girl, solo";
-            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+            if (!chips || !targetTab) throw new Error("Favorite drag fixture did not render the stable Prompt chips or target tab");
             chips.querySelector('[data-prompt-index="0"]')?.dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true }));
             chips.querySelector('[data-prompt-index="1"]')?.dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true }));
             const source = chips.querySelector('[data-prompt-index="0"]');
@@ -1980,17 +2024,17 @@ async function verifySplitUnetSelectionIsTopologySafe(browser, baseUrl) {
             return { unetId: unet.id, bridgeId: bridge.id };
         }, modelNames);
         assert(!setup.error, "Unable to construct split UNET verification graph", setup);
-        await page.waitForFunction(() => [...document.querySelectorAll(".webui-bridge-panel")].at(-1)?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
-        await page.waitForFunction((target) => {
-            const select = [...document.querySelectorAll(".webui-bridge-model-select")].at(-1);
+        await waitForBridgePanelReady(page, setup.bridgeId);
+        await page.waitForFunction(({ target, bridgeId }) => {
+            const select = window.app.graph.getNodeById(bridgeId)?.__webuiBridgePanel?.querySelector(".webui-bridge-model-select");
             const options = [...(select?.options || [])];
             const groups = [...(select?.querySelectorAll("optgroup") || [])].map((group) => group.label);
             return options.some((option) => option.dataset.modelKind === "unet" && option.dataset.modelName === target)
                 && groups.includes("分体 UNET（diffusion_models）")
                 && groups.includes("整合 Checkpoint");
-        }, modelNames[1], { timeout: 30000 });
-        const before = await page.evaluate(({ unetId, target, names }) => {
-            const panel = [...document.querySelectorAll(".webui-bridge-panel")].at(-1);
+        }, { target: modelNames[1], bridgeId: setup.bridgeId }, { timeout: 30000 });
+        const before = await page.evaluate(({ unetId, bridgeId, target, names }) => {
+            const panel = window.app.graph.getNodeById(bridgeId)?.__webuiBridgePanel;
             const select = panel?.querySelector(".webui-bridge-model-select");
             const option = [...(select?.options || [])].find((item) => item.dataset.modelKind === "unet" && item.dataset.modelName === target);
             const widget = window.app.graph.getNodeById(unetId)?.widgets?.find((item) => item.name === "unet_name");
@@ -2012,7 +2056,7 @@ async function verifySplitUnetSelectionIsTopologySafe(browser, baseUrl) {
                 nodeCount: graph.nodes?.length || 0,
                 links: JSON.stringify(graph.links || []),
             };
-        }, { unetId: setup.unetId, target: modelNames[1], names: modelNames });
+        }, { unetId: setup.unetId, bridgeId: setup.bridgeId, target: modelNames[1], names: modelNames });
         assert(before.hasOption, "diffusion_models UNET option was not rendered", before);
         assert(before.groups.includes("分体 UNET（diffusion_models）") && before.groups.includes("整合 Checkpoint"), "Model selector optgroups are missing", before);
         await page.waitForTimeout(250);
@@ -2055,10 +2099,10 @@ async function verifySplitUnetSelectionIsTopologySafe(browser, baseUrl) {
             unrelatedWidget.value = otherNames[0];
             modeWidget.value = false;
             window.app.canvas.setDirty(true, true);
-            return { branchId: branch.id, unrelatedId: unrelated.id, modeId: mode.id };
+            return { branchId: branch.id, unrelatedId: unrelated.id, modeId: mode.id, bridgeId: bridge.id };
         }, { names: modelNames, otherNames: ["mock/other-a.safetensors", "mock/other-b.safetensors"] });
         assert(!splitBranch.error, "Unable to construct Checkpoint-mode split branch verification graph", splitBranch);
-        await page.waitForFunction(() => [...document.querySelectorAll(".webui-bridge-panel")].at(-1)?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
+        await waitForBridgePanelReady(page, splitBranch.bridgeId);
         const splitBranchBefore = await page.evaluate(({ ids, names, otherNames, target }) => {
             const branchWidget = window.app.graph.getNodeById(ids.branchId)?.widgets?.find((item) => item.name === "unet_name");
             const unrelatedWidget = window.app.graph.getNodeById(ids.unrelatedId)?.widgets?.find((item) => item.name === "unet_name");
@@ -2066,7 +2110,7 @@ async function verifySplitUnetSelectionIsTopologySafe(browser, baseUrl) {
             branchWidget.value = names[0];
             unrelatedWidget.options = { ...(unrelatedWidget.options || {}), values: [...otherNames] };
             unrelatedWidget.value = otherNames[0];
-            const panel = [...document.querySelectorAll(".webui-bridge-panel")].at(-1);
+            const panel = window.app.graph.getNodeById(ids.bridgeId)?.__webuiBridgePanel;
             const select = panel.querySelector(".webui-bridge-model-select");
             const option = [...select.options].find((item) => item.dataset.modelKind === "unet" && item.dataset.modelName === target);
             const graph = window.app.graph.serialize();
@@ -2111,26 +2155,28 @@ async function verifySplitUnetSelectionIsTopologySafe(browser, baseUrl) {
                 widget.value = names[0];
             }
             window.app.canvas.setDirty(true, true);
-            return ids;
+            return { ids, bridgeId: bridge.id };
         }, modelNames);
-        await page.waitForFunction(() => [...document.querySelectorAll(".webui-bridge-panel")].at(-1)?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
-        await page.evaluate(({ target, names, ids }) => {
+        await waitForBridgePanelReady(page, ambiguous.bridgeId);
+        const ambiguousStatus = await page.evaluate(({ target, names, ids, bridgeId }) => {
             for (const id of ids) {
                 const widget = window.app.graph.getNodeById(id)?.widgets?.find((item) => item.name === "unet_name");
                 widget.options = { ...(widget.options || {}), values: [...names] };
                 widget.value = names[0];
             }
-            const panel = [...document.querySelectorAll(".webui-bridge-panel")].at(-1);
+            const bridge = window.app.graph.getNodeById(bridgeId);
+            const panel = bridge?.__webuiBridgePanel;
             const select = panel.querySelector(".webui-bridge-model-select");
             const option = [...select.options].find((item) => item.dataset.modelKind === "unet" && item.dataset.modelName === target);
             select.value = option.value;
             select.dispatchEvent(new Event("change", { bubbles: true }));
-        }, { target: modelNames[1], names: modelNames, ids: ambiguous });
+            return panel.querySelector(".webui-bridge-status")?.textContent || "";
+        }, { target: modelNames[1], names: modelNames, ids: ambiguous.ids, bridgeId: ambiguous.bridgeId });
         await page.waitForTimeout(200);
-        const ambiguousAfter = await page.evaluate((ids) => ({
+        const ambiguousAfter = await page.evaluate(({ ids, status }) => ({
             values: ids.map((id) => window.app.graph.getNodeById(id)?.widgets?.find((item) => item.name === "unet_name")?.value),
-            status: [...document.querySelectorAll(".webui-bridge-status")].at(-1)?.textContent || "",
-        }), ambiguous);
+            status,
+        }), { ids: ambiguous.ids, status: ambiguousStatus });
         assert(ambiguousAfter.values.every((value) => value === modelNames[0]), "Ambiguous UNET selection modified a loader", ambiguousAfter);
         assert(/多个|无法安全/.test(ambiguousAfter.status), "Ambiguous UNET selection did not explain why it was rejected", ambiguousAfter);
         return { before, after, splitBranchAfter, ambiguousAfter };
@@ -2173,8 +2219,27 @@ async function verifyImagePromptImportRequiresConfirmation(browser, baseUrl) {
             positive.dispatchEvent(new Event("input", { bubbles: true }));
             negative.dispatchEvent(new Event("input", { bubbles: true }));
         });
-        const input = page.locator('.webui-bridge-tools input[type="file"][accept*="image/png"]');
-        await input.setInputFiles({ name: "prompt.png", mimeType: "image/png", buffer: tinyPng });
+        const imageImportButton = page.getByRole("button", { name: "读图提示词" });
+        assert(await imageImportButton.count() === 1, "The top-level image Prompt import button is missing or duplicated");
+        assert(await imageImportButton.isVisible(), "The top-level image Prompt import button is not visible");
+        const input = page.locator('.webui-bridge-image-prompt-input[accept*="image/png"]');
+        assert(await input.evaluate((element) => Boolean(element.closest(".webui-bridge-top-controls"))), "Image Prompt file input is still hidden inside the collapsible tools section");
+        const chooseImage = async () => {
+            await page.evaluate(() => {
+                const input = document.querySelector(".webui-bridge-image-prompt-input");
+                if (!input) throw new Error("Image Prompt file input is missing");
+                input.dataset.bridgeClickSeen = "0";
+                input.addEventListener("click", () => {
+                    input.dataset.bridgeClickSeen = "1";
+                }, { once: true });
+            });
+            // Use DOM activation here: ComfyUI's optional GPU monitor overlay can cover
+            // the canvas in headless verification even though it is not part of Bridge.
+            await imageImportButton.evaluate((button) => button.click());
+            await page.waitForFunction(() => document.querySelector(".webui-bridge-image-prompt-input")?.dataset.bridgeClickSeen === "1", null, { timeout: 5000 });
+            await input.setInputFiles({ name: "prompt.png", mimeType: "image/png", buffer: tinyPng });
+        };
+        await chooseImage();
         await page.waitForSelector(".webui-bridge-image-prompt-dialog");
         const beforeConfirm = await page.evaluate(() => ({
             positive: document.querySelector(".webui-bridge-positive-prompt-row textarea")?.value,
@@ -2182,21 +2247,21 @@ async function verifyImagePromptImportRequiresConfirmation(browser, baseUrl) {
         }));
         assert(beforeConfirm.positive === "original positive" && beforeConfirm.negative === "original negative", "Image import changed prompts before confirmation", beforeConfirm);
         await page.getByRole("button", { name: "取消" }).last().click();
-        await page.waitForTimeout(80);
+        await page.waitForSelector(".webui-bridge-image-prompt-dialog", { state: "detached" });
         const afterCancel = await page.evaluate(() => ({
             positive: document.querySelector(".webui-bridge-positive-prompt-row textarea")?.value,
             negative: document.querySelector(".webui-bridge-prompt-row:not(.webui-bridge-positive-prompt-row) textarea")?.value,
         }));
         assert(JSON.stringify(afterCancel) === JSON.stringify(beforeConfirm), "Cancelling image import changed prompts", { beforeConfirm, afterCancel });
 
-        await input.setInputFiles({ name: "prompt.png", mimeType: "image/png", buffer: tinyPng });
+        await chooseImage();
         await page.waitForSelector(".webui-bridge-image-prompt-dialog");
         const dialog = page.locator(".webui-bridge-image-prompt-dialog");
         await dialog.locator("select").selectOption("1");
         const checks = dialog.locator('input[type="checkbox"]');
         await checks.nth(1).uncheck();
         await dialog.getByRole("button", { name: "确认覆盖所选内容" }).click();
-        await page.waitForTimeout(100);
+        await page.waitForSelector(".webui-bridge-image-prompt-dialog", { state: "detached" });
         const afterApply = await page.evaluate(() => ({
             positive: document.querySelector(".webui-bridge-positive-prompt-row textarea")?.value,
             negative: document.querySelector(".webui-bridge-prompt-row:not(.webui-bridge-positive-prompt-row) textarea")?.value,
@@ -2204,6 +2269,189 @@ async function verifyImagePromptImportRequiresConfirmation(browser, baseUrl) {
         assert(afterApply.positive === "second positive", "Selected image Prompt candidate was not applied", afterApply);
         assert(afterApply.negative === "original negative", "Unchecked negative Prompt was overwritten", afterApply);
         return { beforeConfirm, afterCancel, afterApply };
+    } finally {
+        await context.close();
+    }
+}
+
+async function waitForBridgePanelReady(page, nodeId, timeout = 30000) {
+    await page.waitForFunction((id) => {
+        const panel = window.app?.graph?.getNodeById?.(id)?.__webuiBridgePanel;
+        return Boolean(panel?.isConnected && panel.__webuiBridgeDataLoaded);
+    }, nodeId, { timeout });
+}
+
+async function verifyPromptEditorLaunchButtons(browser, baseUrl) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(browser, baseUrl, consoleMessages, { width: 1800, height: 1300 });
+    try {
+        const before = await page.evaluate(() => {
+            window.app.graph.clear();
+            const bridge = window.LiteGraph.createNode("WebUIPromptBridge");
+            bridge.id = 952100;
+            bridge.pos = [40, 40];
+            window.app.graph.add(bridge);
+            window.app.canvas.setDirty(true, true);
+            const graph = window.app.graph.serialize();
+            return {
+                bridgeId: bridge.id,
+                nodeCount: graph.nodes?.length || 0,
+                links: JSON.stringify(graph.links || []),
+            };
+        });
+        await page.waitForFunction(() => document.querySelector(".webui-bridge-panel")?.__webuiBridgeDataLoaded, null, { timeout: 30000 });
+        await page.evaluate(() => {
+            const positive = document.querySelector(".webui-bridge-positive-prompt-row textarea");
+            const negative = document.querySelector(".webui-bridge-negative-prompt-row textarea");
+            positive.value = "launch positive marker, detailed face";
+            negative.value = "launch negative marker, blurry";
+            positive.dispatchEvent(new Event("input", { bubbles: true }));
+            negative.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        const panel = page.locator(".webui-bridge-panel");
+        const positiveButton = panel.locator('[data-prompt-editor-kind="positive"]');
+        const negativeButton = panel.locator('[data-prompt-editor-kind="negative"]');
+        assert(await positiveButton.count() === 1, "Positive Prompt editor launch button is missing or duplicated");
+        assert(await negativeButton.count() === 1, "Negative Prompt editor launch button is missing or duplicated");
+
+        const initialCanvasOffset = await page.evaluate(() => {
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.ds.offset = [0, 0];
+            window.app.canvas.setDirty(true, true);
+            return [...window.app.canvas.ds.offset];
+        });
+        await positiveButton.evaluate((button) => button.click());
+        await page.waitForFunction(() => window.app.graph._nodes.some((node) => (
+            node.type === "WebUIPromptBridgePositivePrompt" && node.__webuiBridgePromptOnlyPanel
+        )), null, { timeout: 20000 });
+        await page.waitForTimeout(50);
+        const positiveCanvasOffset = await page.evaluate(() => [...window.app.canvas.ds.offset]);
+        assert(
+            positiveCanvasOffset.every((value, index) => Math.abs(value - initialCanvasOffset[index]) < 0.5),
+            "Launching an already-visible Prompt editor unexpectedly panned the canvas",
+            { initialCanvasOffset, positiveCanvasOffset },
+        );
+        await negativeButton.evaluate((button) => button.click());
+        await page.waitForFunction(() => window.app.graph._nodes.some((node) => (
+            node.type === "WebUIPromptBridgeNegativePrompt" && node.__webuiBridgePromptOnlyPanel
+        )), null, { timeout: 20000 });
+        await page.waitForTimeout(50);
+        const viewportReport = await page.evaluate((beforeOffset) => {
+            const canvas = window.app.canvas;
+            const negative = window.app.graph._nodes.find((node) => node.type === "WebUIPromptBridgeNegativePrompt");
+            const canvasElement = canvas.canvas || document.querySelector("#graph-canvas");
+            const scale = Number(canvas.ds.scale) || 1;
+            const deviceScale = Math.max(1, Number(window.devicePixelRatio) || 1);
+            const viewportWidth = Number(canvasElement.width) / deviceScale;
+            const viewportHeight = Number(canvasElement.height) / deviceScale;
+            const margin = Math.max(24 * scale, 36);
+            const offset = [...canvas.ds.offset];
+            return {
+                beforeOffset,
+                offset,
+                deltaX: offset[0] - beforeOffset[0],
+                deltaY: offset[1] - beforeOffset[1],
+                viewportWidth,
+                viewportHeight,
+                margin,
+                screenRect: {
+                    left: (negative.pos[0] + offset[0]) * scale,
+                    top: (negative.pos[1] + offset[1]) * scale,
+                    right: (negative.pos[0] + negative.size[0] + offset[0]) * scale,
+                    bottom: (negative.pos[1] + negative.size[1] + offset[1]) * scale,
+                },
+            };
+        }, positiveCanvasOffset);
+        assert(viewportReport.deltaX < -0.5 && Math.abs(viewportReport.deltaY) < 0.5, "Offscreen Prompt editor did not pan only the required canvas axis", viewportReport);
+        const editorRightGap = viewportReport.viewportWidth - viewportReport.screenRect.right;
+        assert(
+            editorRightGap >= -2 && editorRightGap <= viewportReport.margin + 32,
+            "Offscreen Prompt editor was centered or remained clipped instead of being minimally revealed",
+            { ...viewportReport, editorRightGap },
+        );
+
+        const pairReport = await page.evaluate((bridgeId) => {
+            const bridge = window.app.graph.getNodeById(bridgeId);
+            const positive = window.app.graph._nodes.find((node) => node.type === "WebUIPromptBridgePositivePrompt");
+            const negative = window.app.graph._nodes.find((node) => node.type === "WebUIPromptBridgeNegativePrompt");
+            const graph = window.app.graph.serialize();
+            const rectFor = (node) => ({
+                left: Number(node?.pos?.[0]) || 0,
+                top: Number(node?.pos?.[1]) || 0,
+                right: (Number(node?.pos?.[0]) || 0) + (Number(node?.size?.[0]) || 0),
+                bottom: (Number(node?.pos?.[1]) || 0) + (Number(node?.size?.[1]) || 0),
+            });
+            const overlaps = (left, right) => (
+                left.left < right.right
+                && left.right > right.left
+                && left.top < right.bottom
+                && left.bottom > right.top
+            );
+            const bridgeRect = rectFor(bridge);
+            const positiveRect = rectFor(positive);
+            const negativeRect = rectFor(negative);
+            return {
+                nodeCount: graph.nodes?.length || 0,
+                links: JSON.stringify(graph.links || []),
+                toolbarButtons: [...document.querySelectorAll(".webui-bridge-top-controls > button")].map((button) => button.textContent.trim()),
+                positive: {
+                    id: positive?.id,
+                    title: positive?.title,
+                    value: positive?.widgets?.find((widget) => widget.name === "positive_prompt")?.value,
+                    pos: [...(positive?.pos || [])],
+                },
+                negative: {
+                    id: negative?.id,
+                    title: negative?.title,
+                    value: negative?.widgets?.find((widget) => widget.name === "negative_prompt")?.value,
+                    pos: [...(negative?.pos || [])],
+                },
+                mainValues: {
+                    positive: bridge?.widgets?.find((widget) => widget.name === "positive_prompt")?.value,
+                    negative: bridge?.widgets?.find((widget) => widget.name === "negative_prompt")?.value,
+                },
+                separated: !overlaps(positiveRect, negativeRect),
+                outsideBridge: !overlaps(bridgeRect, positiveRect) && !overlaps(bridgeRect, negativeRect),
+            };
+        }, before.bridgeId);
+        assert(pairReport.nodeCount === before.nodeCount + 2, "Prompt editor buttons did not create exactly two small nodes", { before, pairReport });
+        assert(pairReport.links === before.links, "Prompt editor buttons changed existing graph links", { before, pairReport });
+        assert(pairReport.positive.title === "正向提示词编辑器" && pairReport.negative.title === "反向提示词编辑器", "Prompt editor nodes did not receive clear localized titles", pairReport);
+        assert(pairReport.positive.value === "launch positive marker, detailed face", "Positive editor did not copy the current positive Prompt", pairReport);
+        assert(pairReport.negative.value === "launch negative marker, blurry", "Negative editor did not copy the current negative Prompt", pairReport);
+        assert(pairReport.mainValues.positive === pairReport.positive.value && pairReport.mainValues.negative === pairReport.negative.value, "Launching an editor changed the main Bridge Prompt", pairReport);
+        assert(pairReport.separated && pairReport.outsideBridge, "Created Prompt editor nodes overlap each other or the main Bridge", pairReport);
+        const quickIndex = pairReport.toolbarButtons.indexOf("快速添加 LoRA");
+        const imageImportIndex = pairReport.toolbarButtons.indexOf("读图提示词");
+        const positiveIndex = pairReport.toolbarButtons.indexOf("正向编辑器");
+        const negativeIndex = pairReport.toolbarButtons.indexOf("反向编辑器");
+        assert(
+            quickIndex >= 0
+            && imageImportIndex === quickIndex + 1
+            && positiveIndex === imageImportIndex + 1
+            && negativeIndex === positiveIndex + 1,
+            "Image Prompt import and Prompt editor buttons are not grouped beside Quick LoRA",
+            pairReport.toolbarButtons,
+        );
+
+        await positiveButton.evaluate((button) => button.click());
+        await page.waitForFunction(() => window.app.graph._nodes.filter((node) => node.type === "WebUIPromptBridgePositivePrompt").length === 2, null, { timeout: 20000 });
+        const repeatedReport = await page.evaluate(() => {
+            const positiveNodes = window.app.graph._nodes.filter((node) => node.type === "WebUIPromptBridgePositivePrompt");
+            return {
+                positions: positiveNodes.map((node) => [...node.pos]),
+                values: positiveNodes.map((node) => node.widgets?.find((widget) => widget.name === "positive_prompt")?.value),
+            };
+        });
+        assert(new Set(repeatedReport.positions.map((position) => position.join(","))).size === 2, "Repeated positive editor launch stacked nodes at the same position", repeatedReport);
+        assert(repeatedReport.values.every((value) => value === "launch positive marker, detailed face"), "Repeated positive editor launch copied the wrong Prompt", repeatedReport);
+
+        const bridgeConsoleErrors = consoleMessages.filter((message) => (
+            ["error", "pageerror"].includes(message.type)
+            && /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        ));
+        assert(!bridgeConsoleErrors.length, "Prompt editor launch emitted Bridge console errors", bridgeConsoleErrors);
+        return { pairReport, repeatedReport, bridgeConsoleErrors: bridgeConsoleErrors.length };
     } finally {
         await context.close();
     }
@@ -2521,6 +2769,9 @@ async function bridgeRestoreSizeMetrics(page, label = "metrics") {
     return await page.evaluate((metricLabel) => {
         const panel = document.querySelector(".webui-bridge-panel");
         const topRow = document.querySelector(".webui-bridge-toprow");
+        const prompts = document.querySelector(".webui-bridge-prompts");
+        const workspaceTabs = document.querySelector(".webui-bridge-prompt-workspace-tabs");
+        const positiveRow = document.querySelector(".webui-bridge-positive-prompt-row");
         const extra = document.querySelector(".webui-bridge-extra");
         const node = window.app.graph._nodes.find((item) => item.type === "WebUIPromptBridge");
         const rect = (element) => {
@@ -2540,6 +2791,10 @@ async function bridgeRestoreSizeMetrics(page, label = "metrics") {
                 : null,
             panel: rect(panel),
             topRow: rect(topRow),
+            prompts: rect(prompts),
+            workspaceTabs: rect(workspaceTabs),
+            positiveRow: rect(positiveRow),
+            promptScrollTop: prompts ? Math.round(prompts.scrollTop) : null,
             extra: rect(extra),
             blankBelowExtra: panel && extra
                 ? Math.round(panel.getBoundingClientRect().bottom - extra.getBoundingClientRect().bottom - 8)
@@ -2572,6 +2827,7 @@ async function verifyRestoreSizeStability(browser, baseUrl, workflow) {
                 node.__webuiBridgeUserSized = true;
             }
             const top = document.querySelector(".webui-bridge-toprow");
+            const prompts = document.querySelector(".webui-bridge-prompts");
             const extra = document.querySelector(".webui-bridge-extra");
             const positiveTags = document.querySelector(".webui-bridge-positive-prompt-row .webui-bridge-tag-panel");
             if (top) {
@@ -2586,6 +2842,7 @@ async function verifyRestoreSizeStability(browser, baseUrl, workflow) {
                 positiveTags.style.height = "260px";
                 positiveTags.style.flex = "0 0 auto";
             }
+            if (prompts) prompts.scrollTop = 140;
             panel?.__webuiBridgeScheduleAdaptiveLayout?.();
             window.app.canvas.setDirty(true, true);
         });
@@ -2621,6 +2878,11 @@ async function verifyRestoreSizeStability(browser, baseUrl, workflow) {
         });
         assert(final.nodeSize?.[0] === 1180 && final.nodeSize?.[1] === 1180, "Restore size did not settle on default node size", final);
         assert(Math.abs(final.blankBelowExtra || 0) <= 36, "Restore size left a large bottom gap or overflow", final);
+        assert((before.promptScrollTop || 0) >= 100, "Restore-size regression fixture did not start scrolled", before);
+        assert(final.promptScrollTop === 0, "Restore size left the Prompt workspace scrolled and can clip the active editor", {
+            before,
+            final,
+        });
         const bridgeConsoleErrors = consoleMessages.filter((message) =>
             ["error", "pageerror"].includes(message.type) &&
             /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
@@ -2630,6 +2892,8 @@ async function verifyRestoreSizeStability(browser, baseUrl, workflow) {
             finalNodeSize: final.nodeSize,
             finalExtraHeight: final.extra?.height || null,
             finalBlankBelowExtra: final.blankBelowExtra,
+            initialPromptScrollTop: before.promptScrollTop,
+            finalPromptScrollTop: final.promptScrollTop,
             settledExtraSpan,
             largeTransitions,
         };
@@ -4140,6 +4404,153 @@ async function verifySerializedBridgeLayoutStateRestoresWithoutLocalStorage(brow
     }
 }
 
+async function verifyCollapsedLoraReclaimsPanelHeight(browser, baseUrl, workflow) {
+    const consoleMessages = [];
+    const { context, page } = await newComfyPage(
+        browser,
+        baseUrl,
+        consoleMessages,
+        { width: 1600, height: 1350 },
+        async (setupPage) => {
+            const mockLoras = mockLoraItems(96);
+            await setupPage.route("**/webui_prompt_bridge/loras*", async (route) => {
+                await route.fulfill({
+                    status: 200,
+                    contentType: "application/json",
+                    body: JSON.stringify({ loras: mockLoras }),
+                });
+            });
+        },
+    );
+    try {
+        const savedWorkflow = JSON.parse(JSON.stringify(workflow));
+        const bridgeData = savedWorkflow.nodes?.find((node) => node.type === "WebUIPromptBridge");
+        assert(bridgeData, "LoRA-collapse workflow is missing the WebUIPromptBridge node");
+        bridgeData.size = [1180, 1180];
+        bridgeData.properties = {
+            ...(bridgeData.properties || {}),
+            webui_prompt_bridge_layout: {
+                version: 1,
+                top_row_height: 620,
+                extra_height: 420,
+                sidebar_width: 400,
+                positive_textarea_height: 112,
+                negative_textarea_height: 220,
+                positive_chip_height: 132,
+                negative_chip_height: 104,
+                positive_tag_height: 238,
+                negative_tag_height: 240,
+                lora_scroll_top: 0,
+                extra_collapsed: true,
+                sidebar_collapsed: false,
+                negative_collapsed: false,
+            },
+        };
+        const layoutKeys = [
+            "webui-bridge-layout-storage-version",
+            "webui-bridge-toprow-height",
+            "webui-bridge-extra-height",
+            "webui-bridge-extra-collapsed",
+            "webui-bridge-action-column-width",
+            "webui-bridge-action-column-collapsed",
+            "webui-bridge-negative-collapsed",
+        ];
+        const report = await page.evaluate(async ({ graphData, keys }) => {
+            const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const snapshot = (label) => {
+                const panel = document.querySelector(".webui-bridge-panel");
+                const topRow = panel?.querySelector(".webui-bridge-toprow");
+                const extra = panel?.querySelector(".webui-bridge-extra");
+                const toggle = [...(panel?.querySelectorAll("button") || [])]
+                    .find((button) => /^(?:显示|隐藏) LoRA$/.test(button.textContent.trim()));
+                const panelRect = panel?.getBoundingClientRect?.();
+                const topRect = topRow?.getBoundingClientRect?.();
+                const extraRect = extra?.getBoundingClientRect?.();
+                return {
+                    label,
+                    collapsed: Boolean(extra?.classList.contains("collapsed")),
+                    toggle: toggle?.textContent?.trim() || "",
+                    panelHeight: Math.round(panelRect?.height || 0),
+                    topHeight: Math.round(topRect?.height || 0),
+                    extraHeight: Math.round(extraRect?.height || 0),
+                    bottomGap: Math.round((panelRect?.bottom || 0) - (extraRect?.bottom || 0)),
+                    topInlineHeight: topRow?.style.height || "",
+                    topInlineFlex: topRow?.style.flex || "",
+                    topComputedFlex: topRow ? getComputedStyle(topRow).flex : "",
+                    storedTopHeight: localStorage.getItem("webui-bridge-toprow-height"),
+                    storedExtraHeight: localStorage.getItem("webui-bridge-extra-height"),
+                };
+            };
+            const toggleLora = () => {
+                const toggle = [...document.querySelectorAll(".webui-bridge-panel button")]
+                    .find((button) => /^(?:显示|隐藏) LoRA$/.test(button.textContent.trim()));
+                if (!toggle) throw new Error("LoRA collapse toggle was not rendered");
+                toggle.click();
+            };
+            for (const key of keys) localStorage.removeItem(key);
+            await window.app.loadGraphData(graphData, true, true, undefined, {
+                filename: "collapsed-lora-reclaims-panel-height.json",
+            });
+            window.app.canvas.ds.offset = [55, 35];
+            window.app.canvas.ds.scale = 1;
+            window.app.canvas.setDirty(true, true);
+            await wait(3500);
+            const initialCollapsed = snapshot("initial-collapsed");
+            toggleLora();
+            await wait(1200);
+            const expanded = snapshot("expanded");
+            toggleLora();
+            await wait(800);
+            const toggledCollapsed = snapshot("toggled-collapsed");
+            const serialized = window.app.graph.serialize();
+            const serializedBridge = serialized.nodes?.find((node) => node.type === "WebUIPromptBridge");
+            return {
+                initialCollapsed,
+                expanded,
+                toggledCollapsed,
+                serializedLayout: serializedBridge?.properties?.webui_prompt_bridge_layout || null,
+            };
+        }, { graphData: savedWorkflow, keys: layoutKeys });
+        await screenshot(page, "compat-collapsed-lora-reclaims-panel-height.png");
+        for (const collapsed of [report.initialCollapsed, report.toggledCollapsed]) {
+            assert(collapsed.collapsed, "LoRA section did not remain collapsed", report);
+            assert(collapsed.extraHeight <= 44, "Collapsed LoRA section exceeded its header height", report);
+            assert(collapsed.bottomGap <= 12, "Collapsed LoRA left a large blank below its header", report);
+            assert(/^1 1 /.test(collapsed.topComputedFlex), "Prompt area did not flex into collapsed LoRA space", report);
+        }
+        assert(!report.expanded.collapsed && report.expanded.extraHeight >= 180,
+            "LoRA section did not restore its expanded height", report);
+        assert(Math.abs(report.expanded.topHeight - Number(report.expanded.storedTopHeight)) <= 4 &&
+            Math.abs(report.expanded.extraHeight - Number(report.expanded.storedExtraHeight)) <= 4,
+            "LoRA expansion did not restore the saved expanded split", report);
+        assert(report.initialCollapsed.topHeight >= report.expanded.topHeight + 120,
+            "Collapsed LoRA space was not reassigned to the prompt area", report);
+        assert(report.initialCollapsed.storedTopHeight === report.expanded.storedTopHeight &&
+            report.expanded.storedTopHeight === report.toggledCollapsed.storedTopHeight,
+            "LoRA toggle rewrote the saved prompt/LoRA split", report);
+        assert(report.expanded.storedExtraHeight === report.toggledCollapsed.storedExtraHeight,
+            "Collapsing LoRA rewrote the saved expanded LoRA height", report);
+        assert(Number(report.serializedLayout?.top_row_height) === Number(report.expanded.storedTopHeight) &&
+            Number(report.serializedLayout?.extra_height) === Number(report.expanded.storedExtraHeight),
+            "Collapsed LoRA serialization rewrote the saved expanded split", report);
+        const bridgeConsoleErrors = consoleMessages.filter((message) =>
+            ["error", "pageerror"].includes(message.type) &&
+            /WebUI Prompt Bridge|WebUIPromptBridge|webui_prompt_bridge/i.test(message.text)
+        );
+        assert(bridgeConsoleErrors.length === 0,
+            "WebUIPromptBridge reported console errors during LoRA-collapse layout check", bridgeConsoleErrors);
+        return {
+            initialCollapsed: report.initialCollapsed,
+            expanded: report.expanded,
+            toggledCollapsed: report.toggledCollapsed,
+            serializedLayout: report.serializedLayout,
+            bridgeConsoleErrors: bridgeConsoleErrors.length,
+        };
+    } finally {
+        await context.close();
+    }
+}
+
 async function verifySerializedBridgeLayoutStateOverridesStaleLocalBooleans(browser, baseUrl, workflow) {
     const consoleMessages = [];
     const { context, page } = await newComfyPage(
@@ -4409,10 +4820,24 @@ async function main() {
     const browser = await chromium.launch({ headless: !options.headed });
     const workflow = await loadWorkflow();
     try {
-        const results = options.newFeatures ? {
+        const results = options.promptEditors ? {
+            promptEditorLaunchButtons: await verifyPromptEditorLaunchButtons(browser, options.baseUrl),
+        } : options.loraCollapse ? {
+            collapsedLoraReclaimsPanelHeight: await verifyCollapsedLoraReclaimsPanelHeight(browser, options.baseUrl, workflow),
+        } : options.favoritePagination ? {
+            favoritePaginationAndBatchOperations: await verifyFavoritePaginationAndBatchOperations(browser, options.baseUrl),
+        } : options.splitUnet ? {
+            splitUnetSelectionIsTopologySafe: await verifySplitUnetSelectionIsTopologySafe(browser, options.baseUrl),
+        } : options.restoreSize ? {
+            restoreSizeStability: await verifyRestoreSizeStability(browser, options.baseUrl, workflow),
+        } : options.imagePrompt ? {
+            imagePromptImportRequiresConfirmation: await verifyImagePromptImportRequiresConfirmation(browser, options.baseUrl),
+        } : options.newFeatures ? {
             splitUnetSelectionIsTopologySafe: await verifySplitUnetSelectionIsTopologySafe(browser, options.baseUrl),
             imagePromptImportRequiresConfirmation: await verifyImagePromptImportRequiresConfirmation(browser, options.baseUrl),
+            promptEditorLaunchButtons: await verifyPromptEditorLaunchButtons(browser, options.baseUrl),
             wrappedPromptPositionEditing: await verifyWrappedPromptPositionEditing(browser, options.baseUrl),
+            collapsedLoraReclaimsPanelHeight: await verifyCollapsedLoraReclaimsPanelHeight(browser, options.baseUrl, workflow),
         } : options.focusedFixes ? {
             freshBridgeStartsAtStablePresetSize: await verifyFreshBridgeStartsAtStablePresetSize(browser, options.baseUrl),
             narrowBridgeWidthLayout: await verifyNarrowBridgeWidthLayout(browser, options.baseUrl),
@@ -4424,7 +4849,9 @@ async function main() {
             favoritePaginationAndBatchOperations: await verifyFavoritePaginationAndBatchOperations(browser, options.baseUrl),
             splitUnetSelectionIsTopologySafe: await verifySplitUnetSelectionIsTopologySafe(browser, options.baseUrl),
             imagePromptImportRequiresConfirmation: await verifyImagePromptImportRequiresConfirmation(browser, options.baseUrl),
+            promptEditorLaunchButtons: await verifyPromptEditorLaunchButtons(browser, options.baseUrl),
             wrappedPromptPositionEditing: await verifyWrappedPromptPositionEditing(browser, options.baseUrl),
+            collapsedLoraReclaimsPanelHeight: await verifyCollapsedLoraReclaimsPanelHeight(browser, options.baseUrl, workflow),
         } : {
             bridgeEventFix: await verifyBridgeDoesNotCancelCanvasWidgets(browser, options.baseUrl),
             freshBridgeStartsAtStablePresetSize: await verifyFreshBridgeStartsAtStablePresetSize(browser, options.baseUrl),
@@ -4444,6 +4871,7 @@ async function main() {
             favoritePaginationAndBatchOperations: await verifyFavoritePaginationAndBatchOperations(browser, options.baseUrl),
             splitUnetSelectionIsTopologySafe: await verifySplitUnetSelectionIsTopologySafe(browser, options.baseUrl),
             imagePromptImportRequiresConfirmation: await verifyImagePromptImportRequiresConfirmation(browser, options.baseUrl),
+            promptEditorLaunchButtons: await verifyPromptEditorLaunchButtons(browser, options.baseUrl),
             wrappedPromptPositionEditing: await verifyWrappedPromptPositionEditing(browser, options.baseUrl),
             fullNegativeCollapseReclaimsLoraSpace: await verifyFullNegativeCollapseReclaimsLoraSpace(browser, options.baseUrl, workflow),
             sectionResizeBlankRecovery: await verifySectionResizeBlankRecovery(browser, options.baseUrl, workflow),
@@ -4466,6 +4894,7 @@ async function main() {
             bridgeSettingsRoundTrip: await verifyBridgeSettingsRoundTrip(browser, options.baseUrl, workflow),
             bridgeLayoutPreferencePersistence: await verifyBridgeLayoutPreferencePersistence(browser, options.baseUrl, workflow),
             serializedBridgeLayoutState: await verifySerializedBridgeLayoutStateRestoresWithoutLocalStorage(browser, options.baseUrl, workflow),
+            collapsedLoraReclaimsPanelHeight: await verifyCollapsedLoraReclaimsPanelHeight(browser, options.baseUrl, workflow),
             serializedBridgeLayoutStateOverridesStaleLocalBooleans: await verifySerializedBridgeLayoutStateOverridesStaleLocalBooleans(browser, options.baseUrl, workflow),
             oldWorkflowCompatibility: await verifyOldWorkflowCompatibility(browser, options.baseUrl, workflow),
         };

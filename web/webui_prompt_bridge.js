@@ -2295,9 +2295,9 @@ function repairBridgePanelLayoutAfterWorkflow(node, reason = "workflow") {
         }
         node.__webuiBridgeApplyDomWidgetSize?.(desired[0], desired[1]);
         panel?.__webuiBridgeScheduleAdaptiveLayout?.();
-        panel?.__webuiBridgeSettleManualResizeLayout?.();
+        panel?.__webuiBridgeSettleManualResizeLayout?.({ automatic: true });
         window.requestAnimationFrame?.(() => panel?.__webuiBridgeScheduleAdaptiveLayout?.());
-        window.requestAnimationFrame?.(() => panel?.__webuiBridgeSettleManualResizeLayout?.());
+        window.requestAnimationFrame?.(() => panel?.__webuiBridgeSettleManualResizeLayout?.({ automatic: true }));
     };
     run();
     for (const delay of WORKFLOW_LAYOUT_REPAIR_DELAYS) {
@@ -8998,6 +8998,9 @@ function createPromptRow(label, value, placeholder, onFocus, onInput, options = 
         onDragMove: () => markManualResize({ phase: "move" }),
         onDragEnd: () => markManualResize({ phase: "end", commit: true }),
     });
+    chipBottomGrip.classList.add("webui-bridge-prompt-bottom-resizer");
+    chipBottomGrip.setAttribute("aria-label", "拖动调整提示词选择区域高度");
+    chipBottomGrip.title = "拖动调整提示词选择区域高度，双击恢复";
     row = el("div", { class: "webui-bridge-prompt-row" }, [
         el("div", { class: "webui-bridge-prompt-label" }, [
             el("span", {}, label),
@@ -13975,6 +13978,7 @@ function buildPanel(node) {
                     ]),
                     tutorialCard("2. 提示词与标签", "常用", [
                         "左侧写正向和反向提示词，标签区可以搜索、点击、导入和整理。",
+                        "要从出图文件恢复原始提示词，点击顶部“读图提示词”；它只读取图片 metadata，确认后才覆盖选中的正/反向内容。",
                         "Styles、Prompt 工具、翻译来源可以在设置里打开或切换。",
                         "分隔条可上下拖动，双击恢复默认高度。",
                     ]),
@@ -14697,7 +14701,9 @@ function buildPanel(node) {
     const promptImageInput = el("input", {
         type: "file",
         accept: "image/png,image/jpeg,image/webp",
-        style: { display: "none" },
+        class: "webui-bridge-image-prompt-input",
+        "aria-label": "选择要读取提示词的图片",
+        tabindex: "-1",
     });
 
     const showImagePromptImportDialog = (data, fileName = "") => {
@@ -15215,8 +15221,7 @@ function buildPanel(node) {
 
     const toolbar = el("div", { class: "webui-bridge-tools" }, [
         createToolButton("↙", "Read generation parameters from clipboard", pasteParams),
-        createToolButton("图", "从 PNG/JPEG/WebP 图片读取 Bridge 正向/反向 Prompt", readPromptFromImage),
-        promptImageInput,
+        createToolButton("读图", "从 PNG/JPEG/WebP 图片原始 metadata 读取 Bridge 正向/反向 Prompt", readPromptFromImage),
         createToolButton("🗑", "Clear prompt", clearPrompts),
         createToolButton("⇅", "Switch prompt and negative prompt", swapPrompts),
         createToolButton("补", "补全质量词、LoRA触发词和推荐负面词", completePrompt),
@@ -15417,6 +15422,21 @@ function buildPanel(node) {
             },
         );
     positiveDetailGrip.classList.add("webui-bridge-positive-detail-resizer");
+    const positiveAioBottomGrip = createHeightResizeGrip(
+        positiveTagPanel,
+        positiveTagPanel.__webuiBridgeHeightKey,
+        {
+            min: positiveTagPanel.__webuiBridgeMinHeight,
+            max: positiveTagPanel.__webuiBridgeMaxHeight,
+            title: "拖动调整提示词选择区域高度，双击恢复",
+            onDragStart: () => markPromptInnerManualResize(),
+            onDragMove: () => markPromptInnerManualResize(),
+            onDragEnd: () => markPromptInnerManualResize({ commit: true }),
+        },
+    );
+    positiveAioBottomGrip.classList.add("webui-bridge-prompt-bottom-resizer", "webui-bridge-aio-bottom-resizer", "webui-bridge-positive-aio-bottom-resizer");
+    positiveAioBottomGrip.setAttribute("aria-label", "拖动调整提示词选择区域高度");
+    positiveAioBottomGrip.title = "拖动调整提示词选择区域高度，双击恢复";
     const promptPolarityGrip = createHeightSplitGrip(
             positiveTagPanel,
             negative.textarea,
@@ -15481,6 +15501,21 @@ function buildPanel(node) {
                 onDragEnd: () => markPromptInnerManualResize({ commit: true }),
             },
         );
+    const negativeAioBottomGrip = createHeightResizeGrip(
+        negativeTagPanel,
+        negativeTagPanel.__webuiBridgeHeightKey,
+        {
+            min: negativeTagPanel.__webuiBridgeMinHeight,
+            max: negativeTagPanel.__webuiBridgeMaxHeight,
+            title: "拖动调整反向词选择区域高度，双击恢复",
+            onDragStart: () => markPromptInnerManualResize(),
+            onDragMove: () => markPromptInnerManualResize(),
+            onDragEnd: () => markPromptInnerManualResize({ commit: true }),
+        },
+    );
+    negativeAioBottomGrip.classList.add("webui-bridge-prompt-bottom-resizer", "webui-bridge-aio-bottom-resizer", "webui-bridge-negative-aio-bottom-resizer");
+    negativeAioBottomGrip.setAttribute("aria-label", "拖动调整反向词选择区域高度");
+    negativeAioBottomGrip.title = "拖动调整反向词选择区域高度，双击恢复";
     let activePromptWorkspace = readLocalString(PROMPT_WORKSPACE_ACTIVE_KEY, "positive");
     if (!new Set(["positive", "negative"]).has(activePromptWorkspace)) activePromptWorkspace = "positive";
     const promptWorkspaceButtons = new Map();
@@ -15522,10 +15557,12 @@ function buildPanel(node) {
         positive.row,
         positiveDetailGrip,
         positiveTagPanel,
+        positiveAioBottomGrip,
         promptPolarityGrip,
         negative.row,
         negativeDetailGrip,
         negativeTagPanel,
+        negativeAioBottomGrip,
     ]);
     positive.row.classList.add("webui-bridge-positive-prompt-row");
     negative.row.classList.add("webui-bridge-negative-prompt-row");
@@ -15539,10 +15576,20 @@ function buildPanel(node) {
         onCommit: () => markGraphChanged(node),
     };
     promptLoraSplitManual = readLocalNumber(topRowHeightKey, null) !== null ||
-        readLocalNumber(extraHeightKey, null) !== null;
+        readLocalNumber(extraHeightKey, null) !== null ||
+        Number.isFinite(configuredLayoutState?.top_row_height) ||
+        Number.isFinite(configuredLayoutState?.extra_height);
     let extraCollapsed = readLocalBoolean(extraCollapsedKey, false);
     let actionCollapsed = readLocalBoolean(actionCollapsedKey, false);
     let loraOverlayOpen = false;
+    const resetPromptWorkspaceScroll = () => {
+        if (!promptsColumn?.isConnected) return;
+        // A restored node can be shorter than the previous manual layout.  Keep
+        // the prompt workspace at its logical start instead of leaving the
+        // active editor scrolled above its tabs and clipping the first rows.
+        promptsColumn.scrollTop = 0;
+        promptsColumn.scrollLeft = 0;
+    };
     const resetNodeLayoutCache = (options = {}) => {
         const preservePromptTextHeights = Boolean(options.preservePromptTextHeights);
         const keys = [
@@ -15567,6 +15614,7 @@ function buildPanel(node) {
         }
         promptLoraSplitManual = false;
         promptInnerSplitManual = false;
+        resetPromptWorkspaceScroll();
         extraCollapsed = false;
         resetResizeTargetHeight(topRow, topRowHeightKey);
         resetResizeTargetHeight(extraSection, extraHeightKey, "1 1 auto");
@@ -15637,6 +15685,7 @@ function buildPanel(node) {
         type: "button",
         title: "折叠/展开 LoRA 卡片区域",
         onclick: () => {
+            if (!extraCollapsed) captureExpandedPromptLoraSplit();
             extraCollapsed = !extraCollapsed;
             writeLocalBoolean(extraCollapsedKey, extraCollapsed);
             applyExtraCollapsedState();
@@ -15684,6 +15733,21 @@ function buildPanel(node) {
     extraSection.__webuiBridgeHeightKey = extraHeightKey;
     extraSection.__webuiBridgeMinHeight = EXTRA_NETWORKS_MIN_HEIGHT;
     extraSection.__webuiBridgeMaxHeight = EXTRA_NETWORKS_INLINE_MAX_HEIGHT;
+    function captureExpandedPromptLoraSplit() {
+        if (extraCollapsed || loraOverlayOpen) return;
+        const topHeight = resizeTargetLayoutHeight(topRow) || 0;
+        const extraHeight = resizeTargetLayoutHeight(extraSection) || 0;
+        let captured = false;
+        if (readLocalNumber(topRowHeightKey, null) === null && topHeight > 0) {
+            writeLocalNumber(topRowHeightKey, topHeight);
+            captured = true;
+        }
+        if (readLocalNumber(extraHeightKey, null) === null && extraHeight > 0) {
+            writeLocalNumber(extraHeightKey, extraHeight);
+            captured = true;
+        }
+        if (captured) promptLoraSplitManual = true;
+    }
     resizeExtraWithNode = (deltaHeight) => {
         if (!deltaHeight || extraCollapsed || loraOverlayOpen || !extraSection?.isConnected) return;
         const currentHeight = resizeTargetLayoutHeight(extraSection) || EXTRA_NETWORKS_MIN_HEIGHT;
@@ -15693,7 +15757,18 @@ function buildPanel(node) {
         });
         extraSection.style.flex = "0 0 auto";
     };
-    settleManualResizeLayout = () => {
+    settleManualResizeLayout = ({ automatic = false } = {}) => {
+        // Workflow-repair passes run after a graph load and can coincide with
+        // a temporary LoRA collapse.  A saved prompt/LoRA split is the user's
+        // layout authority; do not let an automatic blank-space measurement
+        // turn the collapsed flex height into a new persisted split.
+        // Once the user/workflow has an explicit Prompt–LoRA split, the
+        // generic blank-space settle must not rewrite either side.  Negative
+        // prompt collapse has its own `reclaimLoraSpaceAfterNegativeCollapse`
+        // path (including the `before` snapshot), so letting this follow-up
+        // pass run here would turn a saved 520px LoRA region into 524px just
+        // from border/gap rounding.
+        if (promptLoraSplitManual || negative.row?.classList?.contains("collapsed")) return;
         if (extraCollapsed || loraOverlayOpen || !panel?.isConnected || !extraSection?.isConnected) return;
         window.requestAnimationFrame?.(() => {
             window.requestAnimationFrame?.(() => {
@@ -15768,6 +15843,7 @@ function buildPanel(node) {
         });
     };
     function applyExtraCollapsedState(options = {}) {
+        const wasCollapsed = extraSection.classList.contains("collapsed");
         const preserveExpandedHeight = Boolean(options.preserveExpandedHeight);
         const preservedHeight = preserveExpandedHeight
             ? (resizeTargetLayoutHeight(extraSection) || readLocalNumber(extraHeightKey, null) || 0)
@@ -15786,6 +15862,12 @@ function buildPanel(node) {
         extraSection.style.minHeight = "";
         extraSection.style.maxHeight = "";
         extraSection.style.flex = "0 0 auto";
+        if (wasCollapsed) {
+            applyStoredHeight(topRow, topRowHeightKey, {
+                min: topRow.__webuiBridgeMinHeight || 220,
+                max: topRow.__webuiBridgeMaxHeight || PANEL_MAX_HEIGHT,
+            });
+        }
         if (preserveExpandedHeight && preservedHeight) {
             setResizeTargetHeight(extraSection, extraHeightKey, preservedHeight, {
                 min: EXTRA_NETWORKS_MIN_HEIGHT,
@@ -15906,6 +15988,102 @@ function buildPanel(node) {
         title,
         onclick,
     }, text);
+    const findPromptEditorPosition = () => {
+        const editorWidth = 420;
+        const editorHeight = 360;
+        const gap = 48;
+        const bridgeX = Number(node.pos?.[0]) || 0;
+        const bridgeY = Number(node.pos?.[1]) || 0;
+        const bridgeWidth = Math.max(0, Number(node.size?.[0]) || DEFAULT_PANEL_WIDTH);
+        const baseX = bridgeX + bridgeWidth + 80;
+        const occupied = getGraphNodes().filter((graphNode) => graphNode !== node).map((graphNode) => {
+            const left = Number(graphNode?.pos?.[0]) || 0;
+            const top = Number(graphNode?.pos?.[1]) || 0;
+            const width = Math.max(80, Number(graphNode?.size?.[0]) || 180);
+            const height = Math.max(60, Number(graphNode?.size?.[1]) || 100);
+            return { left, top, right: left + width, bottom: top + height };
+        });
+        const overlapsExistingNode = (x, y) => occupied.some((rect) => (
+            x < rect.right + gap
+            && x + editorWidth > rect.left - gap
+            && y < rect.bottom + gap
+            && y + editorHeight > rect.top - gap
+        ));
+        for (let row = 0; row < 12; row += 1) {
+            for (let column = 0; column < 6; column += 1) {
+                const x = baseX + column * (editorWidth + gap);
+                const y = bridgeY + row * (editorHeight + gap);
+                if (!overlapsExistingNode(x, y)) return [x, y];
+            }
+        }
+        return [baseX + 6 * (editorWidth + gap), bridgeY];
+    };
+    const keepPromptEditorVisible = (editorNode) => {
+        const canvas = app.canvas;
+        const ds = canvas?.ds;
+        const canvasElement = canvas?.canvas || document.querySelector("#graph-canvas");
+        if (!editorNode?.pos || !editorNode?.size || !ds?.offset || !canvasElement) return;
+        const scale = Math.max(0.01, Number(ds.scale) || 1);
+        const deviceScale = Math.max(1, Number(window.devicePixelRatio) || 1);
+        const viewportWidth = Math.max(1, Number(canvasElement.width) || 0) / (scale * deviceScale);
+        const viewportHeight = Math.max(1, Number(canvasElement.height) || 0) / (scale * deviceScale);
+        if (!viewportWidth || !viewportHeight) return;
+        const nodeLeft = Number(editorNode.pos[0]) || 0;
+        const nodeTop = Number(editorNode.pos[1]) || 0;
+        const nodeWidth = Math.max(1, Number(editorNode.size[0]) || 420);
+        const nodeHeight = Math.max(1, Number(editorNode.size[1]) || 360);
+        const margin = Math.max(24, 36 / scale);
+        const visibleLeft = -Number(ds.offset[0] || 0);
+        const visibleTop = -Number(ds.offset[1] || 0);
+        const visibleRight = visibleLeft + viewportWidth;
+        const visibleBottom = visibleTop + viewportHeight;
+        const nextOffset = [Number(ds.offset[0] || 0), Number(ds.offset[1] || 0)];
+        if (nodeWidth <= viewportWidth - margin * 2) {
+            if (nodeLeft < visibleLeft + margin) nextOffset[0] += visibleLeft + margin - nodeLeft;
+            else if (nodeLeft + nodeWidth > visibleRight - margin) nextOffset[0] -= nodeLeft + nodeWidth - (visibleRight - margin);
+        } else {
+            nextOffset[0] = -nodeLeft + margin;
+        }
+        if (nodeHeight <= viewportHeight - margin * 2) {
+            if (nodeTop < visibleTop + margin) nextOffset[1] += visibleTop + margin - nodeTop;
+            else if (nodeTop + nodeHeight > visibleBottom - margin) nextOffset[1] -= nodeTop + nodeHeight - (visibleBottom - margin);
+        } else {
+            nextOffset[1] = -nodeTop + margin;
+        }
+        if (Math.abs(nextOffset[0] - Number(ds.offset[0] || 0)) < 0.5 &&
+            Math.abs(nextOffset[1] - Number(ds.offset[1] || 0)) < 0.5) return;
+        ds.offset[0] = nextOffset[0];
+        ds.offset[1] = nextOffset[1];
+        canvas.setDirty?.(true, true);
+    };
+    const launchPromptEditor = (kind) => {
+        const type = kind === "negative"
+            ? "WebUIPromptBridgeNegativePrompt"
+            : "WebUIPromptBridgePositivePrompt";
+        const config = PROMPT_ONLY_NODES[type];
+        const label = kind === "negative" ? "反向提示词编辑器" : "正向提示词编辑器";
+        const sourceText = kind === "negative" ? negative.textarea.value : positive.textarea.value;
+        const report = { errors: [] };
+        const [x, y] = findPromptEditorPosition();
+        const editorNode = createBridgeModuleGraphNode(type, label, x, y, report);
+        if (!editorNode) {
+            setStatus(report.errors.join("；") || `${label}创建失败，请确认节点已加载并重启 ComfyUI。`, { kind: "error", sticky: true });
+            return;
+        }
+        const promptWidget = getWidget(editorNode, config.widgetName);
+        if (!promptWidget) {
+            app.graph.remove?.(editorNode);
+            setStatus(`${label}缺少 ${config.widgetName} 输入，已取消创建。`, { kind: "error", sticky: true });
+            return;
+        }
+        editorNode.title = label;
+        setWidgetValue(editorNode, config.widgetName, sourceText);
+        markGraphChanged(editorNode);
+        app.canvas?.selectNode?.(editorNode);
+        keepPromptEditorVisible(editorNode);
+        window.requestAnimationFrame?.(() => keepPromptEditorVisible(editorNode));
+        setStatus(`已在主节点右侧创建${label}，并复制当前${kind === "negative" ? "反向" : "正向"} Prompt；现有连线未改动。`, { kind: "success" });
+    };
     const visibilityTargets = [];
     const bindVisibility = (element, key) => {
         if (element && key) {
@@ -15930,6 +16108,17 @@ function buildPanel(node) {
     const tutorialButton = bindVisibility(topControlButton("教程", "查看拖拽、布局、LoRA 和反向提示词使用说明", showBridgeTutorialDialog, "help"), "top_tutorial");
     const webuiButton = bindVisibility(topControlButton("接入 WebUI", "只填写 WebUI 根目录，自动接入 Prompt All in One、TagComplete、styles、LoRA 和模型目录", showWebUIIntegrationDialog), "top_webui");
     quickLoraOverlayButton = bindVisibility(topControlButton("快速添加 LoRA", "打开快速添加 LoRA / LyCORIS 浮层，添加完成后可关闭让节点更紧凑", openLoraOverlay), "top_lora");
+    const imagePromptImportButton = topControlButton(
+        "读图提示词",
+        "从 PNG/JPEG/WebP 图片原始 metadata 读取正向/反向 Prompt；确认后才覆盖当前内容",
+        readPromptFromImage,
+        "prompt-import",
+    );
+    imagePromptImportButton.dataset.imagePromptImport = "true";
+    const positivePromptEditorButton = topControlButton("正向编辑器", "创建正向提示词小节点并复制当前正向 Prompt；不会改动现有连线", () => launchPromptEditor("positive"));
+    positivePromptEditorButton.dataset.promptEditorKind = "positive";
+    const negativePromptEditorButton = topControlButton("反向编辑器", "创建反向提示词小节点并复制当前反向 Prompt；不会改动现有连线", () => launchPromptEditor("negative"));
+    negativePromptEditorButton.dataset.promptEditorKind = "negative";
     const clipField = bindVisibility(el("label", { class: "webui-bridge-top-field", title: "Default LoRA CLIP strength when tag has no third value" }, [
         el("span", {}, "CLIP"),
         clipStrengthInput,
@@ -15945,6 +16134,10 @@ function buildPanel(node) {
         tutorialButton,
         webuiButton,
         quickLoraOverlayButton,
+        imagePromptImportButton,
+        promptImageInput,
+        positivePromptEditorButton,
+        negativePromptEditorButton,
         clipField,
         failOnMissingField,
     ]);
@@ -16109,6 +16302,14 @@ function buildPanel(node) {
         if (extraCollapsed || loraOverlayOpen || !topRow?.isConnected || !extraSection?.isConnected) return false;
         const triggeredByCollapse = before && Number(before.topHeight) > 0 && Number(before.extraHeight) > 0;
         if (!triggeredByCollapse && promptLoraSplitManual) return false;
+        // A collapse event itself establishes the current expanded split as
+        // the user's layout authority.  Even when the released space is too
+        // small to move either section, mark it manual before any later
+        // adaptive pass can treat the collapsed layout as a fresh default.
+        if (triggeredByCollapse) {
+            promptLoraSplitManual = true;
+            holdPromptSplitFit();
+        }
         const currentTop = resizeTargetLayoutHeight(topRow) || 0;
         const currentExtra = resizeTargetLayoutHeight(extraSection) || 0;
         const sourceTop = Number(before?.topHeight || currentTop || 0);
@@ -16325,6 +16526,14 @@ function buildPanel(node) {
         extraSection,
         resizeGrip,
     ]);
+    // A restored LiteGraph DOM widget can retain a stale scroll position even
+    // though the prompt workspace is rebuilt.  Start at the logical top so
+    // the Prompt/标签 and prompt-bottom resize grips cannot be left above the
+    // visible portion of the workspace.
+    resetPromptWorkspaceScroll();
+    window.requestAnimationFrame?.(resetPromptWorkspaceScroll);
+    window.setTimeout?.(resetPromptWorkspaceScroll, 0);
+    panel.__webuiBridgeResetPromptWorkspaceScroll = resetPromptWorkspaceScroll;
     setBridgeLowZoomThreshold(node, state.settings?.zoom_summary_threshold, panel);
     panel.__webuiBridgeUpdateZoomSummary = updateZoomSummary;
     updateZoomSummary();
@@ -16353,10 +16562,15 @@ function buildPanel(node) {
         const sidebarWidth = topRow
             ? Number.parseFloat(getComputedStyle(topRow).getPropertyValue("--webui-bridge-sidebar-width"))
             : null;
+        const storedTopHeight = readLocalNumber(topRowHeightKey, null);
+        const storedExtraHeight = readLocalNumber(extraHeightKey, null);
+        const preferStoredPromptLoraSplit = Boolean(promptLoraSplitManual || extraCollapsed);
         const layoutState = normalizeBridgeLayoutState({
-            top_row_height: layoutHeightForState(topRow, topRowHeightKey),
-            extra_height: extraCollapsed
-                ? (readLocalNumber(extraHeightKey, null) || layoutHeightForState(extraSection, extraHeightKey))
+            top_row_height: preferStoredPromptLoraSplit && storedTopHeight !== null
+                ? storedTopHeight
+                : layoutHeightForState(topRow, topRowHeightKey),
+            extra_height: preferStoredPromptLoraSplit && storedExtraHeight !== null
+                ? storedExtraHeight
                 : layoutHeightForState(extraSection, extraHeightKey),
             extra_collapsed: Boolean(extraCollapsed),
             sidebar_width: Number.isFinite(sidebarWidth) ? sidebarWidth : readLocalNumber(actionWidthKey, null),
@@ -16446,6 +16660,10 @@ function buildPanel(node) {
 
     const fitLoraSectionToVisibleRows = (rows = 1, { force = false, fillAvailable = false } = {}) => {
         if (extraCollapsed || loraOverlayOpen || !extraSection?.isConnected) return;
+        // A stored/manual Prompt–LoRA split is the user's layout authority.
+        // Row fitting is only an initial/default helper and must not silently
+        // grow a user-sized LoRA section after a collapse toggle or redraw.
+        if (!force && promptLoraSplitManual) return;
         if (!force && sectionAutoFitSuspended()) return;
         if (!force && !fillAvailable && (performance?.now?.() || Date.now()) < suppressNodeBottomFitUntil) return;
         const extraRect = extraSection.getBoundingClientRect();
@@ -16723,7 +16941,19 @@ function buildPanel(node) {
         const shouldApplyFreshDefaults = node.__webuiBridgeFreshNode && !node.__webuiBridgeWasConfigured && !nodeHasSavedUserBridgePanelSize(node);
         state.settings = data.settings;
         setBridgeLowZoomThreshold(node, state.settings?.zoom_summary_threshold, panel);
-        const loadedPreset = rememberBridgeLayoutPreset(state.settings?.layout_preset);
+        // A fresh node captures the local preset synchronously in
+        // `onNodeCreated`.  The settings request can finish later and must
+        // not replace that choice mid-initialisation (which otherwise makes a
+        // new 920x680 compact node jump to the server's default 1180x1060
+        // size).  Existing/configured nodes still follow the saved backend
+        // preset as before.
+        const loadedPreset = shouldApplyFreshDefaults
+            ? normalizeBridgeLayoutPreset(node.__webuiBridgeInitialLayoutPreset || state.settings?.layout_preset)
+            : rememberBridgeLayoutPreset(state.settings?.layout_preset);
+        if (shouldApplyFreshDefaults) {
+            state.settings = { ...state.settings, layout_preset: loadedPreset };
+            rememberBridgeLayoutPreset(loadedPreset);
+        }
         node.__webuiBridgeInitialLayoutPreset = loadedPreset;
         state.customTagCount = data.customTagCount;
         state.promptLibrary = data.promptLibrary;
@@ -16758,6 +16988,8 @@ function buildPanel(node) {
         }
         positiveTagPanel.__webuiBridgeRender?.();
         negativeTagPanel.__webuiBridgeRender?.();
+        resetPromptWorkspaceScroll();
+        window.requestAnimationFrame?.(resetPromptWorkspaceScroll);
         if (data.loadErrors?.length) {
             const summary = data.loadErrors.map((item) => `${item.label}: ${item.message}`).join("；");
             setStatus(`部分数据读取失败：${summary}`, { kind: "warning", sticky: true });
@@ -16792,6 +17024,7 @@ function installWebUIPanel(node) {
         if (usablePanel && !needsConfiguredLayoutRebuild) {
             repairBridgeNodeWidgetDefaults(node);
             node.__webuiBridgePanel.style.display = "";
+            node.__webuiBridgePanel.__webuiBridgeResetPromptWorkspaceScroll?.();
             const desired = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
             pinBridgeDomWidgetToTop(node, existingWidget);
             node.__webuiBridgeApplyDomWidgetSize?.(desired[0], desired[1]);
@@ -17241,6 +17474,19 @@ function addStyles() {
             border-color: rgba(193, 165, 255, .9);
             background: linear-gradient(180deg, #5a3f95, #33285d);
         }
+        .webui-bridge-top-control.prompt-import {
+            border-color: rgba(117, 212, 177, .92);
+            background: linear-gradient(180deg, #176b63, #12463f);
+        }
+        .webui-bridge-image-prompt-input {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            margin: -1px;
+            opacity: 0;
+            pointer-events: none;
+            overflow: hidden;
+        }
         .webui-bridge-top-control:hover,
         .webui-bridge-side-toggle:hover {
             border-color: #d5e5ff;
@@ -17483,11 +17729,90 @@ function addStyles() {
         }
         .webui-bridge-split-resizer {
             position: relative;
-            z-index: 2;
+            /* Keep the inner Prompt/标签 grips above adjacent scrollable panels.
+             * LiteGraph's DOM-widget shell and the AIO panels can otherwise
+             * paint over the grip after a workflow is restored or resized,
+             * making the lower edge impossible to drag. */
+            z-index: 30;
+            pointer-events: auto;
+            isolation: isolate;
+        }
+        .webui-bridge-prompt-bottom-resizer {
+            position: relative;
+            z-index: 32;
+            flex: 0 0 16px;
+            min-height: 16px;
+            margin: -1px 0 0;
+            border-top: 2px solid rgba(112, 143, 190, .78);
+            border-bottom: 2px solid rgba(30, 38, 52, .95);
+            border-radius: 3px;
+            background:
+                linear-gradient(to bottom, rgba(106, 163, 255, .12), rgba(20, 31, 49, .3)),
+                repeating-linear-gradient(90deg, transparent 0 7px, rgba(134, 170, 220, .58) 7px 9px, transparent 9px 16px);
+            cursor: ns-resize;
+            pointer-events: auto;
+            isolation: isolate;
+            box-shadow:
+                0 -2px 8px rgba(0, 0, 0, .2),
+                0 2px 8px rgba(0, 0, 0, .18),
+                inset 0 0 0 1px rgba(142, 183, 255, .1);
+        }
+        .webui-bridge-aio-bottom-resizer {
+            flex-basis: 18px;
+            min-height: 18px;
+            position: sticky;
+            bottom: 0;
+            margin-top: 0;
+            z-index: 34;
+        }
+        .webui-bridge-prompt-bottom-resizer::after {
+            content: "拖动调节选择区";
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            max-width: calc(100% - 18px);
+            padding: 0 7px;
+            border: 1px solid rgba(117, 163, 255, .66);
+            border-radius: 999px;
+            background: rgba(22, 48, 82, .9);
+            color: #dbeafe;
+            font-size: 9px;
+            font-weight: 700;
+            line-height: 12px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            pointer-events: none;
+        }
+        .webui-bridge-aio-bottom-resizer::after {
+            content: "拖动调节卡片区";
+        }
+        .webui-bridge-prompt-bottom-resizer:hover,
+        .webui-bridge-prompt-bottom-resizer.dragging {
+            border-top-color: rgba(156, 194, 255, .95);
+            background:
+                linear-gradient(to bottom, rgba(106, 163, 255, .22), rgba(20, 47, 82, .28)),
+                repeating-linear-gradient(90deg, transparent 0 7px, rgba(176, 208, 255, .9) 7px 9px, transparent 9px 16px);
+            box-shadow:
+                inset 0 0 0 1px rgba(148, 194, 255, .28),
+                0 0 0 1px rgba(84, 142, 230, .24);
+        }
+        .webui-bridge-positive-detail-resizer,
+        .webui-bridge-negative-detail-resizer,
+        .webui-bridge-negative-main-resizer {
+            position: relative;
+            z-index: 31;
+            pointer-events: auto;
         }
         .webui-bridge-split-resizer.has-label {
             flex-basis: 14px;
             min-height: 14px;
+        }
+        .webui-bridge-positive-detail-resizer,
+        .webui-bridge-negative-detail-resizer {
+            flex-basis: 18px;
+            min-height: 18px;
         }
         .webui-bridge-resizer-label {
             pointer-events: none;
@@ -17806,9 +18131,11 @@ function addStyles() {
         .webui-bridge-prompts:not(.show-negative-workspace) > .webui-bridge-negative-prompt-row,
         .webui-bridge-prompts:not(.show-negative-workspace) > .webui-bridge-negative-detail-resizer,
         .webui-bridge-prompts:not(.show-negative-workspace) > .webui-bridge-aio-negative,
+        .webui-bridge-prompts:not(.show-negative-workspace) > .webui-bridge-negative-aio-bottom-resizer,
         .webui-bridge-prompts.show-negative-workspace > .webui-bridge-positive-prompt-row,
         .webui-bridge-prompts.show-negative-workspace > .webui-bridge-positive-detail-resizer,
         .webui-bridge-prompts.show-negative-workspace > .webui-bridge-aio-positive,
+        .webui-bridge-prompts.show-negative-workspace > .webui-bridge-positive-aio-bottom-resizer,
         .webui-bridge-prompts.show-negative-workspace > .webui-bridge-negative-main-resizer {
             display: none !important;
         }
@@ -17828,7 +18155,8 @@ function addStyles() {
                 inset 0 0 0 1px rgba(234, 220, 255, .12);
         }
         .webui-bridge-prompts.negative-collapsed .webui-bridge-negative-detail-resizer,
-        .webui-bridge-prompts.negative-collapsed .webui-bridge-aio-negative {
+        .webui-bridge-prompts.negative-collapsed .webui-bridge-aio-negative,
+        .webui-bridge-prompts.negative-collapsed .webui-bridge-negative-aio-bottom-resizer {
             display: none;
         }
         .webui-bridge-prompts.negative-collapsed .webui-bridge-aio-positive {
@@ -19410,6 +19738,7 @@ function addStyles() {
             max-height: none;
             display: flex;
             flex-direction: column;
+            box-sizing: border-box;
             border: 2px solid #46556c;
             border-radius: 4px;
             overflow: hidden;
@@ -19522,6 +19851,9 @@ function addStyles() {
             min-height: 42px !important;
             height: 42px !important;
             max-height: 42px !important;
+        }
+        .webui-bridge-panel:has(.webui-bridge-extra.collapsed) .webui-bridge-toprow {
+            flex: 1 1 auto !important;
         }
         .webui-bridge-panel.lora-overlay .webui-bridge-extra {
             position: absolute;
