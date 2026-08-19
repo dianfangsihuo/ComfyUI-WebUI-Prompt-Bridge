@@ -78,13 +78,32 @@ CheckpointLoaderSimple
 
 默认 `denoise` 是 `0.45`，适合保留原图构图并按提示词重绘。想更贴近原图就调低，例如 `0.25`；想变化更大就调高，例如 `0.65`。打开工作流后，先在 `Input Image` 节点选择 `D:\ComfyUI\input` 里的图片，或直接把图片拖进 ComfyUI。
 
+## 加入图片并读取图片提示词
+
+如果你只是想找回以前出图时使用的提示词，不需要进入图生图流程：
+
+1. 在 `WebUI Prompt Bridge` 主节点顶部点击 **“读图提示词”**。
+2. 选择一张以前生成的 PNG、JPEG 或 WebP 图片。
+3. 在候选窗口中选择要读取的 Bridge Prompt。
+4. 选择“只覆盖正向”“只覆盖反向”或“同时覆盖正反向”。
+5. 确认后再应用到当前节点。
+
+Bridge 会优先读取 ComfyUI 图片 metadata 中保存的主节点或正/负向提示词小节点内容，并兼容 A1111 / WebUI `parameters`。图片里有多个 Bridge 时会保留多个候选，不会擅自选择和覆盖。
+
+请注意：
+
+- **读图提示词**只恢复图片 metadata 里的 Prompt，不会恢复模型、Seed、采样器、节点或连线。
+- **图生图 / 局部重绘**才会把图片像素送入生成链路，需要连接 `VAEEncode -> KSampler latent_image`，或使用主节点里的“一键接入图生图链路”。
+- 没有生成 metadata 的普通图片无法读出原始提示词，但仍然可以作为图生图输入。
+
 ## 使用步骤
 
 1. 确认已经安装并重启 ComfyUI。
 2. 把需要的模型放到 ComfyUI 对应模型目录。
 3. 在 ComfyUI 页面中拖入其中一个教程 JSON。
 4. 在 `WebUI Prompt Bridge` 节点里编辑正向词、反向词或 LoRA。
-5. 点击 Bridge 面板右上角的 `Generate`，或者使用 ComfyUI 自带运行按钮。
+5. 如果要恢复旧图片提示词，点击主节点顶部的“读图提示词”；如果要图生图，则检查 KSampler 的 `latent_image` 是否已接入 VAE Encode。
+6. 点击 Bridge 面板右上角的 `Generate`，或者使用 ComfyUI 自带运行按钮。
 
 ## 教程重点
 

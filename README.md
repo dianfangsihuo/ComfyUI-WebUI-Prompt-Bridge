@@ -17,18 +17,15 @@ Bridge 现在更像一个完整的提示词工作台：常用的提示词编辑�
 
 新用户可以先从中文最小工作流教程开始：`docs/tutorial-minimal-workflows.md`。教程分别演示 Anima 分体模型、XL 整合 checkpoint 和 XL 图生图的最小接线，并配有截图和可直接拖入 ComfyUI 的 JSON 工作流。
 
-## 最新更新：v0.4.29
+## 最新更新：v0.4.30
 
-- **分体 UNET 可直接切换**：模型列表正式读取 `diffusion_models`，只修改当前 Bridge 对应的 `UNETLoader`，不替换 Text Encoder、VAE 或工作流连线。
-- **图片 Prompt 可安全读回**：支持从 PNG/JPEG/WebP 读取 Bridge 正向/反向 Prompt；多候选和覆盖字段都必须在确认窗口中选择。
-- **提示词区域更容易调整**：修复底部分隔条被其他面板遮住的问题，并新增清晰可见的卡片区拖拽条，提示词、标签和 LoRA 区域都能正常调整高度。
-- **布局恢复更稳定**：折叠/展开 LoRA 不会再被自动空白回收改写 Prompt/LoRA 分栏；展开和保存工作流时沿用原先的分栏高度，工作流恢复后提示词滚动位置也会回到顶部。
-- **Tag 位置可精确微调**：多行标签支持按视觉行定位拖放，主节点支持 Ctrl 多选整体移动，主节点和提示词小节点都可用按钮或 `Alt+←/→` 前后微调。
-- **收藏分类与大库性能**：收藏支持父级/子级分类和拖放归类；2000+ 收藏按 100 条分页，全库搜索后再分页，分类批量操作只发起一次请求。
+- **提示词输入更跟手**：跳过未变化控件的重复回写，连续输入时合并卡片刷新和工作流状态提交，避免每个字符都克隆整份工作流。
+- **拖动与缩放更流畅**：节点宽高、侧栏和区域分隔条在拖动期间只更新界面，结束时统一保存布局。
+- **端口标签更轻量**：静止画布不再每帧扫描节点和覆盖层；平移、缩放和节点移动时仍会平滑跟随。
+- **提示词小节点同步优化**：正向、反向提示词小节点也会合并连续输入期间的卡片重建和工作流通知。
+- **文档补全**：新增 [完整功能说明](docs/feature-reference.md)，并明确“读图提示词”和“图生图 / 局部重绘”是两条独立流程。
 
-收藏父级/子级分类由社区贡献者 [@sfcsen](https://github.com/sfcsen) 在 [PR #7](https://github.com/dianfangsihuo/ComfyUI-WebUI-Prompt-Bridge/pull/7) 中贡献，本版本在保留其提交作者信息的基础上完成兼容、批量接口、分页和回归适配。
-
-完整细节见 [CHANGELOG.md](CHANGELOG.md) 和 [v0.4.29 发布说明](docs/release-notes-v0.4.29.md)。更新后请重启 ComfyUI，并按 `Ctrl+F5` 强制刷新浏览器页面。
+完整细节见 [CHANGELOG.md](CHANGELOG.md) 和 [v0.4.30 发布说明](docs/release-notes-v0.4.30.md)。更新后请重启 ComfyUI，并按 `Ctrl+F5` 强制刷新浏览器页面。
 
 ## v0.4.x 更新概要
 
@@ -75,6 +72,10 @@ v0.4.x 的更新可以概括为一句话：Bridge 已从提示词输入节点升
 - **样式和布局内置**：尺寸快捷、布局预设和显示/隐藏设置默认放在主节点侧栏里；Styles 起手式可在设置里按需显示。
 - **生成前检查**：提交前检查空数字参数、Prompt/Negative 放反、悬空连接等常见问题，并尽量自动修复。
 - **WebUI 数据桥接**：可以复用本机 WebUI 扩展里的标签、收藏、翻译配置和样式。
+
+更细的功能说明、全部辅助节点和高级模块能力边界，请看 [WebUI Prompt Bridge 完整功能说明](docs/feature-reference.md)。
+
+其中“读图提示词”和“图生图 / 局部重绘”是两个独立功能：前者从图片 metadata 找回正反 Prompt，后者把图片作为实际生成输入。只想恢复以前图片中的提示词时，不需要接 VAE Encode 或 KSampler。
 
 ## 推荐工作流
 
@@ -305,6 +306,10 @@ https://registry.comfy.org/nodes/comfyui-webui-prompt-bridge
 
 ## 常见问题
 
+**怎么从以前生成的图片里找回提示词？**
+
+点击主节点顶部的 `读图提示词`，选择 PNG、JPEG 或 WebP 图片，然后在确认窗口中选择 Prompt 候选和覆盖方向。Bridge 会读取图片原始 metadata，并兼容 A1111 / WebUI `parameters`；它只恢复正反 Prompt，不会修改模型、Seed、采样器、节点或连线。这个入口和“图生图 / 局部重绘”不同，单纯读提示词不需要连接 VAE Encode 或 KSampler。
+
 **为什么我写了 LoRA 但没有效果？**
 
 先确认 LoRA 文件真的在 ComfyUI 的 `models/loras` 目录里，并且名字能被节点匹配到。开启 `Missing LoRA stops` 后，找不到 LoRA 会直接报错，方便定位问题。
@@ -333,7 +338,7 @@ ComfyUI WebUI Prompt Bridge is a WebUI-style prompt workspace for ComfyUI. It co
 
 The default UI stays clean for everyday prompt editing, model switching, image size controls and LoRA browsing. Regional controls and advanced helpers such as ADetailer, ControlNet, SAM/Inpaint, Mask and upscale workflows can be shown only when needed. Advanced helper panels can also build external workflow nodes and connect the known Bridge outputs automatically.
 
-The repository includes a recommended Anima workflow and minimal tutorial workflows for Anima, XL txt2img and XL img2img. The included workflows have been updated for the v0.4.0 Bridge schema.
+The repository includes a recommended Anima workflow, a detailed feature reference, and minimal tutorial workflows for Anima, XL txt2img and XL img2img. The included workflows have been updated for the current v0.4.30 Bridge schema.
 
 ## License
 
