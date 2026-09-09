@@ -5104,22 +5104,37 @@ def _conditioning_set_values(conditioning, values):
     return result
 
 
-def _conditioning_set_area(conditioning, cell, strength):
+def _regional_latent_dimensions(model):
+    # ModelPatcher preserves this property through LoRA/model clones.
+    if model is None:
+        return 2
+    latent_format = model.get_model_object("latent_format")
+    dimensions = getattr(latent_format, "latent_dimensions", 2)
+    if dimensions not in (2, 3):
+        raise ValueError(f"Regional image conditioning does not support {dimensions}D latents")
+    return dimensions
+
+
+def _conditioning_set_area(conditioning, cell, strength, latent_dimensions=2):
+    # ComfyUI expects all sizes followed by all offsets. Anima uses T,H,W
+    # even for still images; cover the full temporal axis, not just H,W.
+    sizes = (1.0,) * (latent_dimensions - 2) + (cell["height"], cell["width"])
+    offsets = (0.0,) * (latent_dimensions - 2) + (cell["y"], cell["x"])
     return _conditioning_set_values(conditioning, {
-        "area": ("percentage", cell["height"], cell["width"], cell["y"], cell["x"]),
+        "area": ("percentage",) + sizes + offsets,
         "strength": strength,
         "set_area_to_bounds": False,
     })
 
 
-def _regional_encode(clip, text, cell=None, strength=1.0):
+def _regional_encode(clip, text, cell=None, strength=1.0, latent_dimensions=2):
     conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(text or ""))
     if cell is None:
         return _conditioning_set_values(conditioning, {"strength": strength})
-    return _conditioning_set_area(conditioning, cell, strength)
+    return _conditioning_set_area(conditioning, cell, strength, latent_dimensions)
 
 
-def _build_regional_conditioning(clip, positive_text, negative_text, split, ratios, base_enabled, common_enabled, base_ratio, strength):
+def _build_regional_conditioning(clip, positive_text, negative_text, split, ratios, base_enabled, common_enabled, base_ratio, strength, model=None):
     positive_parts = _regional_prepare_prompt_parts(positive_text, base_enabled, common_enabled)
     regions = positive_parts["regions"]
     if len(regions) <= 1 and not positive_parts["base_enabled"]:
@@ -5136,11 +5151,12 @@ def _build_regional_conditioning(clip, positive_text, negative_text, split, rati
     strength = max(0.0, _regional_float(strength, 1.0))
     region_strength = strength * max(0.0, 1.0 - base_ratio if positive_parts["base_enabled"] else 1.0)
 
+    latent_dimensions = _regional_latent_dimensions(model)
     positive = []
     if positive_parts["base_enabled"] and base_ratio > 0:
         positive.extend(_regional_encode(clip, positive_parts["base"], None, base_ratio * strength))
     for region, cell in zip(regions, cells):
-        positive.extend(_regional_encode(clip, region, cell, region_strength))
+        positive.extend(_regional_encode(clip, region, cell, region_strength, latent_dimensions))
 
     negative_regions = _regional_prepare_negative_parts(negative_text, region_count)
     if len(set(negative_regions)) == 1:
@@ -5148,7 +5164,7 @@ def _build_regional_conditioning(clip, positive_text, negative_text, split, rati
     else:
         negative = []
         for region, cell in zip(negative_regions, cells):
-            negative.extend(_regional_encode(clip, region, cell, 1.0))
+            negative.extend(_regional_encode(clip, region, cell, 1.0, latent_dimensions))
 
     return {
         "positive": positive,
@@ -5630,6 +5646,7 @@ class WebUIPromptBridge:
                         regional_common_enabled,
                         regional_base_ratio,
                         regional_strength,
+                        model=model,
                     )
                 except Exception as error:
                     regional_info = {"warning": f"Regional conditioning disabled: {error}"}
