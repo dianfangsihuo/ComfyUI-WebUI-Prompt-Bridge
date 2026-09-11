@@ -17,13 +17,13 @@ Bridge 现在更像一个完整的提示词工作台：常用的提示词编辑�
 
 新用户可以先从中文最小工作流教程开始：`docs/tutorial-minimal-workflows.md`。教程分别演示 Anima 分体模型、XL 整合 checkpoint 和 XL 图生图的最小接线，并配有截图和可直接拖入 ComfyUI 的 JSON 工作流。
 
-## 最新更新：v0.4.31
+## 最新更新：v0.4.32
 
-- **修复区域控制报错**：解决 Anima 工作流开启区域提示词后，KSampler 提示 `tuple index out of range` 的问题。
-- **自动适配模型**：根据模型生成正确的区域参数，不需要手动补参数或重新连接工作流；保留 SDXL 的二维区域逻辑。
-- **补充实际验证**：已测试区域二采、四图批量、网格分区，以及 FaceDetailer 精修接 SeedVR2 放大。具体范围见发布说明。
+- **接入 WebUI 更省心**：改善本机地址兼容，接入失败时提供清楚的中文原因与处理建议。
+- **调整参数减少重复处理**：优化区域控制和高级模块的多参数同步，参数仍即时生效。
+- **无需重建工作流**：现有节点接口、模型接线和已保存参数继续沿用。
 
-更新后请**重启 ComfyUI**，再按 `Ctrl+F5` 刷新页面。详情见 [v0.4.31 发布说明](docs/release-notes-v0.4.31.md) 和 [更新日志](CHANGELOG.md)。
+更新后请**重启 ComfyUI**，再按 `Ctrl+F5` 刷新页面。详情见 [v0.4.32 发布说明](docs/release-notes-v0.4.32.md) 和 [更新日志](CHANGELOG.md)。
 
 ## v0.4.x 更新概要
 
@@ -303,6 +303,10 @@ https://registry.comfy.org/nodes/comfyui-webui-prompt-bridge
 这样可以避免一个很常见的问题：提示词里写了 LoRA，但实际模型根本没加载。
 
 ## 常见问题
+
+**一键接入提示 `Untrusted host or cross-origin request` 怎么办？**
+
+这个提示发生在检查 WebUI 根目录之前，所以自动检测和手动填写都会得到同样结果。先用 `http://127.0.0.1:8188` 直接打开 ComfyUI，确保页面和后端全程使用同一个主机名与端口，再点一键接入。通过自定义域名或反向代理访问时，把域名加入 `WEBUI_PROMPT_BRIDGE_ALLOWED_HOSTS`，并让代理正确转发 `Host`、`Origin` 和 `Referer` 后重启 ComfyUI。Bridge 自身也兼容 `0.0.0.0`、IPv6 回环和 IPv4 映射回环等本机地址别名，但不同版本的 ComfyUI 仍可能要求请求头中的地址完全一致，因此优先推荐 `127.0.0.1`。
 
 **怎么从以前生成的图片里找回提示词？**
 

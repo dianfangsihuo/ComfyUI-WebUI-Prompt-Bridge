@@ -87,6 +87,65 @@ SPEC.loader.exec_module(NODES)
 
 class PromptLibraryTests(unittest.TestCase):
     @staticmethod
+    def _request(headers):
+        return types.SimpleNamespace(headers=headers)
+
+    def test_same_origin_accepts_local_aliases_and_lan_ip(self):
+        accepted_headers = (
+            {"Host": "127.0.0.1:8188", "Origin": "http://localhost:8188"},
+            {"Host": "0.0.0.0:8188", "Origin": "http://127.0.0.1:8188"},
+            {"Host": "[::]:8188", "Origin": "http://[::1]:8188"},
+            {"Host": "[::ffff:127.0.0.1]:8188", "Origin": "http://localhost:8188"},
+            {"Host": "192.168.1.20:8188", "Origin": "http://192.168.1.20:8188"},
+        )
+        for headers in accepted_headers:
+            with self.subTest(headers=headers):
+                self.assertTrue(NODES._validate_same_origin_request(self._request(headers)))
+
+    def test_same_origin_rejects_untrusted_domains_and_mismatched_ports(self):
+        rejected_headers = (
+            {"Host": "comfy.example.com", "Origin": "https://comfy.example.com"},
+            {"Host": "127.0.0.1:8188", "Origin": "http://localhost:8189"},
+            {"Host": "127.0.0.1:8188", "Origin": "null"},
+            {"Host": "127.0.0.1:8188", "Origin": "http://loopback:8188"},
+            {"Host": "127.0.0.1:8188", "Origin": "http://evil.example:8188"},
+            {"Host": "127.0.0.1:8188", "Referer": "http://evil.example:8188/path?token=hidden"},
+            {"Host": "[::1", "Origin": "http://[::1]:8188"},
+            {"Host": "127.0.0.1:8188", "Origin": "http://[::1"},
+        )
+        with mock.patch.dict(os.environ, {"WEBUI_PROMPT_BRIDGE_ALLOWED_HOSTS": ""}):
+            NODES._trusted_request_hosts.cache_clear()
+            try:
+                for headers in rejected_headers:
+                    with self.subTest(headers=headers):
+                        self.assertFalse(NODES._validate_same_origin_request(self._request(headers)))
+            finally:
+                NODES._trusted_request_hosts.cache_clear()
+
+    def test_same_origin_accepts_explicitly_allowed_domain(self):
+        request = self._request({
+            "Host": "comfy.example.com",
+            "Origin": "https://comfy.example.com",
+        })
+        with mock.patch.dict(os.environ, {"WEBUI_PROMPT_BRIDGE_ALLOWED_HOSTS": "comfy.example.com"}):
+            NODES._trusted_request_hosts.cache_clear()
+            try:
+                self.assertTrue(NODES._validate_same_origin_request(request))
+            finally:
+                NODES._trusted_request_hosts.cache_clear()
+
+    def test_same_origin_failure_reports_actionable_reason(self):
+        request = self._request({
+            "Host": "127.0.0.1:8188",
+            "Origin": "http://localhost:8189",
+        })
+        valid, reason, host, source = NODES._same_origin_request_result(request)
+        self.assertFalse(valid)
+        self.assertEqual(reason, "origin_mismatch")
+        self.assertEqual(host, "127.0.0.1:8188")
+        self.assertEqual(source, "localhost:8189")
+
+    @staticmethod
     def _png_bytes(metadata=None):
         output = io.BytesIO()
         pnginfo = PngImagePlugin.PngInfo()

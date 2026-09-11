@@ -1,0 +1,23 @@
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
+import assert from 'node:assert/strict';
+
+const source = readFileSync(new URL('../web/webui_prompt_bridge.js', import.meta.url), 'utf8');
+const code = source.slice(source.indexOf('function setWidgetValue('), source.indexOf('function sanitizeBridgeWidgetValue('));
+let captures = 0;
+let callbacks = 0;
+const node = { widgets: [{ name: 'a', value: 0, callback: () => callbacks++ }, { name: 'b', value: 0, callback: () => callbacks++ }] };
+const context = vm.createContext({ getWidget: (n, name) => n.widgets.find(w => w.name === name), markGraphChanged: () => captures++ });
+vm.runInContext(code, context);
+context.batchBridgeWidgetUpdates(node, set => { set('a', 1); set('b', 2); });
+assert.equal(captures, 1);
+assert.equal(callbacks, 2);
+assert.deepEqual(node.widgets.map(w => w.value), [1, 2]);
+context.batchBridgeWidgetUpdates(node, set => { set('a', 1); set('b', 2); set('missing', 3); });
+assert.equal(captures, 1);
+assert.equal(callbacks, 2);
+assert.throws(() => context.batchBridgeWidgetUpdates(node, set => { set('a', 3); throw Error('test'); }));
+assert.equal(captures, 2);
+context.setWidgetValue(node, 'a', 4);
+assert.equal(captures, 3);
+console.log('Widget batch: synchronous values, callbacks, no-op, exception and standalone behavior passed.');

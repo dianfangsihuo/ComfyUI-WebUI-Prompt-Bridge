@@ -41,3 +41,6 @@ jobs:
           cp web/webui_prompt_bridge.js "$RUNNER_TEMP/webui_prompt_bridge.mjs"
           node --check "$RUNNER_TEMP/webui_prompt_bridge.mjs"
           node --check tools/verify_frontend_compat.mjs
+
+      - name: Test widget batch updates
+        run: node tools/test_widget_batch.mjs

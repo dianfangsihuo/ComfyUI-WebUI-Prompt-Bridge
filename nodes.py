@@ -1511,22 +1511,50 @@ def _normalize_request_host(value):
     raw = str(value or "").split(",", 1)[0].strip()
     if not raw:
         return "", None
-    parsed = urlparse(raw if "://" in raw else f"//{raw}", scheme="http")
-    host = (parsed.hostname or "").strip().lower().rstrip(".")
     try:
+        parsed = urlparse(raw if "://" in raw else f"//{raw}", scheme="http")
+        host = (parsed.hostname or "").strip().lower().rstrip(".")
         port = parsed.port
     except ValueError:
-        port = None
+        return "", None
     return host, port
+
+
+def _request_host_alias(host):
+    host = str(host or "").strip().casefold().rstrip(".")
+    if not host:
+        return ""
+    if host in {"localhost", "localhost.localdomain", "0.0.0.0", "::"}:
+        return "::1"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if address.is_loopback or (
+        isinstance(address, ipaddress.IPv6Address)
+        and address.ipv4_mapped is not None
+        and address.ipv4_mapped.is_loopback
+    ):
+        return "::1"
+    return address.compressed
+
+
+def _format_request_authority(host, port):
+    host = str(host or "").strip().casefold().rstrip(".")
+    if not host:
+        return ""
+    display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"{display_host}:{port}" if port is not None else display_host
 
 
 def _hosts_same_origin(request_host, request_port, source_host, source_port):
     if not request_host or not source_host:
         return False
-    if request_host == source_host and request_port == source_port:
-        return True
-    loopback_hosts = {"localhost", "127.0.0.1", "::1"}
-    return request_host in loopback_hosts and source_host in loopback_hosts and request_port == source_port
+    ports_match = request_port == source_port
+    return (
+        _request_host_alias(request_host) == _request_host_alias(source_host)
+        and ports_match
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -1556,18 +1584,25 @@ def _request_host_is_trusted(host):
         return host in _trusted_request_hosts()
 
 
-def _validate_same_origin_request(request):
+def _same_origin_request_result(request):
     host, port = _normalize_request_host(request.headers.get("Host", ""))
+    display_host = _format_request_authority(host, port)
     if not _request_host_is_trusted(host):
-        return False
+        return False, "untrusted_host", display_host, ""
     for header in ("Origin", "Referer"):
         value = request.headers.get(header, "")
         if not value:
             continue
         source_host, source_port = _normalize_request_host(value)
+        if not value.lower().startswith(("http://", "https://")) or not source_host:
+            return False, "invalid_origin", display_host, ""
         if not _hosts_same_origin(host, port, source_host, source_port):
-            return False
-    return True
+            return False, "origin_mismatch", display_host, _format_request_authority(source_host, source_port)
+    return True, "", display_host, ""
+
+
+def _validate_same_origin_request(request):
+    return _same_origin_request_result(request)[0]
 
 
 def _validate_opened_image(image):
@@ -6684,9 +6719,29 @@ def _register_routes():
     routes = prompt_server.routes
 
     def reject_cross_origin(request):
-        if _validate_same_origin_request(request):
+        valid, reason, host, source = _same_origin_request_result(request)
+        if valid:
             return None
-        return web.json_response({"error": "Untrusted host or cross-origin request"}, status=403)
+        if reason == "untrusted_host":
+            message = (
+                f"请求地址 {host or '未知'} 未被信任。请直接使用 http://127.0.0.1:8188 或 "
+                "http://localhost:8188 打开 ComfyUI；自定义域名请加入 "
+                "WEBUI_PROMPT_BRIDGE_ALLOWED_HOSTS 后重启 ComfyUI。"
+            )
+        elif reason == "origin_mismatch":
+            message = (
+                f"页面来源 {source or '未知'} 与 ComfyUI 地址 {host or '未知'} 不一致。"
+                "请让页面和后端全程使用同一个地址写法（建议都用 127.0.0.1）；"
+                "使用反向代理时请正确转发 Host、Origin 和 Referer。"
+            )
+        else:
+            message = "页面来源格式无效。请在 ComfyUI 页面内操作，并优先使用 http://127.0.0.1:8188 打开。"
+        return web.json_response({
+            "error": message,
+            "code": reason,
+            "request_host": host,
+            "source": source,
+        }, status=403)
 
     def protected_route(method, path):
         register = getattr(routes, method)

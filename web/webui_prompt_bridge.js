@@ -3108,6 +3108,21 @@ function setWidgetValue(node, name, value, { markChanged = true } = {}) {
     return true;
 }
 
+// Keep values/callbacks synchronous, but capture the workflow once per control group.
+function batchBridgeWidgetUpdates(node, update) {
+    let changed = false;
+    const set = (name, value) => {
+        const didChange = setWidgetValue(node, name, value, { markChanged: false });
+        changed = didChange || changed;
+        return didChange;
+    };
+    try {
+        update(set);
+    } finally {
+        if (changed) markGraphChanged(node);
+    }
+}
+
 function sanitizeBridgeWidgetValue(name, value) {
     const definition = BRIDGE_WIDGET_DEFINITION_BY_NAME[name];
     if (!definition) return value;
@@ -7467,10 +7482,18 @@ async function fetchWebUIIntegration(options = {}) {
     );
     if (!response.ok) {
         if (response.status === 404) throw new Error("后端接口未加载，请重启 ComfyUI 后再打开一键接入");
-        const { message } = await readBridgeResponse(response, `读取 WebUI 接入状态失败 (${response.status})`);
+        const { data, message } = await readBridgeResponse(response, `读取 WebUI 接入状态失败 (${response.status})`);
+        if (response.status === 403) {
+            throw new Error(data?.code ? message : webUIIntegrationOriginHelp());
+        }
         throw new Error(message);
     }
     return response.json();
+}
+
+function webUIIntegrationOriginHelp() {
+    return "页面地址校验未通过，这和 WebUI 根目录无关。请让页面和后端全程使用同一个地址，"
+        + "建议用 http://127.0.0.1:8188 重新打开 ComfyUI；自定义域名/反向代理请配置允许域名并正确转发请求头。";
 }
 
 async function connectWebUIRoot(webuiRoot, autoDetect = false, options = {}) {
@@ -7488,6 +7511,7 @@ async function connectWebUIRoot(webuiRoot, autoDetect = false, options = {}) {
     const { data, message, text } = await readBridgeResponse(response, `WebUI 接入失败 (${response.status})，请确认选择的是 WebUI 根目录`);
     if (!response.ok) {
         if (response.status === 404) throw new Error("后端接口未加载，请重启 ComfyUI 后再点一键接入");
+        if (response.status === 403) throw new Error(data?.code ? message : webUIIntegrationOriginHelp());
         throw new Error(message || text || `WebUI 接入失败 (${response.status})，请确认选择的是 WebUI 根目录`);
     }
     return data;
@@ -11023,17 +11047,19 @@ function buildPanel(node) {
         });
     };
     syncRegionalWidgets = () => {
-        setWidgetValue(node, "regional_enabled", regionalEnabledInput.checked);
-        setWidgetValue(node, "regional_mode", "matrix");
-        setWidgetValue(node, "regional_split", regionalSplitSelect.value);
-        setWidgetValue(node, "regional_ratios", regionalRatiosInput.value.trim() || "1,1");
-        setWidgetValue(node, "regional_base_enabled", regionalBaseInput.checked);
-        setWidgetValue(node, "regional_common_enabled", regionalCommonInput.checked);
-        setWidgetValue(node, "regional_base_ratio", normalizeClipStrength(regionalBaseRatioInput.value, 0.2));
-        setWidgetValue(node, "regional_strength", normalizeClipStrength(regionalStrengthInput.value, 1));
-        setWidgetValue(node, "regional_canvas_auto", regionalCanvasAutoInput.checked);
-        setWidgetValue(node, "regional_canvas_width", normalizeRegionalCanvasDimension(regionalCanvasWidthInput.value, DEFAULT_REGIONAL_CANVAS_WIDTH));
-        setWidgetValue(node, "regional_canvas_height", normalizeRegionalCanvasDimension(regionalCanvasHeightInput.value, DEFAULT_REGIONAL_CANVAS_HEIGHT));
+        batchBridgeWidgetUpdates(node, (set) => {
+            set("regional_enabled", regionalEnabledInput.checked);
+            set("regional_mode", "matrix");
+            set("regional_split", regionalSplitSelect.value);
+            set("regional_ratios", regionalRatiosInput.value.trim() || "1,1");
+            set("regional_base_enabled", regionalBaseInput.checked);
+            set("regional_common_enabled", regionalCommonInput.checked);
+            set("regional_base_ratio", normalizeClipStrength(regionalBaseRatioInput.value, 0.2));
+            set("regional_strength", normalizeClipStrength(regionalStrengthInput.value, 1));
+            set("regional_canvas_auto", regionalCanvasAutoInput.checked);
+            set("regional_canvas_width", normalizeRegionalCanvasDimension(regionalCanvasWidthInput.value, DEFAULT_REGIONAL_CANVAS_WIDTH));
+            set("regional_canvas_height", normalizeRegionalCanvasDimension(regionalCanvasHeightInput.value, DEFAULT_REGIONAL_CANVAS_HEIGHT));
+        });
         renderRegionalPreview();
     };
     for (const control of [regionalEnabledInput, regionalSplitSelect, regionalRatiosInput, regionalBaseInput, regionalCommonInput, regionalBaseRatioInput, regionalStrengthInput, regionalCanvasAutoInput]) {
@@ -11727,52 +11753,54 @@ function buildPanel(node) {
     const moduleRegionalLoraEnabledInput = moduleCheckbox(moduleRegionalLoraEnabledWidget);
 
     const syncModuleWidgets = () => {
-        setWidgetValue(node, "module_table_enabled", moduleTableEnabledInput.checked);
-        setWidgetValue(node, "module_mask_enabled", moduleMaskEnabledInput.checked);
-        setWidgetValue(node, "module_mask_strength", normalizeClipStrength(moduleMaskStrengthInput.value, 1));
-        setWidgetValue(node, "module_mask_set_area_to_bounds", moduleMaskBoundsInput.checked);
-        setWidgetValue(node, "module_negative_common_enabled", moduleNegativeCommonEnabledInput.checked);
-        setWidgetValue(node, "module_negative_common_prompt", moduleNegativeCommonPromptInput.value.trim());
-        setWidgetValue(node, "module_flip_enabled", moduleFlipEnabledInput.checked);
-        setWidgetValue(node, "module_flip_axis", moduleFlipAxisInput.value);
-        setWidgetValue(node, "module_presets_enabled", modulePresetsEnabledInput.checked);
-        setWidgetValue(node, "module_adetailer_enabled", moduleAdetailerEnabledInput.checked);
-        setWidgetValue(node, "module_adetailer_model", moduleAdetailerModelInput.value);
-        setWidgetValue(node, "module_adetailer_prompt", moduleAdetailerPromptInput.value.trim());
-        setWidgetValue(node, "module_adetailer_negative_prompt", moduleAdetailerNegativePromptInput.value.trim());
-        setWidgetValue(node, "module_adetailer_confidence", normalizeClipStrength(moduleAdetailerConfidenceInput.value, 0.3));
-        setWidgetValue(node, "module_adetailer_mask_blur", Math.max(0, Math.round(normalizeClipStrength(moduleAdetailerMaskBlurInput.value, 4))));
-        setWidgetValue(node, "module_adetailer_denoise", normalizeClipStrength(moduleAdetailerDenoiseInput.value, 0.4));
-        setWidgetValue(node, "module_adetailer_inpaint_only_masked", moduleAdetailerInpaintOnlyMaskedInput.checked);
-        setWidgetValue(node, "module_adetailer_cycles", Math.max(1, Math.round(normalizeClipStrength(moduleAdetailerCyclesInput.value, 1))));
-        setWidgetValue(node, "module_controlnet_enabled", moduleControlnetEnabledInput.checked);
-        setWidgetValue(node, "module_controlnet_preprocessor", moduleControlnetPreprocessorInput.value);
-        setWidgetValue(node, "module_controlnet_model", moduleControlnetModelInput.value.trim());
-        setWidgetValue(node, "module_controlnet_weight", normalizeClipStrength(moduleControlnetWeightInput.value, 1));
-        setWidgetValue(node, "module_controlnet_start", normalizeClipStrength(moduleControlnetStartInput.value, 0));
-        setWidgetValue(node, "module_controlnet_end", normalizeClipStrength(moduleControlnetEndInput.value, 1));
-        setWidgetValue(node, "module_controlnet_resize_mode", moduleControlnetResizeModeInput.value);
-        setWidgetValue(node, "module_controlnet_control_mode", moduleControlnetControlModeInput.value);
-        setWidgetValue(node, "module_controlnet_pixel_perfect", moduleControlnetPixelPerfectInput.checked);
-        setWidgetValue(node, "module_sam_enabled", moduleSamEnabledInput.checked);
-        setWidgetValue(node, "module_sam_model", moduleSamModelInput.value);
-        setWidgetValue(node, "module_sam_prompt_mode", moduleSamPromptModeInput.value);
-        setWidgetValue(node, "module_sam_confidence", normalizeClipStrength(moduleSamConfidenceInput.value, 0.5));
-        setWidgetValue(node, "module_sam_mask_blur", Math.round(normalizeClipStrength(moduleSamMaskBlurInput.value, 4)));
-        setWidgetValue(node, "module_sam_dilate", Math.round(normalizeClipStrength(moduleSamDilateInput.value, 0)));
-        setWidgetValue(node, "module_sam_inpaint_denoise", normalizeClipStrength(moduleSamInpaintDenoiseInput.value, 0.45));
-        setWidgetValue(node, "module_sam_inpaint_area", moduleSamInpaintAreaInput.value);
-        setWidgetValue(node, "module_sam_padding", Math.max(0, Math.round(normalizeClipStrength(moduleSamPaddingInput.value, 32))));
-        setWidgetValue(node, "module_upscale_enabled", moduleUpscaleEnabledInput.checked);
-        setWidgetValue(node, "module_upscale_mode", moduleUpscaleModeInput.value);
-        setWidgetValue(node, "module_upscale_by", normalizeClipStrength(moduleUpscaleByInput.value, 2));
-        setWidgetValue(node, "module_upscale_upscaler", moduleUpscaleUpscalerInput.value.trim());
-        setWidgetValue(node, "module_upscale_steps", Math.max(0, Math.round(normalizeClipStrength(moduleUpscaleStepsInput.value, 18))));
-        setWidgetValue(node, "module_upscale_denoise", normalizeClipStrength(moduleUpscaleDenoiseInput.value, 0.48));
-        setWidgetValue(node, "module_upscale_tile_width", Math.max(128, Math.round(normalizeClipStrength(moduleUpscaleTileWidthInput.value, 768))));
-        setWidgetValue(node, "module_upscale_tile_height", Math.max(128, Math.round(normalizeClipStrength(moduleUpscaleTileHeightInput.value, 768))));
-        setWidgetValue(node, "module_upscale_overlap", Math.max(0, Math.round(normalizeClipStrength(moduleUpscaleOverlapInput.value, 64))));
-        setWidgetValue(node, "module_regional_lora_enabled", moduleRegionalLoraEnabledInput.checked);
+        batchBridgeWidgetUpdates(node, (set) => {
+            set("module_table_enabled", moduleTableEnabledInput.checked);
+            set("module_mask_enabled", moduleMaskEnabledInput.checked);
+            set("module_mask_strength", normalizeClipStrength(moduleMaskStrengthInput.value, 1));
+            set("module_mask_set_area_to_bounds", moduleMaskBoundsInput.checked);
+            set("module_negative_common_enabled", moduleNegativeCommonEnabledInput.checked);
+            set("module_negative_common_prompt", moduleNegativeCommonPromptInput.value.trim());
+            set("module_flip_enabled", moduleFlipEnabledInput.checked);
+            set("module_flip_axis", moduleFlipAxisInput.value);
+            set("module_presets_enabled", modulePresetsEnabledInput.checked);
+            set("module_adetailer_enabled", moduleAdetailerEnabledInput.checked);
+            set("module_adetailer_model", moduleAdetailerModelInput.value);
+            set("module_adetailer_prompt", moduleAdetailerPromptInput.value.trim());
+            set("module_adetailer_negative_prompt", moduleAdetailerNegativePromptInput.value.trim());
+            set("module_adetailer_confidence", normalizeClipStrength(moduleAdetailerConfidenceInput.value, 0.3));
+            set("module_adetailer_mask_blur", Math.max(0, Math.round(normalizeClipStrength(moduleAdetailerMaskBlurInput.value, 4))));
+            set("module_adetailer_denoise", normalizeClipStrength(moduleAdetailerDenoiseInput.value, 0.4));
+            set("module_adetailer_inpaint_only_masked", moduleAdetailerInpaintOnlyMaskedInput.checked);
+            set("module_adetailer_cycles", Math.max(1, Math.round(normalizeClipStrength(moduleAdetailerCyclesInput.value, 1))));
+            set("module_controlnet_enabled", moduleControlnetEnabledInput.checked);
+            set("module_controlnet_preprocessor", moduleControlnetPreprocessorInput.value);
+            set("module_controlnet_model", moduleControlnetModelInput.value.trim());
+            set("module_controlnet_weight", normalizeClipStrength(moduleControlnetWeightInput.value, 1));
+            set("module_controlnet_start", normalizeClipStrength(moduleControlnetStartInput.value, 0));
+            set("module_controlnet_end", normalizeClipStrength(moduleControlnetEndInput.value, 1));
+            set("module_controlnet_resize_mode", moduleControlnetResizeModeInput.value);
+            set("module_controlnet_control_mode", moduleControlnetControlModeInput.value);
+            set("module_controlnet_pixel_perfect", moduleControlnetPixelPerfectInput.checked);
+            set("module_sam_enabled", moduleSamEnabledInput.checked);
+            set("module_sam_model", moduleSamModelInput.value);
+            set("module_sam_prompt_mode", moduleSamPromptModeInput.value);
+            set("module_sam_confidence", normalizeClipStrength(moduleSamConfidenceInput.value, 0.5));
+            set("module_sam_mask_blur", Math.round(normalizeClipStrength(moduleSamMaskBlurInput.value, 4)));
+            set("module_sam_dilate", Math.round(normalizeClipStrength(moduleSamDilateInput.value, 0)));
+            set("module_sam_inpaint_denoise", normalizeClipStrength(moduleSamInpaintDenoiseInput.value, 0.45));
+            set("module_sam_inpaint_area", moduleSamInpaintAreaInput.value);
+            set("module_sam_padding", Math.max(0, Math.round(normalizeClipStrength(moduleSamPaddingInput.value, 32))));
+            set("module_upscale_enabled", moduleUpscaleEnabledInput.checked);
+            set("module_upscale_mode", moduleUpscaleModeInput.value);
+            set("module_upscale_by", normalizeClipStrength(moduleUpscaleByInput.value, 2));
+            set("module_upscale_upscaler", moduleUpscaleUpscalerInput.value.trim());
+            set("module_upscale_steps", Math.max(0, Math.round(normalizeClipStrength(moduleUpscaleStepsInput.value, 18))));
+            set("module_upscale_denoise", normalizeClipStrength(moduleUpscaleDenoiseInput.value, 0.48));
+            set("module_upscale_tile_width", Math.max(128, Math.round(normalizeClipStrength(moduleUpscaleTileWidthInput.value, 768))));
+            set("module_upscale_tile_height", Math.max(128, Math.round(normalizeClipStrength(moduleUpscaleTileHeightInput.value, 768))));
+            set("module_upscale_overlap", Math.max(0, Math.round(normalizeClipStrength(moduleUpscaleOverlapInput.value, 64))));
+            set("module_regional_lora_enabled", moduleRegionalLoraEnabledInput.checked);
+        });
     };
     const moduleControlBindings = [
         [moduleTableEnabledInput, "checked"],
