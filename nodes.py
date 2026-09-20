@@ -2134,11 +2134,29 @@ def _webui_translate_api_config(api_key):
     return config
 
 
-def _webui_network_translate(text, from_lang="zh_CN", to_lang="en_US"):
+def _record_translation_diagnostic(diagnostics, code, message, level="error", **details):
+    """Collect actionable translation diagnostics without exposing secrets."""
+    if diagnostics is None:
+        return
+    item = {"code": str(code), "message": str(message)}
+    for key in ("api", "from_lang", "to_lang", "path"):
+        value = details.get(key)
+        if value:
+            item[key] = str(value)
+    diagnostics.setdefault("warnings" if level == "warning" else "errors", []).append(item)
+
+
+def _webui_network_translate(text, from_lang="zh_CN", to_lang="en_US", diagnostics=None):
     text = str(text or "").strip()
     if not text:
         return ""
     if _translation_source_mode() == "builtin":
+        _record_translation_diagnostic(
+            diagnostics,
+            "translation_source_builtin",
+            "翻译来源设置为内置映射，未调用联网翻译",
+            level="warning",
+        )
         return ""
     api_data = _load_webui_translate_apis()
     api_key = _storage_get("translateApi", api_data.get("default") or "alibaba_free")
@@ -2151,15 +2169,29 @@ def _webui_network_translate(text, from_lang="zh_CN", to_lang="en_US"):
     translate_script = PROMPT_ALL_IN_ONE_DIR / "scripts" / "physton_prompt" / "translate.py"
     if not translate_script.exists() and _translation_source_mode() == "online":
         try:
-            _install_extension_asset("prompt_all_in_one", DATA_DIR)
-        except Exception:
-            pass
-        translate_script = PROMPT_ALL_IN_ONE_DIR / "scripts" / "physton_prompt" / "translate.py"
+            installed = _install_extension_asset("prompt_all_in_one", DATA_DIR) or {}
+            installed_path = installed.get("path")
+            if installed_path:
+                candidate = Path(installed_path) / "scripts" / "physton_prompt" / "translate.py"
+                if candidate.exists():
+                    translate_script = candidate
+        except Exception as exc:
+            _record_translation_diagnostic(diagnostics, "translation_asset_install_failed", f"联网翻译模块下载失败：{exc}")
     if not translate_script.exists():
+        _record_translation_diagnostic(
+            diagnostics,
+            "translation_script_missing",
+            "未找到 Prompt All in One 翻译脚本，请检查 prompt_all_in_one_dir 或重新安装本地翻译数据",
+            path=translate_script,
+        )
         return ""
 
     added_paths = []
-    import_paths = [PROMPT_ALL_IN_ONE_DIR]
+    # Import from the directory that actually contains the script. This also
+    # handles a freshly installed bundled asset when the configured WebUI path
+    # is stale or incomplete.
+    translate_root = translate_script.parents[2]
+    import_paths = [translate_root]
     if WEBUI_PYTHON_SITE_PACKAGES and WEBUI_ROOT and WEBUI_PYTHON_SITE_PACKAGES.is_relative_to(WEBUI_ROOT):
         import_paths.append(WEBUI_PYTHON_SITE_PACKAGES)
     for raw_path in import_paths:
@@ -2173,6 +2205,18 @@ def _webui_network_translate(text, from_lang="zh_CN", to_lang="en_US"):
     try:
         from scripts.physton_prompt.translate import translate
 
+        loaded_module = sys.modules.get("scripts.physton_prompt.translate")
+        loaded_path = Path(getattr(loaded_module, "__file__", "")).resolve() if loaded_module else None
+        expected_path = translate_script.resolve()
+        if loaded_path and loaded_path != expected_path:
+            _record_translation_diagnostic(
+                diagnostics,
+                "translation_module_path_conflict",
+                "检测到同名 scripts 模块冲突，未使用当前 Prompt All in One 翻译脚本",
+                path=loaded_path,
+            )
+            return ""
+
         result = translate(text, from_lang, to_lang, api_key, _webui_translate_api_config(api_key))
         if result.get("success"):
             translated = result.get("translated_text") or ""
@@ -2181,27 +2225,46 @@ def _webui_network_translate(text, from_lang="zh_CN", to_lang="en_US"):
             translated = str(translated).strip().replace("\n", ", ")
             _NETWORK_TRANSLATE_CACHE[cache_key] = translated
             return translated
-    except Exception:
-        pass
+        _record_translation_diagnostic(
+            diagnostics,
+            "translation_provider_failed",
+            result.get("message") or "翻译服务返回失败",
+            api=api_key,
+            from_lang=from_lang,
+            to_lang=to_lang,
+        )
+    except Exception as exc:
+        _record_translation_diagnostic(
+            diagnostics,
+            "translation_module_error",
+            f"翻译模块运行异常：{exc}",
+            api=api_key,
+            from_lang=from_lang,
+            to_lang=to_lang,
+        )
     return ""
 
 
-def _ai_translate_prompt(text, from_lang="zh_CN", to_lang="en_US"):
+def _ai_translate_prompt(text, from_lang="zh_CN", to_lang="en_US", diagnostics=None, required=False):
     text = str(text or "").strip()
     if not text:
         return ""
     config = _ai_config_raw()
     if not config.get("enabled"):
+        _record_translation_diagnostic(diagnostics, "ai_translation_disabled", "AI 翻译未启用", level="error" if required else "warning")
         return ""
     api_key = str(config.get("api_key") or "").strip()
     if not api_key:
+        _record_translation_diagnostic(diagnostics, "ai_api_key_missing", "AI 翻译缺少 API Key", level="error" if required else "warning")
         return ""
     try:
         base_url = _normalize_ai_base_url(config.get("base_url"))
     except ValueError:
+        _record_translation_diagnostic(diagnostics, "ai_base_url_invalid", "AI 翻译地址无效", level="error" if required else "warning")
         return ""
     model = str(config.get("model") or "deepseek-ai/DeepSeek-V4-Flash").strip()
     if not base_url or not model:
+        _record_translation_diagnostic(diagnostics, "ai_config_incomplete", "AI 翻译配置不完整", level="error" if required else "warning")
         return ""
     cache_key = ("ai", base_url, model, from_lang, to_lang, text)
     if cache_key in _NETWORK_TRANSLATE_CACHE:
@@ -2234,10 +2297,11 @@ def _ai_translate_prompt(text, from_lang="zh_CN", to_lang="en_US"):
         content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
         content = _normalize_network_prompt(content).strip("`")
         content = re.sub(r"^(translated tags?|tags?)\s*[:：]\s*", "", content, flags=re.I).strip()
-        _NETWORK_TRANSLATE_CACHE[cache_key] = content
+        if content:
+            _NETWORK_TRANSLATE_CACHE[cache_key] = content
         return content
-    except Exception:
-        _NETWORK_TRANSLATE_CACHE[cache_key] = ""
+    except Exception as exc:
+        _record_translation_diagnostic(diagnostics, "ai_provider_failed", f"AI 翻译请求失败：{exc}", level="error" if required else "warning")
         return ""
 
 
@@ -2810,7 +2874,7 @@ def _merge_prompt_texts(*values):
     return ", ".join(merged)
 
 
-def _translate_prompt_all_in_one_text(text, to="english", lang="zh_CN"):
+def _translate_prompt_all_in_one_text(text, to="english", lang="zh_CN", diagnostics=None):
     local_to_prompt, prompt_to_local = _build_prompt_all_in_one_translation_maps(lang)
     translated = []
     for item in _split_prompt_all_in_one_tags(text):
@@ -2824,10 +2888,10 @@ def _translate_prompt_all_in_one_text(text, to="english", lang="zh_CN"):
             if not local and re.search(r"[A-Za-z]", item):
                 mode = _translation_source_mode()
                 if mode in ("auto", "ai"):
-                    local = _ai_translate_prompt(item, "en_US", lang)
+                    local = _ai_translate_prompt(item, "en_US", lang, diagnostics, required=mode == "ai")
                     source = "ai" if local else source
                 if not local and mode != "ai":
-                    local = _webui_network_translate(item, "en_US", lang)
+                    local = _webui_network_translate(item, "en_US", lang, diagnostics)
                     source = "network" if local else source
             translated.append({
                 "input": item,
@@ -2845,10 +2909,10 @@ def _translate_prompt_all_in_one_text(text, to="english", lang="zh_CN"):
                 mode = _translation_source_mode()
                 network_prompt = None
                 if mode in ("auto", "ai"):
-                    network_prompt = _normalize_network_prompt(_ai_translate_prompt(item, lang, "en_US")) or None
+                    network_prompt = _normalize_network_prompt(_ai_translate_prompt(item, lang, "en_US", diagnostics, required=mode == "ai")) or None
                     ai_used = bool(network_prompt)
                 if not network_prompt and mode != "ai":
-                    network_prompt = _normalize_network_prompt(_webui_network_translate(item, lang, "en_US")) or None
+                    network_prompt = _normalize_network_prompt(_webui_network_translate(item, lang, "en_US", diagnostics)) or None
                     network_used = bool(network_prompt)
                 if network_prompt:
                     prompt = network_prompt
@@ -7369,12 +7433,14 @@ def _register_routes():
         text = _truncate_text(data.get("text", ""), MAX_PROMPT_TEXT_LENGTH)
         lang = _truncate_text(data.get("lang", "zh_CN"), MAX_STYLE_NAME_LENGTH)
         to = _truncate_text(data.get("to", "english"), MAX_STYLE_NAME_LENGTH)
-        translated = await run_blocking(_translate_prompt_all_in_one_text, text, to, lang)
+        diagnostics = {}
+        translated = await run_blocking(_translate_prompt_all_in_one_text, text, to, lang, diagnostics)
         prompt = ", ".join(item["prompt"] for item in translated if item["prompt"] != "\n")
         return web.json_response({
             "tags": translated,
             "prompt": prompt,
             "matched": sum(1 for item in translated if item.get("matched")),
+            "diagnostics": diagnostics,
         })
 
     @protected_route("get", "/webui_prompt_bridge/prompt_all_in_one/storage")

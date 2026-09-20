@@ -4386,7 +4386,7 @@ async function translateTagsToLocal(tags) {
                 localTranslationCache.set(String(item.prompt || item.input || "").toLowerCase(), item.local || "");
             }
         } catch {
-            for (const tag of missing) localTranslationCache.set(tag.toLowerCase(), "");
+            // Do not cache a transient network failure; the next request may recover.
         }
     }
     return tags.map((tag) => localTranslationCache.get(String(tag || "").toLowerCase()) || "");
@@ -5265,9 +5265,22 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             }),
             tool("英", "翻译当前关键词为英文", async () => {
                 if (tag.disabled) return;
-                const translated = await translatePromptAllInOne(tag.value, "english");
-                const next = (translated.tags || []).find((item) => item.prompt && item.prompt !== "\n")?.prompt || translated.prompt;
-                if (next) replacePromptTagAt(textarea, tag.index, next);
+                setPromptTranslateStatus(textarea, "正在翻译当前关键词...", true);
+                try {
+                    const translated = await translatePromptAllInOne(tag.value, "english");
+                    const error = translated.diagnostics?.errors?.[0];
+                    const next = (translated.tags || []).find((item) => item.prompt && item.prompt !== "\n")?.prompt || translated.prompt;
+                    if (error) {
+                        setPromptTranslateStatus(textarea, `翻译失败：${error.message || error.code}`, false);
+                    } else if (next && next !== tag.value) {
+                        replacePromptTagAt(textarea, tag.index, next);
+                        setPromptTranslateStatus(textarea, "关键词翻译完成", false);
+                    } else {
+                        setPromptTranslateStatus(textarea, "未得到新译文，已保留原文", false);
+                    }
+                } catch (error) {
+                    setPromptTranslateStatus(textarea, `翻译失败：${error?.message || error}`, false);
+                }
             }),
             tool("⧉", "复制当前关键词", () => navigator.clipboard.writeText(tag.value).catch(() => {})),
             tool(favorite ? "★" : "☆", favorite ? "取消该 Prompt 的全部收藏" : "加入收藏", async () => {
@@ -7423,6 +7436,13 @@ async function translatePromptAllInOne(text, to = "english") {
         body: JSON.stringify({ text, to, lang: "zh_CN" }),
     });
     return await bridgeJson(response, "翻译失败");
+}
+
+function translationDiagnosticMessage(data, fallback = "翻译失败") {
+    const error = data?.diagnostics?.errors?.[0];
+    if (!error) return fallback;
+    const detail = error.message || error.code || fallback;
+    return error.api ? `${detail}（服务：${error.api}）` : detail;
 }
 
 async function fetchAutocomplete(query, limit = 10) {
@@ -9726,7 +9746,9 @@ function createPromptAllInOnePanel(kind, title, textarea, state, sync) {
         try {
             const translated = await translatePromptAllInOne(value, "english");
             setTextareaValue(textarea, translated.prompt || value);
-            hint.textContent = translated.matched
+            hint.textContent = translated.diagnostics?.errors?.length
+                ? `翻译失败：${translationDiagnosticMessage(translated)}`
+                : translated.matched
                 ? `${aiMode ? "AI " : ""}已翻译 ${translated.matched} 个关键词`
                 : "本地词库未匹配，已保留原文；可在设置里查看说明";
             setPromptTranslateStatus(textarea, hint.textContent, false);
@@ -10719,7 +10741,11 @@ function buildPanel(node) {
                     return;
                 }
                 const next = translated.prompt || before;
-                if (translated.matched && next && next !== before) {
+                if (translated.diagnostics?.errors?.length) {
+                    const message = `翻译失败：${translationDiagnosticMessage(translated)}`;
+                    setPromptTranslateStatus(textarea, message, false);
+                    setStatus(message);
+                } else if (translated.matched && next && next !== before) {
                     setTextareaValue(textarea, next);
                     const translatedByAI = aiMode || (translated.tags || []).some((tag) => tag.source === "ai");
                     const message = `${translatedByAI ? "AI " : ""}已自动翻译 ${translated.matched} 个关键词`;
