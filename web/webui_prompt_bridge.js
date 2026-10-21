@@ -4376,20 +4376,144 @@ function buildLocalTagMap(state) {
 }
 
 const localTranslationCache = new Map();
+// The backend translates unknown tags one by one. A single large request can
+// therefore block *every* label behind the slowest translation. Use a bounded,
+// shared queue so completed chunks can update their own chips immediately.
+const LOCAL_TRANSLATION_BATCH_SIZE = 2;
+const LOCAL_TRANSLATION_CONCURRENCY = 2;
+const LOCAL_TRANSLATION_RETRY_DELAY_MS = 7000;
+// Bound every remote batch: a stalled provider must never occupy a queue slot
+// indefinitely. Allow the slower two-tag batches enough time before retrying.
+const LOCAL_TRANSLATION_REQUEST_TIMEOUT_MS = 45000;
+const localTranslationPending = new Map();
+const localTranslationQueue = [];
+let localTranslationActiveBatches = 0;
+let localTranslationPumpScheduled = false;
 
-async function translateTagsToLocal(tags) {
-    const missing = tags.filter((tag) => tag && !localTranslationCache.has(tag.toLowerCase()));
-    if (missing.length) {
-        try {
-            const translated = await translatePromptAllInOne(missing.join(", "), "local");
-            for (const item of translated.tags || []) {
-                localTranslationCache.set(String(item.prompt || item.input || "").toLowerCase(), item.local || "");
-            }
-        } catch {
-            // Do not cache a transient network failure; the next request may recover.
-        }
+function localTranslationKey(tag) {
+    const source = String(tag || "").trim();
+    if (!source) return "";
+    // Weighted tags should share translations with their unweighted body.
+    return String(normalizeAttentionValue(source).body || source).trim().toLowerCase();
+}
+
+function enqueueLocalTranslation(tag) {
+    const key = localTranslationKey(tag);
+    if (!key) return Promise.resolve("");
+    if (localTranslationCache.has(key)) return Promise.resolve(localTranslationCache.get(key));
+    const existing = localTranslationPending.get(key);
+    if (existing) return existing.promise;
+    let resolve;
+    const promise = new Promise((finish) => { resolve = finish; });
+    const job = { key, attempts: 0, resolve, promise };
+    localTranslationPending.set(key, job);
+    localTranslationQueue.push(job);
+    scheduleLocalTranslationPump();
+    return promise;
+}
+
+function scheduleLocalTranslationPump() {
+    if (localTranslationPumpScheduled) return;
+    localTranslationPumpScheduled = true;
+    Promise.resolve().then(() => {
+        localTranslationPumpScheduled = false;
+        pumpLocalTranslationQueue();
+    });
+}
+
+function finishLocalTranslationJob(job, translated) {
+    if (localTranslationPending.get(job.key) !== job) return;
+    localTranslationPending.delete(job.key);
+    if (translated) localTranslationCache.set(job.key, translated);
+    job.resolve(translated || "");
+}
+
+function translateLocalBatchWithDeadline(jobs) {
+    const controller = new AbortController();
+    let timer = 0;
+    // AbortController alone is not sufficient if a custom fetch transport
+    // ignores its signal. The race also settles when fetch never settles.
+    const deadline = new Promise((_, reject) => {
+        timer = window.setTimeout(() => {
+            controller.abort();
+            reject(bridgeTimeoutError("标签自动翻译请求超时"));
+        }, LOCAL_TRANSLATION_REQUEST_TIMEOUT_MS);
+    });
+    const request = translatePromptAllInOne(jobs.map((job) => job.key).join(", "), "local", {
+        signal: controller.signal,
+    });
+    // Once the deadline wins, this race ignores any late response; it cannot
+    // change a job belonging to a retry or overwrite the current chip.
+    return Promise.race([request, deadline]).finally(() => window.clearTimeout(timer));
+}
+
+function pumpLocalTranslationQueue() {
+    while (localTranslationActiveBatches < LOCAL_TRANSLATION_CONCURRENCY && localTranslationQueue.length) {
+        const jobs = localTranslationQueue.splice(0, LOCAL_TRANSLATION_BATCH_SIZE);
+        localTranslationActiveBatches++;
+        jobs.forEach((job) => { job.attempts++; });
+        translateLocalBatchWithDeadline(jobs)
+            .then((translated) => {
+                const byInput = new Map();
+                for (const item of translated?.tags || []) {
+                    const key = localTranslationKey(item.input || item.prompt);
+                    if (key) byInput.set(key, item);
+                }
+                if (translated?.diagnostics?.errors?.length) {
+                    console.warn("[WebUI Prompt Bridge] Tag translation provider:", translated.diagnostics.errors[0]);
+                }
+                for (const job of jobs) {
+                    const item = byInput.get(job.key);
+                    const candidate = String(item?.local || "").trim();
+                    // Unmatched backend responses return the ORIGINAL English
+                    // text as `local`. Never cache that as a translation: it
+                    // would suppress all future attempts, even after a transient
+                    // translation service failure.
+                    const valid = Boolean(item?.matched && candidate && candidate.toLowerCase() !== job.key);
+                    if (valid) {
+                        finishLocalTranslationJob(job, candidate);
+                    } else if (job.attempts < 2) {
+                        // One delayed retry. Avoid hammering an offline provider
+                        // or endlessly retrying a tag that cannot be translated.
+                        window.setTimeout(() => {
+                            if (localTranslationPending.get(job.key) !== job) return;
+                            localTranslationQueue.push(job);
+                            scheduleLocalTranslationPump();
+                        }, LOCAL_TRANSLATION_RETRY_DELAY_MS);
+                    } else {
+                        finishLocalTranslationJob(job, "");
+                    }
+                }
+            })
+            .catch((error) => {
+                console.warn("[WebUI Prompt Bridge] Tag translation request failed:", error);
+                for (const job of jobs) {
+                    if (job.attempts < 2) {
+                        window.setTimeout(() => {
+                            if (localTranslationPending.get(job.key) !== job) return;
+                            localTranslationQueue.push(job);
+                            scheduleLocalTranslationPump();
+                        }, LOCAL_TRANSLATION_RETRY_DELAY_MS);
+                    } else {
+                        finishLocalTranslationJob(job, "");
+                    }
+                }
+            })
+            .finally(() => {
+                localTranslationActiveBatches--;
+                scheduleLocalTranslationPump();
+            });
     }
-    return tags.map((tag) => localTranslationCache.get(String(tag || "").toLowerCase()) || "");
+}
+
+async function translateTagsToLocal(tags, onProgress = null) {
+    // Keep the return-array API used by the other prompt management screens,
+    // but also publish individual results as soon as they become available.
+    const tasks = tags.map((tag, index) => enqueueLocalTranslation(tag).then((local) => {
+        if (local) onProgress?.(local, index);
+        return local;
+    }));
+    return Promise.all(tasks);
 }
 
 function normalizeLoraName(name) {
@@ -5021,6 +5145,22 @@ async function refreshFavoritesFromResult(state, result) {
     };
 }
 
+// Apply asynchronous localized labels only to the exact chip that requested
+// them. A new render detaches old chips; a weight-only update keeps the chip
+// alive while preserving its underlying tag text (e.g. 1girl -> (1girl:1.1)).
+// Unlike a global render token, this check does not discard valid translations
+// just because another chip or some other UI state was refreshed meanwhile.
+function applyTranslatedPromptChipLocal(chip, originalValue, local) {
+    if (!chip?.isConnected || !local || local === originalValue) return;
+    const currentValue = chip.__bridgeTagRef?.value || "";
+    if (currentValue !== originalValue
+        && normalizeAttentionValue(currentValue).body !== normalizeAttentionValue(originalValue).body) return;
+    const localNode = chip.querySelector(".webui-bridge-chip-local");
+    if (!localNode) return;
+    localNode.textContent = local;
+    chip.setAttribute("aria-label", `${currentValue || originalValue}，${local}`);
+}
+
 function renderPromptChips(row, textarea, state, afterChange, kind = "positive") {
     const chips = row.chips;
     if (!chips) return;
@@ -5201,7 +5341,8 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             el("span", { class: "webui-bridge-chip-main" }, tag.value),
             el("span", { class: "webui-bridge-chip-local" }, local || " "),
         ]);
-        if (!lora && !tag.disabled) translatableChips.push({ chip, value: tag.value });
+        chip.__bridgeTagRef = tag;
+        if (!lora && !tag.disabled && !local) translatableChips.push({ chip, value: tag.value });
         const toolsToggle = el("button", {
             class: "webui-bridge-chip-tools-toggle",
             type: "button",
@@ -5410,15 +5551,13 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
     }
     chips.replaceChildren(fragment);
     const plainTags = translatableChips.map((item) => item.value);
-    translateTagsToLocal(plainTags).then((locals) => {
-        if (!chips.isConnected || row.__webuiBridgeChipRenderToken !== renderToken) return;
-        translatableChips.forEach(({ chip, value }, index) => {
-            const local = locals[index];
-            if (!chip.isConnected || !local || local === value) return;
-            const localNode = chip.querySelector(".webui-bridge-chip-local");
-            if (localNode) localNode.textContent = local;
-        });
-    });
+    // A small translated chunk should appear immediately, not only after all
+    // remaining unknown tags have finished. This updates the label directly,
+    // without replacing the chip or disturbing its weight-toolbar DOM.
+    translateTagsToLocal(plainTags, (local, index) => {
+        const item = translatableChips[index];
+        if (item) applyTranslatedPromptChipLocal(item.chip, item.value, local);
+    }).catch((error) => console.warn("[WebUI Prompt Bridge] Tag label update failed:", error));
 }
 
 function normalizedPromptToggleTag(value, isNegative = false) {
@@ -7429,11 +7568,12 @@ async function updateStyle(action, name, positivePrompt = "", negativePrompt = "
     return data.styles || [];
 }
 
-async function translatePromptAllInOne(text, to = "english") {
+async function translatePromptAllInOne(text, to = "english", options = {}) {
     const response = await api.fetchApi("/webui_prompt_bridge/prompt_all_in_one/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text, to, lang: "zh_CN" }),
+        ...(options.signal ? { signal: options.signal } : {}),
     });
     return await bridgeJson(response, "翻译失败");
 }

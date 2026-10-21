@@ -44,3 +44,5 @@ jobs:
 
       - name: Test widget batch updates
         run: node tools/test_widget_batch.mjs
+      - name: Test translation timeout recovery
+        run: node tools/test_translation_timeout.mjs
