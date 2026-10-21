@@ -4918,11 +4918,11 @@ function setTagNumericWeight(value, weight) {
     const rounded = Math.round(Number(weight || 1) * 100) / 100;
     if (parsed.lora) {
         const clip = parsed.lora.clip ? `:${parsed.lora.clip}` : "";
-        return `<${parsed.lora.type}:${parsed.lora.name}:${rounded.toFixed(rounded % 1 ? 2 : 1).replace(/0$/, "")}${clip}>`;
+        return `<${parsed.lora.type}:${parsed.lora.name}:${rounded.toFixed(rounded % 1 ? 2 : 1).replace(/\.?0+$/, "")}${clip}>`;
     }
     if (!parsed.body) return value;
     if (Math.abs(rounded - 1) < 0.001) return parsed.body;
-    return `(${parsed.body}:${rounded.toFixed(rounded % 1 ? 2 : 1).replace(/0$/, "")})`;
+    return `(${parsed.body}:${rounded.toFixed(rounded % 1 ? 2 : 1).replace(/\.?0+$/, "")})`;
 }
 
 function changeTagNumericWeight(value, delta) {
@@ -5024,6 +5024,40 @@ async function refreshFavoritesFromResult(state, result) {
 function renderPromptChips(row, textarea, state, afterChange, kind = "positive") {
     const chips = row.chips;
     if (!chips) return;
+    // Explicit attention edits must preserve the live chip AND its toolbar.
+    // setTextareaValue() dispatches a synthetic input event, which calls sync()
+    // and renderPromptChips() synchronously, *before* the click handler returns.
+    // Consequently we arm this transaction before mutating the textarea, not
+    // after the event. Unrelated prompt edits still use the full renderer.
+    const attentionEdit = row.__webuiBridgeAttentionEdit;
+    if (attentionEdit && attentionEdit.chip?.isConnected && attentionEdit.chip.parentElement === chips) {
+        const liveTags = splitPromptTags(textarea.value);
+        const { index, beforeValues, chip } = attentionEdit;
+        if (liveTags.length === beforeValues.length
+            && liveTags[index]
+            && liveTags.every((item, i) => i === index || item.value === beforeValues[i])) {
+            const item = liveTags[index];
+            const tagRef = chip.__bridgeTagRef;
+            if (tagRef && Number(chip.dataset.promptIndex) === index) {
+                tagRef.value = item.value;
+                tagRef.separatorAfter = item.separatorAfter;
+                chip.__bridgeRefreshFavorite?.();
+                const label = chip.querySelector('.webui-bridge-chip-main');
+                if (label) label.textContent = item.value;
+                const input = chip.querySelector('.webui-bridge-chip-weight');
+                if (input && document.activeElement !== input)
+                    input.value = String(normalizeAttentionValue(item.value).weight);
+                chip.title = item.value;
+                chip.setAttribute('aria-label', item.value);
+                // No chips.replaceChildren() here: focus, hover and the DOM event
+                // handlers on this particular chip remain continuous.
+                return;
+            }
+        }
+        // A structural change happened during the edit; let normal rendering
+        // take over rather than silently hiding additions or reordered tags.
+        row.__webuiBridgeAttentionEdit = null;
+    }
     const localMap = buildLocalTagMap(state);
     const renderToken = Number(row.__webuiBridgeChipRenderToken || 0) + 1;
     row.__webuiBridgeChipRenderToken = renderToken;
@@ -5094,8 +5128,8 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             title = `${tag.value}\n已禁用，不会写入生成提示词`;
         }
         if (!tag.disabled && selectedTags.has(tag.index)) className += " selected";
-        const matchingFavorites = favoritesForPrompt(state, kind, tag.value);
-        const favorite = matchingFavorites[0] || null;
+        let matchingFavorites = favoritesForPrompt(state, kind, tag.value);
+        let favorite = matchingFavorites[0] || null;
         let tools = null;
         const chip = el("div", {
             class: className,
@@ -5201,6 +5235,7 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             el("span", { class: "webui-bridge-chip-main" }, tag.value),
             el("span", { class: "webui-bridge-chip-local" }, local || " "),
         ]);
+        chip.__bridgeTagRef = tag;
         if (!lora && !tag.disabled) translatableChips.push({ chip, value: tag.value });
         const toolsToggle = el("button", {
             class: "webui-bridge-chip-tools-toggle",
@@ -5222,20 +5257,77 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             onclick: async (event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                await handler();
-                afterChange?.();
+                const isAttentionEdit = !tag.disabled && ["+", "-", "()", "[]"].includes(text);
+                if (isAttentionEdit) {
+                    const current = splitPromptTags(textarea.value);
+                    row.__webuiBridgeAttentionEdit = {
+                        chip, index: tag.index, beforeValues: current.map((item) => item.value),
+                    };
+                    // All tag-related listeners on this chip share this mutable
+                    // tag object, so they observe the same up-to-date prompt text.
+                    tag.value = current[tag.index]?.value ?? tag.value;
+                }
+                try {
+                    await handler();
+                    afterChange?.();
+                } finally {
+                    if (isAttentionEdit && row.__webuiBridgeAttentionEdit?.chip === chip) {
+                        row.__webuiBridgeAttentionEdit = null;
+                    }
+                }
             },
         }, text);
         const weight = normalizeAttentionValue(tag.value).weight;
+        const suspendWeightDrag = () => {
+            // Stop the draggable parent from stealing text-selection gestures.
+            // Keep this disabled for the full focus session, not just mousedown.
+            chip.draggable = false;
+        };
+        const restoreWeightDrag = () => {
+            if (chip.isConnected && !chip.classList.contains("editing"))
+                chip.draggable = !tag.disabled;
+        };
         const weightInput = el("input", {
             class: "webui-bridge-chip-weight",
-            type: "number",
-            step: "0.1",
+            type: "text",
+            inputmode: "decimal",
+            spellcheck: "false",
+            draggable: "false",
             value: Number.isFinite(weight) ? String(weight) : "1",
-            title: "权重数值",
+            title: "权重数值（支持拖动框选）",
+            onfocus: suspendWeightDrag,
+            onblur: restoreWeightDrag,
             onclick: (event) => event.stopPropagation(),
+            onpointerdown: (event) => { suspendWeightDrag(); event.stopPropagation(); },
+            onmousedown: (event) => { suspendWeightDrag(); event.stopPropagation(); },
+            onpointermove: (event) => event.stopPropagation(),
+            onmousemove: (event) => event.stopPropagation(),
+            onpointerup: (event) => event.stopPropagation(),
+            onmouseup: (event) => event.stopPropagation(),
+            onselectstart: (event) => event.stopPropagation(),
+            ondblclick: (event) => event.stopPropagation(),
+            ondragstart: (event) => { event.preventDefault(); event.stopPropagation(); },
             onchange: (event) => {
-                if (!tag.disabled && replacePromptTagAt(textarea, tag.index, setTagNumericWeight(tag.value, event.currentTarget.value))) afterChange?.();
+                if (tag.disabled) return;
+                const current = splitPromptTags(textarea.value);
+                if (!current[tag.index]) return;
+                const rawWeight = String(event.currentTarget.value || "").trim();
+                if (!rawWeight || !Number.isFinite(Number(rawWeight))) {
+                    event.currentTarget.value = String(normalizeAttentionValue(current[tag.index].value).weight);
+                    return;
+                }
+                row.__webuiBridgeAttentionEdit = {
+                    chip, index: tag.index, beforeValues: current.map((item) => item.value),
+                };
+                tag.value = current[tag.index].value;
+                try {
+                    if (replacePromptTagAt(textarea, tag.index, setTagNumericWeight(tag.value, rawWeight))) {
+                        afterChange?.();
+                    }
+                } finally {
+                    if (row.__webuiBridgeAttentionEdit?.chip === chip)
+                        row.__webuiBridgeAttentionEdit = null;
+                }
             },
         });
         const movementIndexes = selectedTags.has(tag.index)
@@ -5314,13 +5406,45 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
                 chip.classList.remove("show-tools");
             }, 220);
         });
+        chip.__bridgeRefreshFavorite = () => {
+            matchingFavorites = favoritesForPrompt(state, kind, tag.value);
+            favorite = matchingFavorites[0] || null;
+            const button = tools.querySelector(".favorite");
+            if (button) {
+                button.textContent = favorite ? "★" : "☆";
+                button.title = favorite ? "取消该 Prompt 的全部收藏" : "加入收藏";
+                button.classList.toggle("active", !!favorite);
+            }
+        };
         chip.append(toolsToggle);
         chip.append(tools);
         function startChipEdit(node, item) {
             if (item.disabled) return;
             node.innerHTML = "";
-            const input = el("textarea", { class: "webui-bridge-chip-edit", spellcheck: "false" });
+            // HTML drag on the parent steals text-selection gestures even when
+            // pointer events on the input are stopped. Disable it while editing.
+            node.draggable = false;
+            node.setAttribute('draggable', 'false');
+            node.classList.add('editing');
+            const input = el("input", {
+                class: "webui-bridge-chip-edit",
+                type: "text",
+                spellcheck: "false",
+                draggable: "false",
+                onclick: (event) => event.stopPropagation(),
+                ondblclick: (event) => event.stopPropagation(),
+                onmousedown: (event) => event.stopPropagation(),
+                onpointerdown: (event) => event.stopPropagation(),
+                onpointermove: (event) => event.stopPropagation(),
+                onmouseup: (event) => event.stopPropagation(),
+                onmousemove: (event) => event.stopPropagation(),
+                onselectstart: (event) => event.stopPropagation(),
+                ondragstart: (event) => { event.preventDefault(); event.stopPropagation(); },
+            });
             input.value = item.value;
+            const textLength = Math.min(60, Math.max(8, item.value.length + 2));
+            input.style.width = `min(${textLength}ch, 240px)`;
+            input.style.maxWidth = "min(240px, 90vw)";
             let done = false;
             const save = () => {
                 if (done) return;
@@ -5331,6 +5455,7 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             };
             input.addEventListener("blur", save);
             input.addEventListener("keydown", (event) => {
+                if (event.isComposing || event.keyCode === 229) return;
                 if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
                     save();
@@ -18929,19 +19054,36 @@ function addStyles() {
             color: #f3f6fb;
             font-size: 11px;
             text-align: center;
+            cursor: text;
+            user-select: text !important;
+            -webkit-user-select: text !important;
+            -webkit-user-drag: none;
+        }
+        .webui-bridge-prompt-chip.editing,
+        .webui-bridge-prompt-chip.editing * {
+            user-select: text !important;
+            -webkit-user-select: text !important;
+            -webkit-user-drag: none !important;
         }
         .webui-bridge-chip-edit {
-            width: 180px;
-            min-height: 40px;
-            padding: 5px 6px;
+            display: block;
+            width: auto;
+            min-width: 64px;
+            max-width: min(240px, 90vw);
+            height: 24px;
+            min-height: 24px;
+            padding: 3px 6px;
             box-sizing: border-box;
             border: 0;
             outline: 1px solid #6aa3ff;
             border-radius: 4px;
-            resize: both;
+            resize: none;
             background: #10141d;
             color: #f4f7fb;
-            font: 12px/1.35 Consolas, Monaco, monospace;
+            font: 12px/18px Consolas, Monaco, monospace;
+            user-select: text;
+            -webkit-user-select: text;
+            cursor: text;
         }
         .webui-bridge-aio {
             border: 1px solid #263243;
