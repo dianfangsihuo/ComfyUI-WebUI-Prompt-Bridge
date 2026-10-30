@@ -5523,8 +5523,14 @@ class WebUIPromptBridge:
             default_clip_strength = float(default_clip_strength)
         except (TypeError, ValueError):
             default_clip_strength = 1.0
-        module_img2img_image = _coerce_bridge_image_ref(module_img2img_image)
-        module_img2img_mask = _coerce_bridge_image_ref(module_img2img_mask)
+        if module_img2img_enabled:
+            module_img2img_image = _coerce_bridge_image_ref(module_img2img_image)
+            module_img2img_mask = _coerce_bridge_image_ref(module_img2img_mask)
+        else:
+            # Disabled optional inputs may contain stale legacy widget values.
+            # Do not validate/load them or forward them to downstream modules.
+            module_img2img_image = ""
+            module_img2img_mask = ""
         (
             module_upscale_by,
             module_upscale_upscaler,
