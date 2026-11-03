@@ -44,3 +44,12 @@ jobs:
 
       - name: Test widget batch updates
         run: node tools/test_widget_batch.mjs
+
+      - name: Test prompt drag behavior and layout budget
+        run: node tools/test_prompt_drag.mjs
+
+      - name: Test prompt reorder input transaction
+        run: node tools/test_prompt_input_transaction.mjs
+
+      - name: Test panel mount failure and recovery
+        run: node tools/test_panel_lifecycle.mjs

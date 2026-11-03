@@ -1792,6 +1792,16 @@ function installBridgeSlotLabelOverlay(node) {
 
 function hideWidget(widget) {
     if (!widget || widget.__webuiBridgeHidden) return;
+    // Keep the original controls recoverable if the custom DOM host fails.
+    widget.__webuiBridgeNativeWidgetState = {
+        fields: ["type", "computeSize", "computedHeight", "y", "last_y", "width", "draw", "hidden", "origComputeSize", "__webuiBridgeHidden"]
+            .map((key) => [key, widget[key], Object.prototype.hasOwnProperty.call(widget, key)]),
+        options: widget.options,
+        optionFields: ["getMinHeight", "getMaxHeight"].map((key) => [key, widget.options?.[key],
+            Boolean(widget.options && Object.prototype.hasOwnProperty.call(widget.options, key))]),
+        element: widget.element,
+        elementStyle: widget.element?.style?.cssText,
+    };
     installWidgetSerializationFallback(widget);
     widget.__webuiBridgeHidden = true;
     widget.origComputeSize = widget.computeSize;
@@ -1825,6 +1835,11 @@ function removeBridgeDomWidgets(node) {
         if (widget?.name !== "webui_prompt_frontend") continue;
         removed = true;
         try {
+            widget.onRemove?.();
+        } catch {
+            // Continue cleanup even if an older host's unregister hook fails.
+        }
+        try {
             widget.element?.remove?.();
         } catch {
             // Ignore stale DOM cleanup errors; the widget list is the source of truth.
@@ -1832,8 +1847,34 @@ function removeBridgeDomWidgets(node) {
     }
     if (removed) {
         node.widgets = node.widgets.filter((widget) => widget?.name !== "webui_prompt_frontend");
+        node.__webuiBridgePanel = null;
     }
     return removed;
+}
+
+function restoreNativeWidgets(node) {
+    let restored = 0;
+    for (const widget of node.widgets || []) {
+        const state = widget.__webuiBridgeNativeWidgetState;
+        if (!state) continue;
+        for (const [key, value, own] of state.fields) {
+            if (widget[key] !== value) widget[key] = value;
+            if (!own) delete widget[key];
+        }
+        if (widget.options !== state.options) widget.options = state.options;
+        if (state.options) {
+            for (const [key, value, own] of state.optionFields) {
+                if (state.options[key] !== value) state.options[key] = value;
+                if (!own) delete state.options[key];
+            }
+        }
+        if (widget.element === state.element && state.element?.style && state.elementStyle !== undefined) {
+            state.element.style.cssText = state.elementStyle;
+        }
+        delete widget.__webuiBridgeNativeWidgetState;
+        restored += 1;
+    }
+    return restored;
 }
 
 function moveWidgetToFront(node, widget) {
@@ -2588,6 +2629,7 @@ function hideNativeWidgets(node) {
 
 function isBridgePanelUsable(node) {
     const panel = node.__webuiBridgePanel;
+    if (!panel?.isConnected) return false;
     if (!panel?.querySelector?.(".webui-bridge-toprow, .webui-bridge-panel-error")) return false;
     return Boolean((node.widgets || []).some((widget) => widget?.name === "webui_prompt_frontend" && widget.element === panel));
 }
@@ -3055,12 +3097,78 @@ function isBridgeGraphConfiguring() {
     return Number(app.configuringGraphLevel || 0) > 0;
 }
 
-function scheduleBridgePanelInstall(node) {
+function clearBridgePanelInstallFailure(node) {
+    const widget = node.__webuiBridgePanelFailureWidget;
+    if (widget && Array.isArray(node.widgets)) {
+        node.widgets = node.widgets.filter((item) => item !== widget);
+    }
+    node.__webuiBridgePanelFailureWidget = null;
+}
+
+function reportBridgePanelInstallFailure(node, error) {
+    console.error("[WebUIPromptBridge] Panel installation failed; restoring native inputs", error);
+    node.__webuiBridgePanelInstallError = String(error?.message || error || "Panel mount failed");
+    removeBridgeDomWidgets(node);
+    node.__webuiBridgePanel?.remove?.();
+    node.__webuiBridgePanel = null;
+    restoreNativeWidgets(node);
+    clearBridgePanelInstallFailure(node);
+    // A canvas-native notice still works when the DOM widget layer is broken.
+    if (typeof node.addWidget === "function") {
+        try {
+            const widget = node.addWidget("button", "Bridge 面板加载失败（点此重试）", null,
+                () => scheduleBridgePanelInstall(node, { retry: true }), { serialize: false });
+            if (widget) {
+                widget.serialize = false;
+                widget.options = { ...widget.options, serialize: false };
+                node.__webuiBridgePanelFailureWidget = widget;
+            }
+        } catch (noticeError) {
+            console.warn("[WebUIPromptBridge] Could not add the native recovery button", noticeError);
+        }
+    }
+    node.setDirtyCanvas?.(true, true);
+    return false;
+}
+
+function installBridgePanelSafely(node) {
+    try {
+        clearBridgePanelInstallFailure(node);
+        installWebUIPanel(node);
+        node.__webuiBridgePanelInstallError = null;
+        return true;
+    } catch (error) {
+        return reportBridgePanelInstallFailure(node, error);
+    }
+}
+
+function bridgePanelMountRecoveryState(node, now) {
+    const panel = node.__webuiBridgePanel;
+    if (!panel || panel.isConnected) {
+        node.__webuiBridgeDetachedPanelRetries = 0;
+        return "none";
+    }
+    // Vue/DOM hosts may attach after the creation callback has returned.
+    if (now - Number(node.__webuiBridgePanelMountStartedAt || 0) < 2000) return "pending";
+    if (Number(node.__webuiBridgeDetachedPanelRetries || 0) >= 1) {
+        reportBridgePanelInstallFailure(node, new Error("ComfyUI did not attach the Bridge DOM widget; native inputs have been restored"));
+        return "failed";
+    }
+    node.__webuiBridgeDetachedPanelRetries = 1;
+    return "retry";
+}
+
+function scheduleBridgePanelInstall(node, { retry = false } = {}) {
     if (node.__webuiBridgeInstallScheduled) return;
+    if (node.__webuiBridgePanelInstallError && !retry) return;
+    if (retry) {
+        node.__webuiBridgePanelInstallError = null;
+        node.__webuiBridgeDetachedPanelRetries = 0;
+    }
     if (node.__webuiBridgeFreshNode && !node.__webuiBridgeWasConfigured && !isBridgeGraphConfiguring()) {
         node.__webuiBridgeInstallScheduled = true;
         try {
-            installWebUIPanel(node);
+            installBridgePanelSafely(node);
         } finally {
             node.__webuiBridgeInstallScheduled = false;
         }
@@ -3069,7 +3177,7 @@ function scheduleBridgePanelInstall(node) {
     node.__webuiBridgeInstallScheduled = true;
     requestAnimationFrame(() => {
         node.__webuiBridgeInstallScheduled = false;
-        installWebUIPanel(node);
+        installBridgePanelSafely(node);
     });
 }
 
@@ -4146,6 +4254,17 @@ function setTextareaValue(textarea, value) {
     }, 0);
 }
 
+function withDeferredPromptInputSync(textarea, update) {
+    const previous = textarea.__webuiBridgeDeferPromptInputSync;
+    textarea.__webuiBridgeDeferPromptInputSync = true;
+    try {
+        return update();
+    } finally {
+        if (previous === undefined) delete textarea.__webuiBridgeDeferPromptInputSync;
+        else textarea.__webuiBridgeDeferPromptInputSync = previous;
+    }
+}
+
 function selectCurrentParenthesisBlock(state, open, close) {
     if (state.start !== state.end) return false;
     const before = state.text.substring(0, state.start);
@@ -4772,7 +4891,7 @@ function movePromptTagsByStep(textarea, fromIndexes, direction) {
     return movePromptTagsAtDetailed(textarea, selected, toIndex);
 }
 
-function promptDropRows(container, selector) {
+function promptDropRows(container, selector, rowTolerance = 6) {
     const items = [...container.querySelectorAll(selector)]
         .map((element) => ({
             element,
@@ -4783,7 +4902,7 @@ function promptDropRows(container, selector) {
         .sort((left, right) => left.rect.top - right.rect.top || left.rect.left - right.rect.left);
     const rows = [];
     for (const item of items) {
-        let row = rows.find((candidate) => Math.abs(candidate.top - item.rect.top) <= 6);
+        let row = rows.find((candidate) => Math.abs(candidate.top - item.rect.top) <= rowTolerance);
         if (!row) {
             row = { top: item.rect.top, bottom: item.rect.bottom, items: [] };
             rows.push(row);
@@ -4796,9 +4915,36 @@ function promptDropRows(container, selector) {
     return rows.sort((left, right) => left.top - right.top);
 }
 
+function promptDropGeometry(container, selector) {
+    // Read the container once, then reuse card geometry until its layout changes.
+    // Indicator writes happen only after these reads, avoiding per-card reflows.
+    const rect = container.getBoundingClientRect();
+    const dimensions = [rect.left, rect.top, rect.width, rect.height,
+        container.scrollLeft, container.scrollTop, container.clientWidth, container.clientHeight];
+    const cached = container.__webuiBridgeDropGeometry;
+    if (cached?.selector === selector && dimensions.every((value, index) => value === cached.dimensions[index])) {
+        return cached;
+    }
+    const scaleX = container.offsetWidth > 0 ? rect.width / container.offsetWidth : 1;
+    const scaleY = container.offsetHeight > 0 ? rect.height / container.offsetHeight : 1;
+    const geometry = {
+        selector, rect, dimensions,
+        scaleX: scaleX > 0 ? scaleX : 1,
+        scaleY: scaleY > 0 ? scaleY : 1,
+        rows: promptDropRows(container, selector, 6 * (scaleY > 0 ? scaleY : 1)),
+    };
+    container.__webuiBridgeDropGeometry = geometry;
+    return geometry;
+}
+
 function resolvePromptDropSlot(container, selector, clientX, clientY) {
-    const rows = promptDropRows(container, selector);
-    const containerRect = container.getBoundingClientRect();
+    const geometry = promptDropGeometry(container, selector);
+    const slot = resolvePromptDropSlotInRows(geometry.rows, geometry.rect, clientX, clientY);
+    slot.geometry = geometry;
+    return slot;
+}
+
+function resolvePromptDropSlotInRows(rows, containerRect, clientX, clientY) {
     if (!rows.length) {
         return { toIndex: 0, orientation: "horizontal", x: containerRect.left + 8, y: containerRect.top + 8 };
     }
@@ -4853,34 +4999,66 @@ function resolvePromptDropSlot(container, selector, clientX, clientY) {
 
 function clearPromptDropIndicator(container) {
     container.__webuiBridgeDropSlot = null;
+    container.__webuiBridgeDropGeometry = null;
+    container.__webuiBridgeDropIndicator = null;
     container.querySelector(":scope > .webui-bridge-prompt-drop-indicator")?.remove();
 }
 
 function showPromptDropIndicator(container, slot) {
-    clearPromptDropIndicator(container);
-    if (!slot) return;
-    const containerRect = container.getBoundingClientRect();
-    const indicator = el("div", {
-        class: `webui-bridge-prompt-drop-indicator ${slot.orientation}`,
-        "aria-hidden": "true",
-    });
+    if (!slot) {
+        clearPromptDropIndicator(container);
+        return;
+    }
+    const geometry = slot.geometry;
+    const containerRect = geometry?.rect || container.getBoundingClientRect();
+    const scaleX = geometry?.scaleX || 1;
+    const scaleY = geometry?.scaleY || 1;
+    let indicator = container.__webuiBridgeDropIndicator;
+    if (!indicator || indicator.parentNode !== container) {
+        indicator = el("div", { class: "webui-bridge-prompt-drop-indicator", "aria-hidden": "true" });
+        container.__webuiBridgeDropIndicator = indicator;
+        container.append(indicator);
+    }
+    const className = `webui-bridge-prompt-drop-indicator ${slot.orientation}`;
+    if (indicator.className !== className) indicator.className = className;
+    let left, top, width = "", height = "";
     if (slot.orientation === "vertical") {
-        indicator.style.left = `${Math.round(slot.x - containerRect.left + container.scrollLeft)}px`;
-        indicator.style.top = `${Math.round(slot.y - containerRect.top + container.scrollTop)}px`;
-        indicator.style.height = `${Math.max(20, Math.round((slot.bottom || slot.y + 40) - slot.y))}px`;
+        left = `${Math.round((slot.x - containerRect.left) / scaleX + container.scrollLeft)}px`;
+        top = `${Math.round((slot.y - containerRect.top) / scaleY + container.scrollTop)}px`;
+        height = `${Math.max(20, Math.round(((slot.bottom || slot.y + 40 * scaleY) - slot.y) / scaleY))}px`;
     } else {
-        indicator.style.left = `${Math.round(container.scrollLeft + 8)}px`;
-        indicator.style.top = `${Math.round(slot.y - containerRect.top + container.scrollTop)}px`;
-        indicator.style.width = `${Math.max(24, container.clientWidth - 16)}px`;
+        left = `${Math.round(container.scrollLeft + 8)}px`;
+        top = `${Math.round((slot.y - containerRect.top) / scaleY + container.scrollTop)}px`;
+        width = `${Math.max(24, container.clientWidth - 16)}px`;
+    }
+    // Most dragover events still point to the same insertion slot.
+    for (const [name, value] of Object.entries({ left, top, width, height })) {
+        if (indicator.style[name] !== value) indicator.style[name] = value;
     }
     container.__webuiBridgeDropSlot = slot;
-    container.append(indicator);
 }
 
 function configurePromptDropTarget(container, options) {
     container.__webuiBridgeDropOptions = options;
+    container.__webuiBridgeDropGeometry = null;
     if (container.__webuiBridgeDropTargetInstalled) return;
     container.__webuiBridgeDropTargetInstalled = true;
+    if (typeof MutationObserver === "function") {
+        // Async translations can change card widths without resizing the panel.
+        // Ignore indicator mutations so dragging does not invalidate its own cache.
+        const observer = new MutationObserver((records) => {
+            if (!container.__webuiBridgeDropGeometry) return;
+            const selector = container.__webuiBridgeDropOptions?.selector;
+            if (!selector) return;
+            if (records.some((record) => {
+                const target = record.type === "characterData" ? record.target.parentElement : record.target;
+                if (target?.closest?.(selector)) return true;
+                return target === container && [...(record.addedNodes || []), ...(record.removedNodes || [])]
+                    .some((node) => node.matches?.(selector));
+            })) container.__webuiBridgeDropGeometry = null;
+        });
+        observer.observe(container, { childList: true, characterData: true, subtree: true });
+    }
     container.addEventListener("dragover", (event) => {
         const current = container.__webuiBridgeDropOptions;
         const dragging = current?.getDragging?.();
@@ -4895,8 +5073,8 @@ function configurePromptDropTarget(container, options) {
     container.addEventListener("drop", (event) => {
         const current = container.__webuiBridgeDropOptions;
         const dragging = current?.getDragging?.();
-        const slot = container.__webuiBridgeDropSlot;
-        if (!dragging || !slot) return;
+        if (!dragging) return;
+        const slot = resolvePromptDropSlot(container, current.selector, event.clientX, event.clientY);
         event.preventDefault();
         event.stopPropagation();
         clearPromptDropIndicator(container);
@@ -5041,8 +5219,13 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
     const focusMovedTag = (index) => window.requestAnimationFrame?.(() => {
         chips.querySelector(`.webui-bridge-prompt-chip[data-prompt-index="${index}"]`)?.focus();
     });
+    // Commit once after updating selection, rather than rebuilding all cards in
+    // setTextareaValue's input event and immediately rebuilding them again here.
+    const applyPromptMove = (update) => typeof afterChange === "function"
+        ? withDeferredPromptInputSync(textarea, update)
+        : update();
     const applyTagMove = (fromIndexes, toIndex) => {
-        const result = movePromptTagsAtDetailed(textarea, fromIndexes, toIndex);
+        const result = applyPromptMove(() => movePromptTagsAtDetailed(textarea, fromIndexes, toIndex));
         if (!result.changed) return result;
         selectedTags.clear();
         result.newIndexes.forEach((index) => selectedTags.add(index));
@@ -5051,7 +5234,7 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
         return result;
     };
     const applyTagStep = (fromIndexes, direction) => {
-        const result = movePromptTagsByStep(textarea, fromIndexes, direction);
+        const result = applyPromptMove(() => movePromptTagsByStep(textarea, fromIndexes, direction));
         if (!result.changed) return result;
         selectedTags.clear();
         result.newIndexes.forEach((index) => selectedTags.add(index));
@@ -10774,6 +10957,10 @@ function buildPanel(node) {
     const onInput = (textarea, event = null) => {
         clearPromptPlacementWarning();
         textarea.__webuiBridgeAutoTranslateVersion = Number(textarea.__webuiBridgeAutoTranslateVersion || 0) + 1;
+        if (textarea.__webuiBridgeDeferPromptInputSync) {
+            if (textarea.__webuiBridgeAutoTranslating) textarea.__webuiBridgeAutoTranslatePending = true;
+            return;
+        }
         if (textarea.__webuiBridgeAutoTranslating) {
             textarea.__webuiBridgeAutoTranslatePending = true;
             if (event?.isTrusted) schedulePromptInputSync(textarea);
@@ -17241,7 +17428,7 @@ function installWebUIPanel(node) {
     repairBridgeNodeWidgetDefaults(node);
     if (node.__webuiBridgePanel) {
         const existingWidget = node.widgets?.find((widget) => widget.name === "webui_prompt_frontend");
-        const usablePanel = existingWidget?.element === node.__webuiBridgePanel &&
+        const usablePanel = node.__webuiBridgePanel.isConnected && existingWidget?.element === node.__webuiBridgePanel &&
             node.__webuiBridgePanel.querySelector?.(".webui-bridge-toprow, .webui-bridge-panel-error");
         const needsConfiguredLayoutRebuild = hasBridgeLayoutState(node.__webuiBridgeConfiguredLayoutState) &&
             !node.__webuiBridgeConfiguredLayoutStateApplied;
@@ -17349,7 +17536,6 @@ function installWebUIPanel(node) {
         };
         node.__webuiBridgeSetSizeWrapped = true;
     }
-    hideNativeWidgets(node);
     const hadRepairablePanelSize = shouldRepairBridgePanelSize(node.size);
     let panel = null;
     try {
@@ -17412,6 +17598,10 @@ function installWebUIPanel(node) {
         getMinHeight: () => 280,
         getMaxHeight: () => Math.max(280, PANEL_MAX_HEIGHT - DOM_WIDGET_PANEL_PAD),
     });
+    if (!domWidget || domWidget.element !== panel) {
+        throw new Error("ComfyUI addDOMWidget did not return a valid Bridge DOM widget");
+    }
+    hideNativeWidgets(node);
     installWidgetSerializationFallback(domWidget, () => null);
     pinBridgeDomWidgetToTop(node, domWidget);
     for (const widget of node.widgets || []) installWidgetSerializationFallback(widget);
@@ -17439,6 +17629,7 @@ function installWebUIPanel(node) {
     };
     applyDomWidgetSize(node.__webuiBridgeDesiredSize[0], node.__webuiBridgeDesiredSize[1]);
     node.__webuiBridgePanel = panel;
+    node.__webuiBridgePanelMountStartedAt = performance.now();
     installBridgeSlotLabelOverlay(node);
     scheduleBridgeDomWidgetPin(node, domWidget, panel);
     repairBridgePanelLayoutAfterWorkflow(node, "install-panel");
@@ -22477,15 +22668,19 @@ app.registerExtension({
             scheduleBridgePanelInstall(this);
         });
         chainCallback(nodeType.prototype, "onDrawForeground", function (ctx) {
+            if (this.flags?.collapsed) return;
             const hasSlotLabelOverlay = Boolean(this.__webuiBridgeSlotLabelOverlay?.isConnected);
             if (!hasSlotLabelOverlay) drawBridgeExternalSlotLabels(this, ctx);
             if (isBridgePanelUsable(this)) {
+                this.__webuiBridgeDetachedPanelRetries = 0;
                 if (!hasSlotLabelOverlay) installBridgeSlotLabelOverlay(this);
                 return;
             }
             const now = performance.now();
             if (now - (this.__webuiBridgeLastHealthInstall || 0) < 1000) return;
             this.__webuiBridgeLastHealthInstall = now;
+            const mountState = bridgePanelMountRecoveryState(this, now);
+            if (mountState === "pending" || mountState === "failed") return;
             scheduleBridgePanelInstall(this);
         });
     },
