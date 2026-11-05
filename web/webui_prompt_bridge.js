@@ -2418,10 +2418,17 @@ function scheduleBridgeDomWidgetPin(node, widget, panel) {
 function repairBridgePanelLayoutAfterWorkflow(node, reason = "workflow") {
     if (!node || node.type !== TARGET_NODE) return;
     const run = () => {
+        if (!node.graph || node.flags?.collapsed) return;
         if (!isBridgePanelUsable(node)) {
+            // Layout-repair timers run before an async DOM host has mounted.
+            // Reinstalling here resets the mount deadline and starts another
+            // repair timer chain, bypassing the bounded draw-hook recovery.
+            const mountState = bridgePanelMountRecoveryState(node, performance.now());
+            if (mountState === "pending" || mountState === "failed") return;
             scheduleBridgePanelInstall(node);
             return;
         }
+        node.__webuiBridgeDetachedPanelRetries = 0;
         const widget = node.widgets?.find((item) => item?.name === "webui_prompt_frontend" && item.element === node.__webuiBridgePanel);
         const panel = node.__webuiBridgePanel;
         const desired = resolveBridgePanelSizeForLiveState(node, { clearConfiguredLock: true });
@@ -3122,6 +3129,7 @@ function reportBridgePanelInstallFailure(node, error) {
                 widget.serialize = false;
                 widget.options = { ...widget.options, serialize: false };
                 node.__webuiBridgePanelFailureWidget = widget;
+                moveWidgetToFront(node, widget);
             }
         } catch (noticeError) {
             console.warn("[WebUIPromptBridge] Could not add the native recovery button", noticeError);
@@ -3143,6 +3151,7 @@ function installBridgePanelSafely(node) {
 }
 
 function bridgePanelMountRecoveryState(node, now) {
+    if (node.__webuiBridgeInstallScheduled) return "pending";
     const panel = node.__webuiBridgePanel;
     if (!panel || panel.isConnected) {
         node.__webuiBridgeDetachedPanelRetries = 0;
@@ -3165,7 +3174,11 @@ function scheduleBridgePanelInstall(node, { retry = false } = {}) {
         node.__webuiBridgePanelInstallError = null;
         node.__webuiBridgeDetachedPanelRetries = 0;
     }
-    if (node.__webuiBridgeFreshNode && !node.__webuiBridgeWasConfigured && !isBridgeGraphConfiguring()) {
+    // Vue must observe the old host's unregistration before the same widget
+    // name is registered again; a same-tick replacement can stay detached.
+    const waitForHostUnmount = Boolean(node.__webuiBridgePanel && !node.__webuiBridgePanel.isConnected);
+    if (waitForHostUnmount) removeBridgeDomWidgets(node);
+    if (node.__webuiBridgeFreshNode && !node.__webuiBridgeWasConfigured && !isBridgeGraphConfiguring() && !waitForHostUnmount) {
         node.__webuiBridgeInstallScheduled = true;
         try {
             installBridgePanelSafely(node);
@@ -3177,6 +3190,7 @@ function scheduleBridgePanelInstall(node, { retry = false } = {}) {
     node.__webuiBridgeInstallScheduled = true;
     requestAnimationFrame(() => {
         node.__webuiBridgeInstallScheduled = false;
+        if (!node.graph) return;
         installBridgePanelSafely(node);
     });
 }

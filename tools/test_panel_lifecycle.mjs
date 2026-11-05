@@ -45,7 +45,7 @@ function fixture() {
         scheduleBridgeDomWidgetPin: noop, repairBridgePanelLayoutAfterWorkflow: noop,
         isBridgeGraphConfiguring: () => false,
     });
-    const names = ["hideWidget", "removeBridgeDomWidgets", "shouldHideNativeWidget", "hideNativeWidgets", "isBridgePanelUsable",
+    const names = ["hideWidget", "removeBridgeDomWidgets", "moveWidgetToFront", "shouldHideNativeWidget", "hideNativeWidgets", "isBridgePanelUsable",
         "installWebUIPanel", "scheduleBridgePanelInstall"];
     for (const name of names) vm.runInContext(functionSource(name), context);
     for (const name of ["restoreNativeWidgets", "clearBridgePanelInstallFailure", "reportBridgePanelInstallFailure", "installBridgePanelSafely", "bridgePanelMountRecoveryState"]) {
@@ -138,6 +138,7 @@ assert.equal(removed, 1, "Stale widget was removed from the array without unregi
     assert(notice && notice.type === "button", "Failure had no canvas-rendered recovery control");
     assert.equal(notice.options.serialize, false);
     assert.equal(notice.serialize, false);
+    assert.equal(f.node.widgets[0], notice, "The recovery button is buried below the native parameter list");
     assert.equal(f.node.__webuiBridgeInstallScheduled, false);
     const widgetCount = f.node.widgets.length;
     f.context.scheduleBridgePanelInstall(f.node);
@@ -180,4 +181,114 @@ assert.equal(removed, 1, "Stale widget was removed from the array without unregi
     assert.equal(f.context.isBridgePanelUsable(f.node), true);
     assert.equal(f.node.widgets.filter(item => item.name === "webui_prompt_frontend").length, 1);
 }
-console.log("Panel lifecycle: failed/missing DOM API, native input preservation/restoration, healthy mount, detached-host recovery, unregister, bounded errors and manual retry passed.");
+// Exercise the real layout-repair/install feedback path, not just isolated
+// mount-state calls. Vue hosts can attach asynchronously and may never call
+// LiteGraph's onDrawForeground, so recovery must also work without that hook.
+function layoutMountFixture(attachDelay) {
+    const f = fixture();
+    let now = 10000;
+    let sequence = 0;
+    let mounts = 0;
+    let unregisters = 0;
+    const jobs = [];
+    const schedule = (callback, delay = 0) => {
+        jobs.push({ callback, at: now + delay, sequence: sequence++ });
+        return sequence;
+    };
+    f.context.performance.now = () => now;
+    f.context.requestAnimationFrame = f.context.window.requestAnimationFrame = callback => schedule(callback, 16);
+    f.context.window.setTimeout = schedule;
+    f.context.TARGET_NODE = f.node.type = "WebUIPromptBridge";
+    f.context.WORKFLOW_LAYOUT_REPAIR_DELAYS = [0, 32, 120, 360, 900, 1600, 3200, 6500];
+    f.context.resolveBridgePanelSizeForLiveState = () => [1000, 700];
+    f.context.bridgeConfiguredSizeLockActive = () => false;
+    f.node.__webuiBridgeFreshNode = true;
+    f.context.buildPanel = () => {
+        const panel = { ...f.panel, style: {}, isConnected: false };
+        mounts++;
+        const delay = typeof attachDelay === "function" ? attachDelay(mounts) : attachDelay;
+        if (Number.isFinite(delay)) schedule(() => { panel.isConnected = true; }, delay);
+        return panel;
+    };
+    const addDOMWidget = f.node.addDOMWidget;
+    f.node.addDOMWidget = function (...args) {
+        const widget = addDOMWidget.apply(this, args);
+        widget.onRemove = () => unregisters++;
+        return widget;
+    };
+    vm.runInContext(functionSource("repairBridgePanelLayoutAfterWorkflow"), f.context);
+    return {
+        ...f,
+        run() {
+            f.context.scheduleBridgePanelInstall(f.node);
+            let callbacks = 0;
+            while (jobs.length && callbacks < 200) {
+                jobs.sort((a, b) => a.at - b.at || a.sequence - b.sequence);
+                if (jobs[0].at > 20000) break;
+                const job = jobs.shift();
+                now = job.at;
+                job.callback();
+                callbacks++;
+            }
+            return { mounts, unregisters, callbacks };
+        },
+    };
+}
+{
+    const f = fixture();
+    f.context.installWebUIPanel(f.node);
+    f.panel.isConnected = false;
+    f.frames.length = 0;
+    assert.equal(f.context.bridgePanelMountRecoveryState(f.node, 12000), "retry");
+    f.context.buildPanel = () => ({ ...f.panel, style: {}, isConnected: true });
+    f.context.scheduleBridgePanelInstall(f.node);
+    assert.equal(f.node.widgets.some(w => w.name === "webui_prompt_frontend"), false,
+        "The Vue host must observe unregistration before reusing the same widget name");
+    assert.equal(f.context.bridgePanelMountRecoveryState(f.node, 15000), "pending");
+    assert.equal(f.node.__webuiBridgeDetachedPanelRetries, 1, "A pending remount reset the retry budget");
+    f.frames.shift()();
+    assert.equal(f.context.isBridgePanelUsable(f.node), true);
+}
+{
+    const f = layoutMountFixture(250);
+    const result = f.run();
+    assert.equal(result.mounts, 1, `A healthy async host was rebuilt before it could attach: ${JSON.stringify(result)}`);
+    assert.equal(result.unregisters, 0);
+    assert.equal(f.context.isBridgePanelUsable(f.node), true);
+    assert.equal(f.widget.hidden, true);
+}
+{
+    const f = layoutMountFixture(Infinity);
+    const result = f.run();
+    assert.equal(result.mounts, 2, `A failed mount escaped its retry budget: ${JSON.stringify(result)}`);
+    assert(result.callbacks < 200, "Layout repair generated an unbounded install/timer loop");
+    assert.equal(f.widget.hidden, false, "No draw callback: native inputs stayed hidden forever");
+    assert(f.node.__webuiBridgePanelFailureWidget, "No draw callback: no retry button was shown");
+    assert.equal(f.widget.value, "keep this prompt");
+    assert.equal(result.unregisters, 2);
+}
+{
+    const f = layoutMountFixture(attempt => attempt === 1 ? Infinity : 250);
+    const result = f.run();
+    assert.equal(result.mounts, 2);
+    assert.equal(result.unregisters, 1);
+    assert.equal(f.context.isBridgePanelUsable(f.node), true);
+    assert.equal(f.node.__webuiBridgePanelInstallError, null);
+    assert.equal(f.node.__webuiBridgeDetachedPanelRetries, 0, "A successful remount kept the old failure budget");
+}
+for (const inactive of ["removed", "collapsed"]) {
+    const f = layoutMountFixture(Infinity);
+    if (inactive === "removed") f.node.graph = null;
+    if (inactive === "collapsed") f.node.flags = { collapsed: true };
+    assert.equal(f.run().mounts, 1, `Layout repair remounted an inactive node: ${inactive}`);
+    assert.equal(Boolean(f.node.__webuiBridgePanelFailureWidget), false);
+}
+{
+    const f = fixture();
+    f.context.scheduleBridgePanelInstall(f.node);
+    f.node.graph = null;
+    f.frames.shift()();
+    assert.equal(f.widget.hidden, false, "A removed node was installed by a queued frame");
+    assert.equal(f.node.__webuiBridgePanel, undefined);
+}
+console.log("Panel lifecycle: native fallback/retry, async host grace, real layout-repair retry budget and recovery without draw callbacks passed.");
