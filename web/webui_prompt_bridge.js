@@ -5319,7 +5319,7 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
                 }, 420);
             },
             onclick: (event) => {
-                if (event.target.closest(".webui-bridge-chip-tools, .webui-bridge-chip-tools-toggle")) return;
+                if (event.target.closest(".webui-bridge-chip-tools, .webui-bridge-chip-tools-toggle, .webui-bridge-chip-quick-delete")) return;
                 if (row.__webuiBridgeDragJustEnded) return;
                 if ((event.ctrlKey || event.metaKey) && !tag.disabled) {
                     if (selectedTags.has(tag.index)) selectedTags.delete(tag.index);
@@ -5361,7 +5361,7 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
                 }
             },
             ondragstart: (event) => {
-                if (tag.disabled || event.target.closest(".webui-bridge-chip-tools, .webui-bridge-chip-tools-toggle")) {
+                if (tag.disabled || event.target.closest(".webui-bridge-chip-tools, .webui-bridge-chip-tools-toggle, .webui-bridge-chip-quick-delete")) {
                     event.preventDefault();
                     return;
                 }
@@ -5513,6 +5513,35 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
         });
         chip.append(toolsToggle);
         chip.append(tools);
+        // Compact A1111-style delete affordance in the chip's upper-right
+        // corner. Reuse deleteChip() so duplicate tags and disabled entries
+        // behave exactly like deletion from the existing toolbar.
+        const quickDelete = el("button", {
+            class: "webui-bridge-chip-quick-delete",
+            type: "button",
+            title: "删除当前关键词",
+            "aria-label": "删除当前关键词",
+            draggable: "false",
+            onpointerdown: (event) => event.stopPropagation(),
+            onmousedown: (event) => event.stopPropagation(),
+            onmouseup: (event) => event.stopPropagation(),
+            ondragstart: (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+            },
+            ondblclick: (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+            },
+            onclick: (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                window.clearTimeout(row.__webuiBridgeClickTimer);
+                deleteChip(tag);
+                afterChange?.();
+            },
+        }, "×");
+        chip.append(quickDelete);
         function startChipEdit(node, item) {
             if (item.disabled) return;
             node.innerHTML = "";
@@ -19055,6 +19084,50 @@ function addStyles() {
         .webui-bridge-chip-tools-toggle:hover {
             border-color: #c7dcff;
             background: #24466f;
+        }
+        .webui-bridge-chip-quick-delete {
+            position: absolute;
+            z-index: 90;
+            top: -7px;
+            right: -6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 17px;
+            height: 17px;
+            padding: 0;
+            border: 1px solid #99525b;
+            border-radius: 5px;
+            background: #34212a;
+            color: #ffccd0;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, .45);
+            font: 700 13px/1 Arial, sans-serif;
+            cursor: pointer;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-user-drag: none;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 80ms ease;
+        }
+        .webui-bridge-prompt-chip:hover > .webui-bridge-chip-quick-delete,
+        .webui-bridge-prompt-chip:focus-within > .webui-bridge-chip-quick-delete,
+        .webui-bridge-prompt-chip.show-tools > .webui-bridge-chip-quick-delete,
+        .webui-bridge-chip-quick-delete:focus-visible {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .webui-bridge-chip-quick-delete:hover,
+        .webui-bridge-chip-quick-delete:focus-visible {
+            background: #7c2b38;
+            border-color: #f0848f;
+            color: #ffffff;
+        }
+        @media (pointer: coarse) {
+            .webui-bridge-prompt-chip > .webui-bridge-chip-quick-delete {
+                opacity: 1;
+                pointer-events: auto;
+            }
         }
         .webui-bridge-chip-tools {
             position: absolute;
