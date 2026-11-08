@@ -42,6 +42,7 @@ jobs:
           node --check "$RUNNER_TEMP/webui_prompt_bridge.mjs"
           node --check tools/verify_frontend_compat.mjs
           node --check tools/test_panel_mount_browser.mjs
+          node --check tools/test_layout_browser.mjs
 
       - name: Test widget batch updates
         run: node tools/test_widget_batch.mjs
@@ -54,3 +55,6 @@ jobs:
 
       - name: Test panel mount failure and recovery
         run: node tools/test_panel_lifecycle.mjs
+
+      - name: Test section layout budgets and native resize
+        run: node tools/test_layout_budget.mjs

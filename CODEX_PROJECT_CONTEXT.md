@@ -1,6 +1,15 @@
 # WebUIPromptBridge Codex Project Context
 
-Updated: 2026-06-25
+Updated: 2026-11-08
+
+## Latest layout audit (v0.4.37)
+
+- See `docs/layout-audit-2026-11-08.md` for verified scope and limits; the early blank-panel reproduction report only established mounting, not usable internal layout.
+- Repair invalid Prompt/LoRA section budgets even when stale minimum heights were saved; keep node dimensions, valid manual splits and inner editor heights. All comparisons must use unscaled CSS layout pixels.
+- Existing elements own their preferred section/sidebar sizes. Global layout storage is a new-panel default, not an authority shared by every node during serialization or resize.
+- Keep typed-array native `setSize` support, LoRA overlay restoration, and the socket-aware Vue prompt-only host positioning/health checks.
+- `tools/test_layout_budget.mjs` tests pure layout budgets, independent preferences and typed-array resize; `tools/test_layout_browser.mjs --isolated --url=...` runs a disposable two-renderer layout matrix without generation.
+- Inspect rendered node, host and panel bounds **and** internal section allocation. A connected DOM element or visible input alone is not layout acceptance.
 
 This file is a maintainer-oriented memory map for future Codex sessions. It is not release documentation. Read this first when debugging layout, persistence, LoRA performance, or DOM element location issues.
 

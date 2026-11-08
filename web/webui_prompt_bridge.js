@@ -869,9 +869,10 @@ function clampNumber(value, min, max) {
 }
 
 function applyStoredHeight(target, storageKey, { min = 48, max = 640 } = {}) {
-    const value = readLocalNumber(storageKey, null);
+    const value = target?.__webuiBridgePreferredHeight ?? readLocalNumber(storageKey, null);
     if (value === null) return;
     const height = clampNumber(value, min, max);
+    target.__webuiBridgePreferredHeight = height;
     if (Math.abs((resizeTargetLayoutHeight(target) || 0) - height) < 1 &&
         target.style.flex === "0 0 auto") {
         return;
@@ -916,6 +917,27 @@ function resizeTargetLayoutHeight(target) {
     return target.offsetHeight || target.getBoundingClientRect?.().height || 0;
 }
 
+// Only repair an invalid section budget, not small intentional manual gaps.
+// All dimensions here are CSS layout pixels (never zoomed viewport pixels).
+function fitBridgeSectionBudget({ top, extra, available, topMin, extraMin, comfortTop, tolerance = 96 }) {
+    if (![top, extra, available, topMin, extraMin, comfortTop].every(Number.isFinite)) return null;
+    if (available < topMin + extraMin) return null;
+    const delta = available - top - extra;
+    // Host scrollbars / wrapped toolbar rows can settle by a few pixels after
+    // a zoom or collapse. Do not persist those transient rounding changes.
+    if (delta >= -24 && delta <= tolerance) return null;
+    let nextTop;
+    if (delta > 0) {
+        // Restore a useful prompt area, then give the rest to scrollable LoRA
+        // rows instead of making a huge empty prompt column or shrinking the node.
+        nextTop = clampNumber(Math.max(top, comfortTop), topMin, available - extraMin);
+    } else {
+        nextTop = clampNumber(available * top / Math.max(top + extra, 1), topMin, available - extraMin);
+    }
+    nextTop = Math.min(Math.round(nextTop), Math.floor(available - extraMin));
+    return { top: nextTop, extra: Math.floor(available - nextTop) };
+}
+
 function resizeTargetLayoutWidth(target) {
     if (!target) return 0;
     return target.offsetWidth || target.getBoundingClientRect?.().width || 0;
@@ -943,6 +965,7 @@ function gridColumnGap(target) {
 function setResizeTargetHeight(target, storageKey, height, { min = 48, max = 640, persist = true, auto = false } = {}) {
     if (!target) return;
     const nextHeight = clampNumber(height, min, max);
+    if (persist) target.__webuiBridgePreferredHeight = nextHeight;
     const key = resizeTargetKey(target, storageKey);
     if (auto) target.__webuiBridgeAutoHeightWrite = true;
     if (Math.abs((resizeTargetLayoutHeight(target) || 0) - nextHeight) < 1 &&
@@ -967,6 +990,7 @@ function resetResizeTargetHeight(target, storageKey, fill = "") {
     if (!target) return;
     const key = resizeTargetKey(target, storageKey);
     if (key) clearLocalValue(key);
+    delete target.__webuiBridgePreferredHeight;
     target.style.height = "";
     target.style.flex = fill;
 }
@@ -974,7 +998,10 @@ function resetResizeTargetHeight(target, storageKey, fill = "") {
 function persistResizeTargetHeight(target, storageKey) {
     const key = resizeTargetKey(target, storageKey);
     const height = resizeTargetLayoutHeight(target);
-    if (key && Number.isFinite(height) && height > 0) writeLocalNumber(key, height);
+    if (Number.isFinite(height) && height > 0) {
+        target.__webuiBridgePreferredHeight = height;
+        if (key) writeLocalNumber(key, height);
+    }
 }
 
 function applyTopRowCollapsedState(topRow, collapsed) {
@@ -1146,6 +1173,7 @@ function setSidebarWidth(topRow, storageKey, width, options = {}) {
     const min = options.min ?? ACTION_SIDEBAR_MIN_WIDTH;
     const max = Number.isFinite(options.resolvedMax) ? options.resolvedMax : sidebarWidthMax(topRow, options);
     const nextWidth = clampNumber(width, min, max);
+    if (storageKey) topRow.__webuiBridgePreferredSidebarWidth = width;
     topRow.style.setProperty("--webui-bridge-sidebar-width", `${nextWidth}px`);
     if (storageKey && options.persist !== false) writeLocalNumber(storageKey, nextWidth);
     return nextWidth;
@@ -1160,6 +1188,7 @@ function resetSidebarWidth(topRow, storageKey, options = {}) {
     if (!topRow) return;
     if (storageKey) clearLocalValue(storageKey);
     const width = setSidebarWidth(topRow, "", options.defaultWidth ?? ACTION_SIDEBAR_DEFAULT_WIDTH, options);
+    topRow.__webuiBridgePreferredSidebarWidth = width;
     options.onCommit?.(width);
 }
 
@@ -1943,8 +1972,14 @@ function syncBridgeDomWidgetWrapper(panel, width, height, options = {}) {
             current.classList?.contains("lg-node-widgets")) break;
         current = current.parentElement;
     }
+    // Vue's prompt-only node includes normal socket rows above its widget.
+    // A fixed-height widget in that flex flow feeds node-height + socket-height
+    // back into onResize forever. Anchor the widget host inside the node instead.
+    const promptOnlyHost = panel.classList?.contains("webui-bridge-prompt-only-panel")
+        ? panel.closest?.(".lg-node-widgets") : null;
+    if (promptOnlyHost && !roots.includes(promptOnlyHost)) roots.push(promptOnlyHost);
     for (const root of roots) {
-        root.classList?.add?.("webui-bridge-dom-widget-shell");
+        if (!root.classList?.contains("webui-bridge-dom-widget-shell")) root.classList?.add?.("webui-bridge-dom-widget-shell");
         setImportant(root, "width", "100%");
         setImportant(root, "max-width", "none");
         setImportant(root, "min-width", "0");
@@ -1955,9 +1990,19 @@ function syncBridgeDomWidgetWrapper(panel, width, height, options = {}) {
     }
     const host = roots.find((root) => root.classList?.contains("lg-node-widgets"));
     if (host) {
+        let topInset = 34;
+        if (promptOnlyHost === host) {
+            const vueNode = host.closest(".lg-node");
+            const nodeRect = vueNode?.getBoundingClientRect();
+            const scale = nodeRect?.height / vueNode?.offsetHeight || 1;
+            for (const slot of vueNode?.querySelectorAll(".lg-slot--input, .lg-slot--output") || []) {
+                if (host.contains(slot)) continue;
+                topInset = Math.max(topInset, (slot.getBoundingClientRect().bottom - nodeRect.top) / scale + 8);
+            }
+        }
         setImportant(host, "left", `${DOM_WIDGET_INPUT_LABEL_GUTTER}px`);
         setImportant(host, "right", `${DOM_WIDGET_OUTPUT_LABEL_GUTTER}px`);
-        setImportant(host, "top", "34px");
+        setImportant(host, "top", `${Math.ceil(topInset)}px`);
         setImportant(host, "bottom", "10px");
         setImportant(host, "width", "auto");
         setImportant(host, "height", "auto");
@@ -1989,6 +2034,16 @@ function syncBridgeDomWidgetWrapper(panel, width, height, options = {}) {
 function bridgeDomWidgetShellNeedsSync(panel, root) {
     const expected = panel?.__webuiBridgeExpectedWidgetSize;
     if (!panel?.isConnected || !root?.isConnected || !Array.isArray(expected)) return false;
+    if (panel.classList?.contains("webui-bridge-prompt-only-panel")) {
+        const host = panel.closest?.(".lg-node-widgets");
+        if (host) {
+            // This host fills the space below socket rows, not the legacy
+            // node-height - 70 rectangle. Comparing those heights makes the
+            // MutationObserver repeatedly "repair" an already correct shell.
+            return host.style.position !== "absolute" || root.style.height !== "100%" ||
+                root.style.width !== "100%" || panel.style.height !== "100%";
+        }
+    }
     const [expectedWidth, expectedHeight] = expected;
     if (!Number.isFinite(expectedWidth) || !Number.isFinite(expectedHeight)) return false;
     const width = root.offsetWidth || panel.offsetWidth || 0;
@@ -15445,6 +15500,8 @@ function buildPanel(node) {
     let suppressPromptInnerFitUntil = 0;
     let manualNodeResizeActive = false;
     let promptLoraSplitManual = false;
+    let recoveredExtraMaxHeight = Math.max(EXTRA_NETWORKS_INLINE_MAX_HEIGHT,
+        Number(configuredLayoutState?.extra_height) || 0);
     let promptInnerSplitManual = [
         positiveTextareaHeightKey,
         negativeTextareaHeightKey,
@@ -16004,6 +16061,7 @@ function buildPanel(node) {
     let extraCollapsed = readLocalBoolean(extraCollapsedKey, false);
     let actionCollapsed = readLocalBoolean(actionCollapsedKey, false);
     let loraOverlayOpen = false;
+    let loraOverlayWasCollapsed = false;
     const resetPromptWorkspaceScroll = () => {
         if (!promptsColumn?.isConnected) return;
         // A restored node can be shorter than the previous manual layout.  Keep
@@ -16076,7 +16134,7 @@ function buildPanel(node) {
         if (promptLoraSplitManual) return;
         if (!extraSection?.isConnected || resizeTargetHidden(extraSection)) return;
         if (!panelLayoutIsMeasurable()) return;
-        const height = extraSection?.getBoundingClientRect?.().height || 0;
+        const height = resizeTargetLayoutHeight(extraSection);
         const maxExtraHeight = getExtraResizeMaxHeight();
         const targetHeight = clampNumber(
             Math.max(getExtraVisibleFloor?.() || EXTRA_NETWORKS_MIN_HEIGHT, preferredHeight),
@@ -16116,6 +16174,9 @@ function buildPanel(node) {
     }, extraCollapsed ? "显示 LoRA" : "隐藏 LoRA");
     networkControls.prepend(extraToggle);
     const openLoraOverlay = () => {
+        if (loraOverlayOpen) return;
+        loraOverlayWasCollapsed = extraCollapsed;
+        captureExpandedPromptLoraSplit();
         loraOverlayOpen = true;
         extraCollapsed = false;
         writeLocalBoolean(extraCollapsedKey, false);
@@ -16123,13 +16184,15 @@ function buildPanel(node) {
         extraSection?.classList?.remove("collapsed");
         extraBody.style.display = "";
         extraToggle.textContent = "隐藏 LoRA";
-        clearLocalValue(extraHeightKey);
         extraSection.style.height = "";
         extraSection.style.flex = "";
     };
     const closeLoraOverlay = () => {
         loraOverlayOpen = false;
         panel?.classList?.remove("lora-overlay");
+        extraCollapsed = loraOverlayWasCollapsed;
+        writeLocalBoolean(extraCollapsedKey, extraCollapsed);
+        applyExtraCollapsedState();
     };
     const overlayClose = el("button", {
         class: "webui-bridge-network-tool webui-bridge-lora-overlay-close",
@@ -16712,7 +16775,8 @@ function buildPanel(node) {
     };
     const getExtraVisibleFloor = () => extraCollapsed ? 42 : EXTRA_NETWORKS_MIN_HEIGHT;
     function getExtraResizeMaxHeight() {
-        const inlineMax = extraSection?.__webuiBridgeMaxHeight || EXTRA_NETWORKS_INLINE_MAX_HEIGHT;
+        const inlineMax = Math.max(extraSection?.__webuiBridgeMaxHeight || EXTRA_NETWORKS_INLINE_MAX_HEIGHT,
+            recoveredExtraMaxHeight);
         return negative.row?.classList?.contains("collapsed")
             ? Math.max(inlineMax, EXTRA_NETWORKS_MAX_HEIGHT)
             : inlineMax;
@@ -16987,8 +17051,10 @@ function buildPanel(node) {
         const sidebarWidth = topRow
             ? Number.parseFloat(getComputedStyle(topRow).getPropertyValue("--webui-bridge-sidebar-width"))
             : null;
-        const storedTopHeight = readLocalNumber(topRowHeightKey, null);
-        const storedExtraHeight = readLocalNumber(extraHeightKey, null);
+        // Global storage is a default for new panels, not the state of every
+        // existing node. Another node/tab may have written different values.
+        const storedTopHeight = topRow.__webuiBridgePreferredHeight ?? null;
+        const storedExtraHeight = extraSection.__webuiBridgePreferredHeight ?? null;
         const preferStoredPromptLoraSplit = Boolean(promptLoraSplitManual || extraCollapsed);
         const layoutState = normalizeBridgeLayoutState({
             top_row_height: preferStoredPromptLoraSplit && storedTopHeight !== null
@@ -17062,12 +17128,16 @@ function buildPanel(node) {
     const refreshSidebarWidth = () => setSidebarWidth(
         topRow,
         "",
-        readLocalNumber(actionWidthKey, actionWidthOptions.defaultWidth),
+        topRow.__webuiBridgePreferredSidebarWidth ?? readLocalNumber(actionWidthKey, actionWidthOptions.defaultWidth),
         actionWidthOptions,
     );
     if (typeof ResizeObserver !== "undefined") {
-        const sidebarResizeObserver = new ResizeObserver(refreshSidebarWidth);
+        const sidebarResizeObserver = new ResizeObserver(() => {
+            refreshSidebarWidth();
+            scheduleAdaptiveLayout();
+        });
         sidebarResizeObserver.observe(topRow);
+        sidebarResizeObserver.observe(panel);
         panel.__webuiBridgeSidebarResizeObserver = sidebarResizeObserver;
     }
     window.requestAnimationFrame?.(refreshSidebarWidth);
@@ -17172,6 +17242,31 @@ function buildPanel(node) {
             settleTolerance,
             largeBottomBlank: blank > largeBottomBlankThreshold,
         };
+    };
+
+    const repairPanelSectionBudget = () => {
+        if (manualNodeResizeActive || extraCollapsed || loraOverlayOpen || !panelLayoutIsMeasurable() ||
+            resizeTargetHidden(topRow) || resizeTargetHidden(extraSection)) return;
+        const gap = getExtraSectionBottomGapMetrics();
+        const top = resizeTargetLayoutHeight(topRow);
+        const extra = resizeTargetLayoutHeight(extraSection);
+        const plan = fitBridgeSectionBudget({
+            top, extra, available: top + extra + gap.blank / gap.viewportScale,
+            topMin: getTopRowVisibleMinHeight(), extraMin: getExtraVisibleFloor(),
+            comfortTop: getTopRowComfortHeight(),
+            tolerance: Math.max(96, resizeTargetLayoutHeight(panel) * 0.08),
+        });
+        if (!plan) return;
+        // A deliberately tall node may need more than the default 520px LoRA
+        // cap. Keep its dimensions and inner editor heights; use the space.
+        recoveredExtraMaxHeight = Math.max(recoveredExtraMaxHeight, plan.extra);
+        promptLoraSplitManual = true;
+        setResizeTargetHeight(topRow, topRowHeightKey, plan.top, {
+            min: getTopRowVisibleMinHeight(), max: topRow.__webuiBridgeMaxHeight,
+        });
+        setResizeTargetHeight(extraSection, extraHeightKey, plan.extra, {
+            min: getExtraVisibleFloor(), max: getExtraResizeMaxHeight(),
+        });
     };
 
     panel.__webuiBridgeHandlePromptCollapseChange = (detail = {}) => {
@@ -17309,6 +17404,7 @@ function buildPanel(node) {
                     fillAvailable: activePreset === "default" || activePreset === "roomy",
                 });
                 ensureUsableExtraHeight();
+                repairPanelSectionBudget();
             });
         });
     };
@@ -17477,7 +17573,9 @@ function installWebUIPanel(node) {
     if (!node.__webuiBridgeSetSizeWrapped && typeof node.setSize === "function") {
         const originalSetSize = node.setSize.bind(node);
         node.setSize = function (size) {
-            if (Array.isArray(size) && Number.isFinite(size[0]) && Number.isFinite(size[1])) {
+            // Current LiteGraph stores size in a typed array. Native corner
+            // resizing passes that array; rejecting it bypassed all syncing.
+            if ((Array.isArray(size) || ArrayBuffer.isView(size)) && Number.isFinite(size[0]) && Number.isFinite(size[1])) {
                 const requestedNeedsRepair = shouldRepairBridgePanelSize(size);
                 const currentWidth = Math.round(Number(node.size?.[0] || 0));
                 const currentHeight = Math.round(Number(node.size?.[1] || 0));
@@ -21566,6 +21664,17 @@ function addStyles() {
             background: #202630;
             color: #e7ebf1;
             font-size: 12px;
+        }
+        .lg-node:has(.webui-bridge-prompt-only-panel) .lg-node-widgets {
+            display: block !important;
+        }
+        .lg-node:has(.webui-bridge-prompt-only-panel) .lg-node-widgets > .lg-node-widget:not(:has(.webui-bridge-prompt-only-panel)),
+        .lg-node-widget:has(.webui-bridge-prompt-only-panel) > div:not(:has(.webui-bridge-prompt-only-panel)) {
+            display: none !important;
+        }
+        .lg-node-widget:has(.webui-bridge-prompt-only-panel) > div:has(.webui-bridge-prompt-only-panel) {
+            grid-column: 1 / -1 !important;
+            grid-row: 1 !important;
         }
         .webui-bridge-prompt-only-label {
             display: flex;
