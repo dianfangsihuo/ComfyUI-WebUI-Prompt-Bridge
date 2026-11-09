@@ -2363,6 +2363,36 @@ def _favorite_sub_category_value(item):
     return str(value or "").strip() or "未分类"
 
 
+FAVORITE_TRANSLATION_BATCH_LIMIT = 20
+
+
+def _favorite_needs_chinese_name(item):
+    prompt = _prompt_all_in_one_item_prompt(item).strip()
+    name = str(item.get("name") or "").strip()
+    return bool(prompt and (not name or name == prompt))
+
+
+def _preview_favorite_chinese_name(kind, item_id):
+    """Translate one stored favorite without mutating it or trusting client text."""
+    items = _storage_get(_storage_key("favorite", kind), [])
+    item = next((item for index, item in enumerate(items if isinstance(items, list) else [])
+                 if isinstance(item, dict) and _prompt_all_in_one_item_id(item, index) == item_id), None)
+    if not item or not _favorite_needs_chinese_name(item):
+        return {"id": item_id, "status": "skipped", "message": "已删除或已有自定义名称"}
+    prompt = _prompt_all_in_one_item_prompt(item).strip()
+    if len(prompt) > 4000 or len(_split_prompt_all_in_one_tags(prompt)) > 32:
+        return {"id": item_id, "status": "skipped", "message": "单条最多 4000 字符 / 32 个标签，请拆分后翻译"}
+    diagnostics = {}
+    tags = _translate_prompt_all_in_one_text(prompt, "local", "zh_CN", diagnostics)
+    words = [tag for tag in tags if tag.get("input") != "\n"]
+    name = "，".join(str(tag.get("local") or "").strip() for tag in words)
+    valid = bool(words and all(tag.get("matched") for tag in words) and re.search(r"[\u3400-\u9fff]", name)
+                 and len(name) <= MAX_STYLE_NAME_LENGTH)
+    return {"id": item_id, "prompt": prompt, "expected_name": str(item.get("name") or ""),
+            "name": name if valid else "", "status": "ready" if valid else "failed",
+            "message": "待确认保存" if valid else "未完整匹配中文说明，保留原文；请检查翻译设置", "diagnostics": diagnostics}
+
+
 def _mutate_prompt_all_in_one_favorites(
     kind,
     operation,
@@ -2428,6 +2458,25 @@ def _mutate_prompt_all_in_one_favorites(
             )
             items.append(last_item)
             existing_keys.add(identity)
+            changed += 1
+
+    elif operation == "fill_chinese_names":
+        updates = {str(entry.get("id") or ""): entry for entry in (entries or [])[:FAVORITE_TRANSLATION_BATCH_LIMIT]
+                   if isinstance(entry, dict)}
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            entry = updates.get(_prompt_all_in_one_item_id(item, index))
+            if not entry or not _favorite_needs_chinese_name(item):
+                continue
+            # Optimistic check protects edits made while preview requests ran.
+            if (_prompt_all_in_one_item_prompt(item).strip() != str(entry.get("prompt") or "").strip()
+                    or str(item.get("name") or "") != str(entry.get("expected_name") or "")):
+                continue
+            translated_name = str(entry.get("name") or "").strip()
+            if not re.search(r"[\u3400-\u9fff]", translated_name) or len(translated_name) > MAX_STYLE_NAME_LENGTH:
+                continue
+            item["name"] = translated_name
             changed += 1
 
     elif operation == "update":
@@ -7457,6 +7506,22 @@ def _register_routes():
             return web.json_response({"error": "Unknown collection"}, status=400)
         return web.json_response({"items": _get_prompt_all_in_one_items(collection, kind)})
 
+    @protected_route("post", "/webui_prompt_bridge/favorites/translate_preview")
+    async def favorite_chinese_preview(request):
+        rejected = reject_cross_origin(request)
+        if rejected is not None:
+            return rejected
+        try:
+            data = await request.json()
+            kind = _validate_kind(data.get("kind", "positive"))
+            item_id = _truncate_text(data.get("id", ""), MAX_STYLE_NAME_LENGTH)
+            if not item_id:
+                return web.json_response({"error": "请选择一个收藏项"}, status=400)
+            result = await run_blocking(_preview_favorite_chinese_name, kind, item_id)
+            return web.json_response(result)
+        except (ValueError, TypeError, AttributeError):
+            return web.json_response({"error": "无效的收藏翻译请求"}, status=400)
+
     @protected_route("post", "/webui_prompt_bridge/prompt_all_in_one/storage")
     async def prompt_all_in_one_storage_post(request):
         rejected = reject_cross_origin(request)
@@ -7517,6 +7582,12 @@ def _register_routes():
                 sub_category=sub_category if sub_category else None,
             )
             return favorite_response(result, require_change=True)
+        if action == "fill_chinese_names":
+            entries = data.get("items")
+            if not isinstance(entries, list) or len(entries) > FAVORITE_TRANSLATION_BATCH_LIMIT:
+                return web.json_response({"error": "每次最多保存 20 条中文说明"}, status=400)
+            result = _mutate_prompt_all_in_one_favorites(kind, "fill_chinese_names", entries=entries)
+            return favorite_response(result)
         if action == "move_favorites":
             result = _mutate_prompt_all_in_one_favorites(
                 kind,

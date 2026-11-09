@@ -1,6 +1,9 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
+// Tag editor / progressive labels / quick delete adapted from magicdolls
+// PRs #11, #12 and #13. See docs/community-integration-2026-11-09.md for SHAs.
+
 const BRIDGE_DEBUG = {};
 
 const TARGET_NODE = "WebUIPromptBridge";
@@ -860,7 +863,7 @@ async function readBridgeResponse(response, fallback = "请求失败") {
 
 async function bridgeJson(response, fallback = "请求失败") {
     const { data, message } = await readBridgeResponse(response, fallback);
-    if (!response.ok) throw new Error(message);
+    if (!response.ok) throw Object.assign(new Error(message), { status: response.status });
     return data;
 }
 
@@ -1774,6 +1777,10 @@ function installBridgeSlotLabelOverlay(node) {
         }
         lastViewSignature = viewSignature;
         const bridgePanel = node.__webuiBridgePanel;
+        if (bridgePanel) {
+            bridgePanel.style.setProperty("--bridge-delete-hit-size", `${Math.min(40, 22 / Math.max(scale, 0.55))}px`);
+            bridgePanel.classList.toggle("bridge-low-hit-zoom", scale < 0.55);
+        }
         if (bridgePanel?.__webuiBridgeLowZoom !== lowZoom) {
             bridgePanel.__webuiBridgeLowZoom = lowZoom;
             bridgePanel.classList.toggle("zoom-summary-mode", lowZoom);
@@ -1962,14 +1969,17 @@ function syncBridgeDomWidgetWrapper(panel, width, height, options = {}) {
         ".graph-canvas-container.webui-bridge-dom-widget-shell",
         ".isolate.webui-bridge-dom-widget-shell",
     ].join(","))?.forEach(clearGlobalShell);
+    // Vue has added extra subgrid wrappers in newer frontends. Walk the whole
+    // widget chain, not just to the first lg-node-widget: a zero-height ancestor
+    // still clips an otherwise connected/full-sized panel.
+    const vueHost = panel.closest?.(".lg-node-widgets");
     const roots = [];
     let current = panel.parentElement;
-    for (let depth = 0; current && depth < 5; depth += 1) {
+    for (let depth = 0; current && depth < 12; depth += 1) {
         if (current === document.body || current.classList?.contains("lg-node")) break;
         roots.push(current);
-        if (current.classList?.contains("dom-widget") ||
-            current.classList?.contains("lg-node-widget") ||
-            current.classList?.contains("lg-node-widgets")) break;
+        if (current === vueHost || (!vueHost && (current.classList?.contains("dom-widget") ||
+            current.classList?.contains("lg-node-widget")))) break;
         current = current.parentElement;
     }
     // Vue's prompt-only node includes normal socket rows above its widget.
@@ -1987,6 +1997,11 @@ function syncBridgeDomWidgetWrapper(panel, width, height, options = {}) {
         setImportant(root, "min-height", "0");
         setImportant(root, "box-sizing", "border-box");
         setImportant(root, "overflow", "hidden");
+        if (vueHost) {
+            setImportant(root, "grid-template-rows", "minmax(0, 1fr)");
+            setImportant(root, "grid-row", "1");
+            setImportant(root, "grid-column", "1 / -1");
+        }
     }
     const host = roots.find((root) => root.classList?.contains("lg-node-widgets"));
     if (host) {
@@ -2008,6 +2023,7 @@ function syncBridgeDomWidgetWrapper(panel, width, height, options = {}) {
         setImportant(host, "height", "auto");
         setImportant(host, "margin-left", "0");
         setImportant(host, "position", "absolute");
+        setImportant(host, "display", "block");
     }
     if (!host && roots[0]) {
         setImportant(roots[0], "width", `${wrapperWidth}px`);
@@ -2034,13 +2050,20 @@ function syncBridgeDomWidgetWrapper(panel, width, height, options = {}) {
 function bridgeDomWidgetShellNeedsSync(panel, root) {
     const expected = panel?.__webuiBridgeExpectedWidgetSize;
     if (!panel?.isConnected || !root?.isConnected || !Array.isArray(expected)) return false;
-    if (panel.classList?.contains("webui-bridge-prompt-only-panel")) {
+    {
         const host = panel.closest?.(".lg-node-widgets");
         if (host) {
             // This host fills the space below socket rows, not the legacy
             // node-height - 70 rectangle. Comparing those heights makes the
             // MutationObserver repeatedly "repair" an already correct shell.
-            return host.style.position !== "absolute" || root.style.height !== "100%" ||
+            let clipped = false;
+            for (let ancestor = root, depth = 0; ancestor && ancestor !== host && depth < 12; ancestor = ancestor.parentElement, depth++) {
+                if (ancestor.style.height !== "100%" || (host.offsetHeight > 0 && ancestor.offsetHeight === 0)) {
+                    clipped = true;
+                    break;
+                }
+            }
+            return clipped || host.style.position !== "absolute" || root.style.height !== "100%" ||
                 root.style.width !== "100%" || panel.style.height !== "100%";
         }
     }
@@ -2091,7 +2114,12 @@ function installBridgeDomWidgetShellGuard(panel, root) {
     const resizeObserver = typeof ResizeObserver !== "undefined"
         ? new ResizeObserver(() => check())
         : null;
-    mutationObserver?.observe?.(root, { attributes: true, attributeFilter: ["style", "class"] });
+    for (let ancestor = root, depth = 0; ancestor && depth < 12; ancestor = ancestor.parentElement, depth++) {
+        mutationObserver?.observe?.(ancestor, { attributes: true, attributeFilter: ["style", "class"] });
+        resizeObserver?.observe?.(ancestor);
+        if (ancestor.classList?.contains("lg-node-widgets") || ancestor.classList?.contains("dom-widget")) break;
+        if (ancestor.parentElement?.classList?.contains("lg-node")) break;
+    }
     if (panel !== root) {
         mutationObserver?.observe?.(panel, { attributes: true, attributeFilter: ["style", "class"] });
     }
@@ -4564,20 +4592,159 @@ function buildLocalTagMap(state) {
 }
 
 const localTranslationCache = new Map();
+// The backend translates unknown tags one by one. A single large request can
+// therefore block *every* label behind the slowest translation. Use a bounded,
+// shared queue so completed chunks can update their own chips immediately.
+const LOCAL_TRANSLATION_BATCH_SIZE = 2;
+const LOCAL_TRANSLATION_CONCURRENCY = 2;
+const LOCAL_TRANSLATION_RETRY_DELAY_MS = 7000;
+// Bound every remote batch: a stalled provider must never occupy a queue slot
+// indefinitely. Allow the slower two-tag batches enough time before retrying.
+const LOCAL_TRANSLATION_REQUEST_TIMEOUT_MS = 45000;
+const localTranslationPending = new Map();
+const localTranslationQueue = [];
+const localTranslationFailures = new Map();
+const LOCAL_TRANSLATION_FAILURE_COOLDOWN_MS = 60000;
+let localTranslationActiveBatches = 0;
+let localTranslationPumpScheduled = false;
 
-async function translateTagsToLocal(tags) {
-    const missing = tags.filter((tag) => tag && !localTranslationCache.has(tag.toLowerCase()));
-    if (missing.length) {
-        try {
-            const translated = await translatePromptAllInOne(missing.join(", "), "local");
-            for (const item of translated.tags || []) {
-                localTranslationCache.set(String(item.prompt || item.input || "").toLowerCase(), item.local || "");
-            }
-        } catch {
-            // Do not cache a transient network failure; the next request may recover.
-        }
+function resetLocalTranslationCache() {
+    localTranslationCache.clear();
+    localTranslationFailures.clear();
+    for (const job of localTranslationPending.values()) job.resolve("");
+    localTranslationPending.clear();
+    localTranslationQueue.length = 0;
+}
+
+function retryableLocalTranslation(error) {
+    // Unknown network/timeout failures may already have billed the provider.
+    // Only explicit transient HTTP rejection gets one automatic retry.
+    return Number(error?.status) === 429;
+}
+
+function localTranslationKey(tag) {
+    const source = String(tag || "").trim();
+    if (!source) return "";
+    // Weighted tags should share translations with their unweighted body.
+    return String(normalizeAttentionValue(source).body || source).trim().toLowerCase();
+}
+
+function enqueueLocalTranslation(tag) {
+    const key = localTranslationKey(tag);
+    if (!key) return Promise.resolve("");
+    if (localTranslationCache.has(key)) return Promise.resolve(localTranslationCache.get(key));
+    if ((localTranslationFailures.get(key) || 0) > Date.now()) return Promise.resolve("");
+    localTranslationFailures.delete(key);
+    if (localTranslationPending.size >= 256) return Promise.resolve("");
+    const existing = localTranslationPending.get(key);
+    if (existing) return existing.promise;
+    let resolve;
+    const promise = new Promise((finish) => { resolve = finish; });
+    const job = { key, attempts: 0, resolve, promise };
+    localTranslationPending.set(key, job);
+    localTranslationQueue.push(job);
+    scheduleLocalTranslationPump();
+    return promise;
+}
+
+function scheduleLocalTranslationPump() {
+    if (localTranslationPumpScheduled) return;
+    localTranslationPumpScheduled = true;
+    Promise.resolve().then(() => {
+        localTranslationPumpScheduled = false;
+        pumpLocalTranslationQueue();
+    });
+}
+
+function finishLocalTranslationJob(job, translated) {
+    if (localTranslationPending.get(job.key) !== job) return;
+    localTranslationPending.delete(job.key);
+    if (translated) localTranslationCache.set(job.key, translated);
+    else localTranslationFailures.set(job.key, Date.now() + LOCAL_TRANSLATION_FAILURE_COOLDOWN_MS);
+    if (localTranslationFailures.size > 512) localTranslationFailures.delete(localTranslationFailures.keys().next().value);
+    job.resolve(translated || "");
+}
+
+function translateLocalBatchWithDeadline(jobs) {
+    const controller = new AbortController();
+    let timer = 0;
+    // AbortController alone is not sufficient if a custom fetch transport
+    // ignores its signal. The race also settles when fetch never settles.
+    const deadline = new Promise((_, reject) => {
+        timer = window.setTimeout(() => {
+            controller.abort();
+            reject(bridgeTimeoutError("标签自动翻译请求超时"));
+        }, LOCAL_TRANSLATION_REQUEST_TIMEOUT_MS);
+    });
+    const request = translatePromptAllInOne(jobs.map((job) => job.key).join(", "), "local", {
+        signal: controller.signal,
+    });
+    // Once the deadline wins, this race ignores any late response; it cannot
+    // change a job belonging to a retry or overwrite the current chip.
+    return Promise.race([request, deadline]).finally(() => window.clearTimeout(timer));
+}
+
+function pumpLocalTranslationQueue() {
+    while (localTranslationActiveBatches < LOCAL_TRANSLATION_CONCURRENCY && localTranslationQueue.length) {
+        const jobs = localTranslationQueue.splice(0, LOCAL_TRANSLATION_BATCH_SIZE);
+        localTranslationActiveBatches++;
+        jobs.forEach((job) => { job.attempts++; });
+        translateLocalBatchWithDeadline(jobs)
+            .then((translated) => {
+                const byInput = new Map();
+                for (const item of translated?.tags || []) {
+                    const key = localTranslationKey(item.input || item.prompt);
+                    if (key) byInput.set(key, item);
+                }
+                if (translated?.diagnostics?.errors?.length) {
+                    console.warn("[WebUI Prompt Bridge] Tag translation provider:", translated.diagnostics.errors[0]);
+                }
+                for (const job of jobs) {
+                    const item = byInput.get(job.key);
+                    const candidate = String(item?.local || "").trim();
+                    // Unmatched backend responses return the ORIGINAL English
+                    // text as `local`. Never cache that as a translation: it
+                    // would suppress all future attempts, even after a transient
+                    // translation service failure.
+                    const valid = Boolean(item?.matched && candidate && candidate.toLowerCase() !== job.key);
+                    if (valid) {
+                        finishLocalTranslationJob(job, candidate);
+                    } else {
+                        // Builtin miss/config/auth/provider diagnostics are not
+                        // evidence that a retry is safe or useful.
+                        finishLocalTranslationJob(job, "");
+                    }
+                }
+            })
+            .catch((error) => {
+                console.warn("[WebUI Prompt Bridge] Tag translation request failed:", error);
+                for (const job of jobs) {
+                    if (job.attempts < 2 && retryableLocalTranslation(error)) {
+                        window.setTimeout(() => {
+                            if (localTranslationPending.get(job.key) !== job) return;
+                            localTranslationQueue.push(job);
+                            scheduleLocalTranslationPump();
+                        }, LOCAL_TRANSLATION_RETRY_DELAY_MS);
+                    } else {
+                        finishLocalTranslationJob(job, "");
+                    }
+                }
+            })
+            .finally(() => {
+                localTranslationActiveBatches--;
+                scheduleLocalTranslationPump();
+            });
     }
-    return tags.map((tag) => localTranslationCache.get(String(tag || "").toLowerCase()) || "");
+}
+
+async function translateTagsToLocal(tags, onProgress = null) {
+    // Keep the return-array API used by the other prompt management screens,
+    // but also publish individual results as soon as they become available.
+    const tasks = tags.map((tag, index) => enqueueLocalTranslation(tag).then((local) => {
+        if (local) onProgress?.(local, index);
+        return local;
+    }));
+    return Promise.all(tasks);
 }
 
 function normalizeLoraName(name) {
@@ -5165,11 +5332,11 @@ function setTagNumericWeight(value, weight) {
     const rounded = Math.round(Number(weight || 1) * 100) / 100;
     if (parsed.lora) {
         const clip = parsed.lora.clip ? `:${parsed.lora.clip}` : "";
-        return `<${parsed.lora.type}:${parsed.lora.name}:${rounded.toFixed(rounded % 1 ? 2 : 1).replace(/0$/, "")}${clip}>`;
+        return `<${parsed.lora.type}:${parsed.lora.name}:${rounded.toFixed(rounded % 1 ? 2 : 1).replace(/\.?0+$/, "")}${clip}>`;
     }
     if (!parsed.body) return value;
     if (Math.abs(rounded - 1) < 0.001) return parsed.body;
-    return `(${parsed.body}:${rounded.toFixed(rounded % 1 ? 2 : 1).replace(/0$/, "")})`;
+    return `(${parsed.body}:${rounded.toFixed(rounded % 1 ? 2 : 1).replace(/\.?0+$/, "")})`;
 }
 
 function changeTagNumericWeight(value, delta) {
@@ -5268,9 +5435,59 @@ async function refreshFavoritesFromResult(state, result) {
     };
 }
 
+// Apply asynchronous localized labels only to the exact chip that requested
+// them. A new render detaches old chips; a weight-only update keeps the chip
+// alive while preserving its underlying tag text (e.g. 1girl -> (1girl:1.1)).
+// Unlike a global render token, this check does not discard valid translations
+// just because another chip or some other UI state was refreshed meanwhile.
+function applyTranslatedPromptChipLocal(chip, originalValue, local) {
+    if (!chip?.isConnected || !local || local === originalValue) return;
+    const currentValue = chip.__bridgeTagRef?.value || "";
+    if (currentValue !== originalValue
+        && normalizeAttentionValue(currentValue).body !== normalizeAttentionValue(originalValue).body) return;
+    const localNode = chip.querySelector(".webui-bridge-chip-local");
+    if (!localNode) return;
+    localNode.textContent = local;
+    chip.setAttribute("aria-label", `${currentValue || originalValue}，${local}`);
+}
+
 function renderPromptChips(row, textarea, state, afterChange, kind = "positive") {
     const chips = row.chips;
     if (!chips) return;
+    // Explicit attention edits must preserve the live chip AND its toolbar.
+    // setTextareaValue() dispatches a synthetic input event, which calls sync()
+    // and renderPromptChips() synchronously, *before* the click handler returns.
+    // Consequently we arm this transaction before mutating the textarea, not
+    // after the event. Unrelated prompt edits still use the full renderer.
+    const attentionEdit = row.__webuiBridgeAttentionEdit;
+    if (attentionEdit && attentionEdit.chip?.isConnected && attentionEdit.chip.parentElement === chips) {
+        const liveTags = splitPromptTags(textarea.value);
+        const { index, beforeValues, chip } = attentionEdit;
+        if (liveTags.length === beforeValues.length
+            && liveTags[index]
+            && liveTags.every((item, i) => i === index || item.value === beforeValues[i])) {
+            const item = liveTags[index];
+            const tagRef = chip.__bridgeTagRef;
+            if (tagRef && Number(chip.dataset.promptIndex) === index) {
+                tagRef.value = item.value;
+                tagRef.separatorAfter = item.separatorAfter;
+                chip.__bridgeRefreshFavorite?.();
+                const label = chip.querySelector('.webui-bridge-chip-main');
+                if (label) label.textContent = item.value;
+                const input = chip.querySelector('.webui-bridge-chip-weight');
+                if (input && document.activeElement !== input)
+                    input.value = String(normalizeAttentionValue(item.value).weight);
+                chip.title = item.value;
+                chip.setAttribute('aria-label', item.value);
+                // No chips.replaceChildren() here: focus, hover and the DOM event
+                // handlers on this particular chip remain continuous.
+                return;
+            }
+        }
+        // A structural change happened during the edit; let normal rendering
+        // take over rather than silently hiding additions or reordered tags.
+        row.__webuiBridgeAttentionEdit = null;
+    }
     const localMap = buildLocalTagMap(state);
     const renderToken = Number(row.__webuiBridgeChipRenderToken || 0) + 1;
     row.__webuiBridgeChipRenderToken = renderToken;
@@ -5346,8 +5563,8 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             title = `${tag.value}\n已禁用，不会写入生成提示词`;
         }
         if (!tag.disabled && selectedTags.has(tag.index)) className += " selected";
-        const matchingFavorites = favoritesForPrompt(state, kind, tag.value);
-        const favorite = matchingFavorites[0] || null;
+        let matchingFavorites = favoritesForPrompt(state, kind, tag.value);
+        let favorite = matchingFavorites[0] || null;
         let tools = null;
         const chip = el("div", {
             class: className,
@@ -5374,7 +5591,7 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
                 }, 420);
             },
             onclick: (event) => {
-                if (event.target.closest(".webui-bridge-chip-tools, .webui-bridge-chip-tools-toggle")) return;
+                if (event.target.closest(".webui-bridge-chip-tools, .webui-bridge-chip-tools-toggle, .webui-bridge-chip-quick-delete")) return;
                 if (row.__webuiBridgeDragJustEnded) return;
                 if ((event.ctrlKey || event.metaKey) && !tag.disabled) {
                     if (selectedTags.has(tag.index)) selectedTags.delete(tag.index);
@@ -5416,7 +5633,7 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
                 }
             },
             ondragstart: (event) => {
-                if (tag.disabled || event.target.closest(".webui-bridge-chip-tools, .webui-bridge-chip-tools-toggle")) {
+                if (tag.disabled || event.target.closest(".webui-bridge-chip-tools, .webui-bridge-chip-tools-toggle, .webui-bridge-chip-quick-delete")) {
                     event.preventDefault();
                     return;
                 }
@@ -5453,7 +5670,8 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             el("span", { class: "webui-bridge-chip-main" }, tag.value),
             el("span", { class: "webui-bridge-chip-local" }, local || " "),
         ]);
-        if (!lora && !tag.disabled) translatableChips.push({ chip, value: tag.value });
+        chip.__bridgeTagRef = tag;
+        if (!lora && !tag.disabled && !local) translatableChips.push({ chip, value: tag.value });
         const toolsToggle = el("button", {
             class: "webui-bridge-chip-tools-toggle",
             type: "button",
@@ -5474,20 +5692,77 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             onclick: async (event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                await handler();
-                afterChange?.();
+                const isAttentionEdit = !tag.disabled && ["+", "-", "()", "[]"].includes(text);
+                if (isAttentionEdit) {
+                    const current = splitPromptTags(textarea.value);
+                    row.__webuiBridgeAttentionEdit = {
+                        chip, index: tag.index, beforeValues: current.map((item) => item.value),
+                    };
+                    // All tag-related listeners on this chip share this mutable
+                    // tag object, so they observe the same up-to-date prompt text.
+                    tag.value = current[tag.index]?.value ?? tag.value;
+                }
+                try {
+                    await handler();
+                    afterChange?.();
+                } finally {
+                    if (isAttentionEdit && row.__webuiBridgeAttentionEdit?.chip === chip) {
+                        row.__webuiBridgeAttentionEdit = null;
+                    }
+                }
             },
         }, text);
         const weight = normalizeAttentionValue(tag.value).weight;
+        const suspendWeightDrag = () => {
+            // Stop the draggable parent from stealing text-selection gestures.
+            // Keep this disabled for the full focus session, not just mousedown.
+            chip.draggable = false;
+        };
+        const restoreWeightDrag = () => {
+            if (chip.isConnected && !chip.classList.contains("editing"))
+                chip.draggable = !tag.disabled;
+        };
         const weightInput = el("input", {
             class: "webui-bridge-chip-weight",
-            type: "number",
-            step: "0.1",
+            type: "text",
+            inputmode: "decimal",
+            spellcheck: "false",
+            draggable: "false",
             value: Number.isFinite(weight) ? String(weight) : "1",
-            title: "权重数值",
+            title: "权重数值（支持拖动框选）",
+            onfocus: suspendWeightDrag,
+            onblur: restoreWeightDrag,
             onclick: (event) => event.stopPropagation(),
+            onpointerdown: (event) => { suspendWeightDrag(); event.stopPropagation(); },
+            onmousedown: (event) => { suspendWeightDrag(); event.stopPropagation(); },
+            onpointermove: (event) => event.stopPropagation(),
+            onmousemove: (event) => event.stopPropagation(),
+            onpointerup: (event) => event.stopPropagation(),
+            onmouseup: (event) => event.stopPropagation(),
+            onselectstart: (event) => event.stopPropagation(),
+            ondblclick: (event) => event.stopPropagation(),
+            ondragstart: (event) => { event.preventDefault(); event.stopPropagation(); },
             onchange: (event) => {
-                if (!tag.disabled && replacePromptTagAt(textarea, tag.index, setTagNumericWeight(tag.value, event.currentTarget.value))) afterChange?.();
+                if (tag.disabled) return;
+                const current = splitPromptTags(textarea.value);
+                if (!current[tag.index]) return;
+                const rawWeight = String(event.currentTarget.value || "").trim();
+                if (!rawWeight || !Number.isFinite(Number(rawWeight))) {
+                    event.currentTarget.value = String(normalizeAttentionValue(current[tag.index].value).weight);
+                    return;
+                }
+                row.__webuiBridgeAttentionEdit = {
+                    chip, index: tag.index, beforeValues: current.map((item) => item.value),
+                };
+                tag.value = current[tag.index].value;
+                try {
+                    if (replacePromptTagAt(textarea, tag.index, setTagNumericWeight(tag.value, rawWeight))) {
+                        afterChange?.();
+                    }
+                } finally {
+                    if (row.__webuiBridgeAttentionEdit?.chip === chip)
+                        row.__webuiBridgeAttentionEdit = null;
+                }
             },
         });
         const movementIndexes = selectedTags.has(tag.index)
@@ -5566,13 +5841,83 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
                 chip.classList.remove("show-tools");
             }, 220);
         });
+        chip.__bridgeRefreshFavorite = () => {
+            matchingFavorites = favoritesForPrompt(state, kind, tag.value);
+            favorite = matchingFavorites[0] || null;
+            const button = tools.querySelector(".favorite");
+            if (button) {
+                button.textContent = favorite ? "★" : "☆";
+                button.title = favorite ? "取消该 Prompt 的全部收藏" : "加入收藏";
+                button.classList.toggle("active", !!favorite);
+            }
+        };
         chip.append(toolsToggle);
         chip.append(tools);
+        // Compact A1111-style delete affordance in the chip's upper-right
+        // corner. Reuse deleteChip() so duplicate tags and disabled entries
+        // behave exactly like deletion from the existing toolbar.
+        const quickDelete = el("button", {
+            class: "webui-bridge-chip-quick-delete",
+            type: "button",
+            title: "删除当前关键词",
+            "aria-label": "删除当前关键词",
+            draggable: "false",
+            onpointerdown: (event) => event.stopPropagation(),
+            onmousedown: (event) => event.stopPropagation(),
+            onmouseup: (event) => event.stopPropagation(),
+            ondragstart: (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+            },
+            ondblclick: (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+            },
+            onclick: (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                window.clearTimeout(row.__webuiBridgeClickTimer);
+                deleteChip(tag);
+                afterChange?.();
+            },
+        }, "×");
+        chip.append(quickDelete);
+        const refreshQuickDeleteTarget = () => {
+            // Vue can render at a different transform from the canvas overlay.
+            // Measure this chip at the actual interaction point instead.
+            const scale = resizeTargetViewportScale(chip);
+            quickDelete.style.setProperty("--bridge-delete-hit-size", `${22 / Math.max(scale, 0.55)}px`);
+            quickDelete.dataset.lowZoom = scale < 0.55 ? "true" : "false";
+        };
+        chip.addEventListener("mouseenter", refreshQuickDeleteTarget);
+        chip.addEventListener("focusin", refreshQuickDeleteTarget);
         function startChipEdit(node, item) {
             if (item.disabled) return;
             node.innerHTML = "";
-            const input = el("textarea", { class: "webui-bridge-chip-edit", spellcheck: "false" });
+            // HTML drag on the parent steals text-selection gestures even when
+            // pointer events on the input are stopped. Disable it while editing.
+            node.draggable = false;
+            node.setAttribute('draggable', 'false');
+            node.classList.add('editing');
+            const input = el("input", {
+                class: "webui-bridge-chip-edit",
+                type: "text",
+                spellcheck: "false",
+                draggable: "false",
+                onclick: (event) => event.stopPropagation(),
+                ondblclick: (event) => event.stopPropagation(),
+                onmousedown: (event) => event.stopPropagation(),
+                onpointerdown: (event) => event.stopPropagation(),
+                onpointermove: (event) => event.stopPropagation(),
+                onmouseup: (event) => event.stopPropagation(),
+                onmousemove: (event) => event.stopPropagation(),
+                onselectstart: (event) => event.stopPropagation(),
+                ondragstart: (event) => { event.preventDefault(); event.stopPropagation(); },
+            });
             input.value = item.value;
+            const textLength = Math.min(60, Math.max(8, item.value.length + 2));
+            input.style.width = `min(${textLength}ch, 240px)`;
+            input.style.maxWidth = "min(240px, 90vw)";
             let done = false;
             const save = () => {
                 if (done) return;
@@ -5583,6 +5928,7 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
             };
             input.addEventListener("blur", save);
             input.addEventListener("keydown", (event) => {
+                if (event.isComposing || event.keyCode === 229) return;
                 if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
                     save();
@@ -5662,15 +6008,13 @@ function renderPromptChips(row, textarea, state, afterChange, kind = "positive")
     }
     chips.replaceChildren(fragment);
     const plainTags = translatableChips.map((item) => item.value);
-    translateTagsToLocal(plainTags).then((locals) => {
-        if (!chips.isConnected || row.__webuiBridgeChipRenderToken !== renderToken) return;
-        translatableChips.forEach(({ chip, value }, index) => {
-            const local = locals[index];
-            if (!chip.isConnected || !local || local === value) return;
-            const localNode = chip.querySelector(".webui-bridge-chip-local");
-            if (localNode) localNode.textContent = local;
-        });
-    });
+    // A small translated chunk should appear immediately, not only after all
+    // remaining unknown tags have finished. This updates the label directly,
+    // without replacing the chip or disturbing its weight-toolbar DOM.
+    translateTagsToLocal(plainTags, (local, index) => {
+        const item = translatableChips[index];
+        if (item) applyTranslatedPromptChipLocal(item.chip, item.value, local);
+    }).catch((error) => console.warn("[WebUI Prompt Bridge] Tag label update failed:", error));
 }
 
 function normalizedPromptToggleTag(value, isNegative = false) {
@@ -7681,11 +8025,12 @@ async function updateStyle(action, name, positivePrompt = "", negativePrompt = "
     return data.styles || [];
 }
 
-async function translatePromptAllInOne(text, to = "english") {
+async function translatePromptAllInOne(text, to = "english", options = {}) {
     const response = await api.fetchApi("/webui_prompt_bridge/prompt_all_in_one/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text, to, lang: "zh_CN" }),
+        ...(options.signal ? { signal: options.signal } : {}),
     });
     return await bridgeJson(response, "翻译失败");
 }
@@ -7795,7 +8140,9 @@ async function saveBridgeSettings(settings) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(settings),
     });
-    return bridgeJson(response, "保存设置失败");
+    const result = await bridgeJson(response, "保存设置失败");
+    resetLocalTranslationCache();
+    return result;
 }
 
 async function fetchModuleAssets() {
@@ -7836,7 +8183,9 @@ async function saveAIConfig(config) {
         const { message } = await readBridgeResponse(response, "保存 AI 配置失败");
         throw new Error(message);
     }
-    return response.json();
+    const result = await response.json();
+    resetLocalTranslationCache();
+    return result;
 }
 
 async function testAIConfig(prompt) {
@@ -9803,6 +10152,106 @@ function createTagButton(tag, textarea, sync, rerender, isNegative = false, stat
     return button;
 }
 
+function showFavoriteChineseDialog(kind, state, onSaved) {
+    const candidates = (state.promptAllInOne?.favorites?.[kind] || []).filter(item =>
+        item.id && item.prompt && (!item.name || String(item.name).trim() === String(item.prompt).trim()));
+    const selected = new Set();
+    const previews = new Map();
+    const statuses = new Map();
+    let controller = null;
+    let running = false;
+    let closed = false;
+    let savePending = false;
+    const mask = el("div", { class: "webui-bridge-config-mask" });
+    const search = el("input", { class: "webui-bridge-config-input", placeholder: "搜索英文收藏或分类", "aria-label": "搜索待翻译收藏" });
+    const list = el("div", { class: "webui-bridge-favorite-translate-list" });
+    const status = el("div", { class: "webui-bridge-favorite-translate-status", role: "status", "aria-live": "polite" });
+    const updateActions = () => {
+        translate.disabled = running || savePending || selected.size === 0;
+        save.disabled = running || savePending || ![...selected].some(id => previews.has(id));
+        cancel.disabled = savePending;
+    };
+    const render = () => {
+        const query = search.value.trim().toLowerCase();
+        const matches = candidates.filter(item => `${item.prompt} ${item.category || ""}`.toLowerCase().includes(query));
+        list.replaceChildren(...matches.slice(0, 100).map(item => {
+            const check = el("input", { type: "checkbox", "aria-label": `选择 ${item.prompt}` });
+            check.checked = selected.has(item.id);
+            check.disabled = running || savePending;
+            check.addEventListener("change", () => {
+                if (check.checked && selected.size >= 20) { check.checked = false; status.textContent = "每批最多选择 20 条"; return; }
+                if (check.checked) selected.add(item.id); else selected.delete(item.id);
+                status.textContent = `已选择 ${selected.size} 条；翻译后需确认保存`;
+                updateActions();
+            });
+            return el("label", { class: "webui-bridge-favorite-translate-row" }, [check,
+                el("span", {}, [el("strong", {}, item.prompt),
+                    el("small", {}, `${item.category || "未分类"} / ${item.subCategory || "未分类"}`),
+                    el("span", { class: "webui-bridge-favorite-translate-result" }, previews.get(item.id)?.name || statuses.get(item.id) || "尚未翻译")])]);
+        }));
+        if (!matches.length) list.append(el("p", {}, candidates.length ? "没有匹配的收藏" : "没有缺少中文说明的收藏；自定义名称不会被覆盖"));
+        if (matches.length > 100) list.append(el("p", {}, `共 ${matches.length} 条，先显示 100 条；可搜索缩小范围`));
+        updateActions();
+    };
+    const translate = el("button", { type: "button", class: "primary", onclick: async () => {
+        running = true; controller = new AbortController();
+        const signal = controller.signal;
+        const ids = [...selected]; let done = 0;
+        for (const id of ids) { previews.delete(id); statuses.delete(id); }
+        render();
+        for (const id of ids) {
+            if (signal.aborted || closed) break;
+            status.textContent = `正在翻译 ${done + 1}/${ids.length}；不会自动保存`;
+            const timer = window.setTimeout(() => controller.abort(), 45000);
+            try {
+                const response = await api.fetchApi("/webui_prompt_bridge/favorites/translate_preview", {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ kind, id }), signal,
+                });
+                const result = await bridgeJson(response, "翻译失败");
+                if (signal.aborted || closed) break;
+                if (result.status === "ready") previews.set(id, result);
+                statuses.set(id, result.message || "未匹配，保留原文");
+            } catch (error) {
+                statuses.set(id, signal.aborted ? "已停止；没有保存" : `失败：${error.message}`);
+                if (signal.aborted) break;
+            } finally { window.clearTimeout(timer); }
+            done++; render();
+        }
+        running = false;
+        if (!closed) { status.textContent = signal.aborted ? "已停止后续请求；已完成结果可确认保存。服务器中的请求可能仍在处理。" : `完成 ${done}/${ids.length}；请检查中文结果再保存`;
+            render(); }
+    } }, "翻译选中（最多20条）");
+    const save = el("button", { type: "button", class: "primary", onclick: async () => {
+        const items = [...selected].map(id => previews.get(id)).filter(Boolean);
+        if (!items.length) return;
+        savePending = true; render();
+        try {
+            const result = await updatePromptAllInOneStorage("fill_chinese_names", kind, "", "", "", "", "", { items });
+            await refreshFavoritesFromResult(state, result);
+            onSaved?.();
+            status.textContent = `已保存 ${result.changed || 0} 条；期间被修改/删除的项目会跳过。英文提示词未改动。`;
+            for (const item of items) { previews.delete(item.id); selected.delete(item.id); statuses.set(item.id, "已处理，请关闭后重新打开刷新列表"); }
+            resetLocalTranslationCache();
+        } catch (error) { status.textContent = `保存失败：${error.message}；请刷新收藏确认状态，不自动重试`; }
+        finally { savePending = false; render(); }
+    } }, "确认保存中文说明");
+    const cancel = el("button", { type: "button", onclick: () => {
+        if (running) { controller?.abort(); return; }
+        closed = true; controller?.abort(); mask.remove();
+    } }, "停止 / 关闭");
+    search.addEventListener("input", render);
+    mask.append(el("div", { class: "webui-bridge-config-panel webui-bridge-favorite-translate-dialog", role: "dialog", "aria-modal": "true", "aria-label": "收藏中文说明" }, [
+        el("h3", {}, "补全收藏中文说明"),
+        el("p", {}, "选择单条或多条收藏，先翻译预览再保存。只补缺失名称，不改英文提示词、分类或已有自定义名称。"),
+        el("p", { class: "webui-bridge-favorite-translate-warning" }, "沿用当前翻译设置；联网/AI 可能产生费用。每批最多20条，逐条请求，不自动重试；每条最多32个标签，可能分别调用翻译服务。停止只取消后续请求，不保证服务器或供应商停止计费。"),
+        search, list, status, el("div", { class: "webui-bridge-config-actions" }, [translate, save, cancel])
+    ]));
+    document.body.append(mask);
+    status.textContent = `找到 ${candidates.length} 条待补全收藏；请先选择`;
+    render();
+}
+
 function createPromptAllInOnePanel(kind, title, textarea, state, sync) {
     const isNegative = kind === "negative";
     const root = el("div", { class: `webui-bridge-aio webui-bridge-aio-${kind}` });
@@ -10047,6 +10496,7 @@ function createPromptAllInOnePanel(kind, title, textarea, state, sync) {
     };
     promptTools.append(
         toolButton("英", "整段翻译为 Anima 英文 tag", translateAll),
+        toolButton("译中", "为收藏补全中文说明（保留英文提示词）", () => showFavoriteChineseDialog(kind, state, render)),
         toolButton("⚙", "提示词管理设置 / 翻译说明", showPromptSettings),
         toolButton("⧉", "复制提示词", copyPrompt),
         toolButton("↥", "保存到历史", saveHistory),
@@ -10063,8 +10513,8 @@ function createPromptAllInOnePanel(kind, title, textarea, state, sync) {
         tabs,
         subTabs,
         appendRow,
-        body,
         pager,
+        body,
         hint,
         colorRow,
         createHeightResizeGrip(root, panelHeightKey, { min: root.__webuiBridgeMinHeight, max: 680, title: "拖动调整收藏/标签列表高度，双击恢复" }),
@@ -17791,6 +18241,18 @@ function addStyles() {
     const style = document.createElement("style");
     style.id = "webui-prompt-bridge-style";
     style.textContent = `
+        .webui-bridge-favorite-translate-dialog {
+            width: min(840px, 94vw); max-height: 90vh; display: flex; flex-direction: column;
+            padding: 22px; gap: 12px; box-sizing: border-box;
+        }
+        .webui-bridge-favorite-translate-dialog h3, .webui-bridge-favorite-translate-dialog p { margin: 0; }
+        .webui-bridge-favorite-translate-warning { color: #d6bc82; font-size: 12px; line-height: 1.6; }
+        .webui-bridge-favorite-translate-list { min-height: 120px; max-height: 48vh; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+        .webui-bridge-favorite-translate-row { display: flex; align-items: flex-start; gap: 10px; padding: 10px; border: 1px solid #3d4a5d; border-radius: 6px; background: #151c27; }
+        .webui-bridge-favorite-translate-row > span { min-width: 0; display: flex; flex-direction: column; gap: 5px; overflow-wrap: anywhere; }
+        .webui-bridge-favorite-translate-row small { color: #95a7bd; }
+        .webui-bridge-favorite-translate-result { color: #9bc9f5; }
+        .webui-bridge-favorite-translate-status { min-height: 28px; font-size: 13px; color: #bcd8ed; }
         .webui-bridge-panel {
             position: relative;
             width: 100% !important;
@@ -18087,7 +18549,9 @@ function addStyles() {
             overflow: visible;
         }
         .lg-node:has(.webui-bridge-panel) .lg-slot--input .text-node-component-slot-text,
-        .lg-node:has(.webui-bridge-panel) .lg-slot--output .text-node-component-slot-text {
+        .lg-node:has(.webui-bridge-panel) .lg-slot--output .text-node-component-slot-text,
+        .lg-node:has(.webui-bridge-panel) .lg-slot--input .editable-text,
+        .lg-node:has(.webui-bridge-panel) .lg-slot--output .editable-text {
             position: absolute;
             z-index: 21;
             top: 50%;
@@ -18102,15 +18566,28 @@ function addStyles() {
             pointer-events: none;
             white-space: nowrap;
         }
-        .lg-node:has(.webui-bridge-panel) .lg-slot--input .text-node-component-slot-text {
+        .lg-node:has(.webui-bridge-panel) .lg-slot--input .text-node-component-slot-text,
+        .lg-node:has(.webui-bridge-panel) .lg-slot--input .editable-text {
             left: auto;
             right: calc(100% + 18px);
             text-align: right;
         }
-        .lg-node:has(.webui-bridge-panel) .lg-slot--output .text-node-component-slot-text {
+        .lg-node:has(.webui-bridge-panel) .lg-slot--output .text-node-component-slot-text,
+        .lg-node:has(.webui-bridge-panel) .lg-slot--output .editable-text {
             left: calc(100% + 18px);
             right: auto;
             text-align: left;
+        }
+        .lg-node:has(.webui-bridge-panel) .lg-slot--output > div:not([data-testid="slot-connection-dot"]):has(> span.truncate) {
+            position: absolute;
+            left: calc(100% + 18px);
+            top: 50%;
+            transform: translateY(-50%);
+            overflow: visible;
+            min-width: max-content;
+            pointer-events: none;
+            background: rgba(17, 22, 32, .82);
+            padding: 0 4px;
         }
         .lg-node:has(.webui-bridge-panel) .lg-slot--input .slot-dot,
         .lg-node:has(.webui-bridge-panel) .lg-slot--output .slot-dot {
@@ -19154,6 +19631,55 @@ function addStyles() {
             border-color: #c7dcff;
             background: #24466f;
         }
+        .webui-bridge-chip-quick-delete {
+            position: absolute;
+            z-index: 90;
+            top: -7px;
+            right: -6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: var(--bridge-delete-hit-size, 22px);
+            height: var(--bridge-delete-hit-size, 22px);
+            padding: 0;
+            border: 1px solid #99525b;
+            border-radius: 5px;
+            background: #34212a;
+            color: #ffccd0;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, .45);
+            font: 700 13px/1 Arial, sans-serif;
+            cursor: pointer;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-user-drag: none;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 80ms ease;
+        }
+        .webui-bridge-prompt-chip:hover > .webui-bridge-chip-quick-delete,
+        .webui-bridge-prompt-chip:focus-within > .webui-bridge-chip-quick-delete,
+        .webui-bridge-prompt-chip.show-tools > .webui-bridge-chip-quick-delete,
+        .webui-bridge-chip-quick-delete:focus-visible {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .webui-bridge-chip-quick-delete:hover,
+        .webui-bridge-chip-quick-delete:focus-visible {
+            background: #7c2b38;
+            border-color: #f0848f;
+            color: #ffffff;
+        }
+        @media (pointer: coarse) {
+            .webui-bridge-prompt-chip > .webui-bridge-chip-quick-delete {
+                opacity: 1;
+                pointer-events: auto;
+                width: max(32px, var(--bridge-delete-hit-size, 22px));
+                height: max(32px, var(--bridge-delete-hit-size, 22px));
+            }
+        }
+        .webui-bridge-chip-quick-delete[data-low-zoom="true"] {
+            display: none;
+        }
         .webui-bridge-chip-tools {
             position: absolute;
             z-index: 80;
@@ -19232,19 +19758,36 @@ function addStyles() {
             color: #f3f6fb;
             font-size: 11px;
             text-align: center;
+            cursor: text;
+            user-select: text !important;
+            -webkit-user-select: text !important;
+            -webkit-user-drag: none;
+        }
+        .webui-bridge-prompt-chip.editing,
+        .webui-bridge-prompt-chip.editing * {
+            user-select: text !important;
+            -webkit-user-select: text !important;
+            -webkit-user-drag: none !important;
         }
         .webui-bridge-chip-edit {
-            width: 180px;
-            min-height: 40px;
-            padding: 5px 6px;
+            display: block;
+            width: auto;
+            min-width: 64px;
+            max-width: min(240px, 90vw);
+            height: 24px;
+            min-height: 24px;
+            padding: 3px 6px;
             box-sizing: border-box;
             border: 0;
             outline: 1px solid #6aa3ff;
             border-radius: 4px;
-            resize: both;
+            resize: none;
             background: #10141d;
             color: #f4f7fb;
-            font: 12px/1.35 Consolas, Monaco, monospace;
+            font: 12px/18px Consolas, Monaco, monospace;
+            user-select: text;
+            -webkit-user-select: text;
+            cursor: text;
         }
         .webui-bridge-aio {
             border: 1px solid #263243;
@@ -19462,6 +20005,9 @@ function addStyles() {
         }
         .webui-bridge-aio-pager {
             display: flex;
+            position: relative;
+            z-index: 2;
+            flex: 0 0 auto;
             align-items: center;
             justify-content: center;
             gap: 8px;
@@ -19474,6 +20020,15 @@ function addStyles() {
         }
         .webui-bridge-aio-pager[hidden] {
             display: none;
+        }
+        .webui-bridge-aio:has(.webui-bridge-aio-pager:not([hidden])) > .webui-bridge-aio-body {
+            min-height: 0;
+            flex: 1 1 0;
+        }
+        .webui-bridge-aio > .webui-bridge-aio-header,
+        .webui-bridge-aio > .webui-bridge-aio-tabs,
+        .webui-bridge-aio > .webui-bridge-aio-subtabs {
+            flex-shrink: 0;
         }
         .webui-bridge-aio-pager button {
             min-width: 30px;

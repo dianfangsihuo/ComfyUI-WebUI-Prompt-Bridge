@@ -43,6 +43,8 @@ jobs:
           node --check tools/verify_frontend_compat.mjs
           node --check tools/test_panel_mount_browser.mjs
           node --check tools/test_layout_browser.mjs
+          node --check tools/test_favorite_chinese_ui.mjs
+          node --check tools/test_community_integration_browser.mjs
 
       - name: Test widget batch updates
         run: node tools/test_widget_batch.mjs
@@ -57,4 +59,21 @@ jobs:
         run: node tools/test_panel_lifecycle.mjs
 
       - name: Test section layout budgets and native resize
-        run: node tools/test_layout_budget.mjs
+        run: |
+          node tools/test_layout_budget.mjs
+          node tools/test_vue_shell.mjs
+
+      - name: Test translation deadlines, retry policy and cooldown
+        run: node tools/test_translation_timeout.mjs
+
+      - name: Prepare focused browser fixtures
+        run: |
+          npm install --no-save --ignore-scripts playwright@1.60.0
+          npx playwright install --with-deps chromium
+
+      - name: Test contributor interaction fixes and favorite translation UI
+        run: |
+          node tools/test_prompt_chip_editor.mjs
+          node tools/test_prompt_translation.mjs
+          node tools/test_prompt_quick_delete.mjs
+          node tools/test_favorite_chinese_ui.mjs

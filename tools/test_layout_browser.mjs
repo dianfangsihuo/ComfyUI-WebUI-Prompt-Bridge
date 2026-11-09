@@ -66,17 +66,25 @@ async function metrics(page) {
         const rect = p.getBoundingClientRect(), scale = rect.height / p.offsetHeight || 1;
         const style = getComputedStyle(p);
         const bottom = getComputedStyle(extra).display === "none" ? top : extra;
+        const clippedAncestors=[];
+        for(let e=p.parentElement;e&&e!==document.body;e=e.parentElement){
+            if(e.classList.contains('lg-node'))break;
+            const s=getComputedStyle(e);
+            if(/hidden|clip/.test(s.overflow+s.overflowY) && (e.clientHeight<8||e.clientWidth<8))clippedAncestors.push(e.className);
+            if(e.classList.contains('dom-widget'))break;
+        }
         return { id: n.id, size: Array.from(n.size).map(Math.round), panel: p.offsetHeight, top: top.offsetHeight,
             extra: extra.offsetHeight, blank: Math.round((rect.bottom - bottom.getBoundingClientRect().bottom) / scale),
             overflowX: p.scrollWidth - p.clientWidth, overflowY: p.scrollHeight - p.clientHeight,
             connected: p.isConnected, display: style.display, widgets: n.widgets.filter(w => w.name === "webui_prompt_frontend").length,
             layout: p.__webuiBridgeGetLayoutState(),
             positive: n.widgets.find(w => w.name === "positive_prompt").value,
-            failure: Boolean(n.__webuiBridgePanelFailureWidget) };
+            failure: Boolean(n.__webuiBridgePanelFailureWidget),clippedAncestors };
     }));
 }
 function healthy(m, { blank = 100, size } = {}) {
     assert(m.connected && m.widgets === 1 && !m.failure, JSON.stringify(m));
+    assert.deepEqual(m.clippedAncestors,[],`Connected panel is visually clipped: ${JSON.stringify(m)}`);
     assert(m.top >= 220 && m.extra >= 42 && m.overflowX <= 2, JSON.stringify(m));
     // Allow one footer/gap of host rounding; never a clipped content section.
     assert(m.blank <= blank && m.blank >= -24 && m.overflowY <= 24, `Unused/overflowing panel space: ${JSON.stringify(m)}`);

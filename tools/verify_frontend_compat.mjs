@@ -1847,7 +1847,7 @@ async function verifyFavoritePaginationAndBatchOperations(browser, baseUrl) {
                 body: JSON.stringify({
                     prompt: String(payload.text || ""),
                     matched: tags.length,
-                    tags: tags.map((prompt) => ({ prompt, local: `本地 ${prompt}` })),
+                    tags: tags.map((prompt) => ({ input: prompt, prompt, local: `本地 ${prompt}`, matched: true })),
                 }),
             });
         });

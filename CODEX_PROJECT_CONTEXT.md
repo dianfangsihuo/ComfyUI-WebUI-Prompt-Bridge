@@ -1,6 +1,13 @@
 # WebUIPromptBridge Codex Project Context
 
-Updated: 2026-11-08
+Updated: 2026-11-09
+
+## Community integration (v0.4.38, 2026-11-09)
+
+- Branch `codex/nodes2-community-integration`: see `docs/community-integration-2026-11-09.md` for contributor provenance and Issue/PR dispositions.
+- Frontend 1.58.7 adds subgrid ancestors between a DOM widget and `.lg-node-widgets`; repairing only the inner widget leaves a connected panel clipped by a 0px ancestor. Traverse/synchronize the complete host chain and verify rendered ancestor heights/hit-testing, not only `isConnected`.
+- Favorites Chinese labels use explicit preview + save with original-prompt/name checks; never overwrite English prompts or custom names automatically. Test provider operations use builtin or synthetic responses.
+- v0.4.38 preserves magicdolls PR #11/#12/#13 original commits as release ancestors. See the integration document for precise tested scope; publication does not imply reporter-machine confirmation.
 
 ## Latest layout audit (v0.4.37)
 
