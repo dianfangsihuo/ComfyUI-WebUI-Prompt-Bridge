@@ -30,7 +30,9 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   javascript-syntax:
-    runs-on: ubuntu-latest
+    # Keep Playwright's native dependencies on an explicitly supported image.
+    # ubuntu-latest may advance before the pinned browser runtime supports it.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
